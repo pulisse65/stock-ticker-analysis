@@ -5,12 +5,15 @@ import logging
 import math
 import os
 import threading
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -633,6 +636,278 @@ def get_history():
 def clear_history():
     _clear_history_all()
     return {"ok": True}
+
+
+# ----------------------------- Dashboard widgets -----------------------------
+#
+# Five server-fed widget endpoints. The TradingView mini-chart is fully
+# client-side and doesn't need a backend.
+#
+# All endpoints are wrapped in a tiny in-memory TTL cache so we don't hammer
+# yfinance / Reddit / Google News on every dashboard refresh.
+
+_WIDGET_CACHE: dict[tuple, tuple[float, Any]] = {}
+
+
+def _cache_get(key: tuple) -> Any | None:
+    entry = _WIDGET_CACHE.get(key)
+    if entry is None:
+        return None
+    expiry, value = entry
+    if time.time() > expiry:
+        _WIDGET_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: tuple, value: Any, ttl: int) -> None:
+    _WIDGET_CACHE[key] = (time.time() + ttl, value)
+
+
+def _safe(call: Callable[[], Any], default: Any = None) -> Any:
+    try:
+        return call()
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _ts_to_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(value, (int, float)) and not math.isnan(value):
+        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+    return str(value)
+
+
+@app.get("/widgets/reddit")
+def widget_reddit(ticker: str):
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Missing ticker.")
+
+    cache_key = ("reddit", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    subs = "wallstreetbets+stocks+investing+StockMarket"
+    url = (
+        f"https://www.reddit.com/r/{subs}/search.json"
+        f"?q={ticker}&restrict_sr=on&sort=new&limit=15&t=month"
+    )
+    headers = {"User-Agent": "stock-ticker-analysis/1.0 (https://github.com/pulisse65/stock-ticker-analysis)"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Reddit fetch failed: {exc}") from exc
+
+    posts = []
+    for child in (data.get("data") or {}).get("children", []):
+        d = child.get("data") or {}
+        posts.append({
+            "title": d.get("title"),
+            "subreddit": d.get("subreddit"),
+            "score": d.get("score", 0),
+            "num_comments": d.get("num_comments", 0),
+            "created_utc": d.get("created_utc"),
+            "permalink": f"https://www.reddit.com{d.get('permalink', '')}",
+            "author": d.get("author"),
+            "flair": d.get("link_flair_text"),
+        })
+
+    result = {"ticker": ticker, "posts": posts}
+    _cache_set(cache_key, result, ttl=300)  # 5 min
+    return result
+
+
+@app.get("/widgets/news")
+def widget_news(ticker: str):
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Missing ticker.")
+
+    cache_key = ("news", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    url = (
+        f"https://news.google.com/rss/search?q={ticker}+stock"
+        f"&hl=en-US&gl=US&ceid=US:en"
+    )
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"News fetch failed: {exc}") from exc
+
+    items = []
+    for it in root.findall(".//item")[:20]:
+        items.append({
+            "title": (it.findtext("title") or "").strip(),
+            "link": (it.findtext("link") or "").strip(),
+            "pub_date": (it.findtext("pubDate") or "").strip(),
+            "source": (it.findtext("source") or "").strip(),
+        })
+
+    result = {"ticker": ticker, "items": items}
+    _cache_set(cache_key, result, ttl=300)  # 5 min
+    return result
+
+
+@app.get("/widgets/fundamentals")
+def widget_fundamentals(ticker: str):
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Missing ticker.")
+
+    cache_key = ("fundamentals", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    info = _safe(lambda: yf.Ticker(ticker).info, default={}) or {}
+    if not info:
+        raise HTTPException(404, f"No fundamentals available for '{ticker}'.")
+
+    fields = [
+        "longName", "shortName", "sector", "industry", "country", "currency", "exchange",
+        "marketCap", "enterpriseValue",
+        "trailingPE", "forwardPE", "priceToBook", "pegRatio",
+        "trailingEps", "forwardEps",
+        "profitMargins", "operatingMargins", "returnOnEquity",
+        "dividendYield", "dividendRate", "payoutRatio",
+        "beta",
+        "fiftyTwoWeekLow", "fiftyTwoWeekHigh",
+        "fiftyDayAverage", "twoHundredDayAverage",
+        "currentPrice", "regularMarketPrice", "previousClose",
+        "regularMarketChange", "regularMarketChangePercent",
+        "volume", "averageVolume", "averageVolume10days",
+        "sharesOutstanding", "floatShares",
+    ]
+    data: dict[str, Any] = {}
+    for k in fields:
+        v = info.get(k)
+        if isinstance(v, float) and math.isnan(v):
+            v = None
+        data[k] = v
+
+    result = {"ticker": ticker, "data": data}
+    _cache_set(cache_key, result, ttl=600)  # 10 min
+    return result
+
+
+@app.get("/widgets/earnings")
+def widget_earnings(ticker: str):
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Missing ticker.")
+
+    cache_key = ("earnings", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    t = yf.Ticker(ticker)
+
+    # `calendar` shape varies by yfinance version: dict in newer, DataFrame in older.
+    calendar: dict[str, Any] = {}
+    raw_cal = _safe(lambda: t.calendar)
+    if isinstance(raw_cal, dict):
+        for k, v in raw_cal.items():
+            if isinstance(v, list):
+                calendar[k] = [_ts_to_iso(x) for x in v]
+            else:
+                calendar[k] = _ts_to_iso(v) if hasattr(v, "isoformat") else v
+    elif isinstance(raw_cal, pd.DataFrame) and not raw_cal.empty:
+        for col in raw_cal.columns:
+            v = raw_cal[col].iloc[0]
+            calendar[col] = _ts_to_iso(v) if hasattr(v, "isoformat") else (None if pd.isna(v) else v)
+
+    earnings_dates: list[dict[str, Any]] = []
+    raw_ed = _safe(lambda: t.earnings_dates)
+    if isinstance(raw_ed, pd.DataFrame) and not raw_ed.empty:
+        ed = raw_ed.head(8).reset_index()
+        date_col = "Earnings Date" if "Earnings Date" in ed.columns else ed.columns[0]
+        for _, row in ed.iterrows():
+            def _f(col: str) -> float | None:
+                v = row.get(col)
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    return None
+                return float(v) if isinstance(v, (int, float, np.integer, np.floating)) else None
+
+            earnings_dates.append({
+                "date": _ts_to_iso(row.get(date_col)),
+                "eps_estimate": _f("EPS Estimate"),
+                "eps_actual": _f("Reported EPS"),
+                "surprise_pct": _f("Surprise(%)"),
+            })
+
+    result = {"ticker": ticker, "calendar": calendar, "earnings_dates": earnings_dates}
+    _cache_set(cache_key, result, ttl=900)  # 15 min
+    return result
+
+
+@app.get("/widgets/analysts")
+def widget_analysts(ticker: str):
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Missing ticker.")
+
+    cache_key = ("analysts", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    t = yf.Ticker(ticker)
+    info = _safe(lambda: t.info, default={}) or {}
+
+    ratings: dict[str, int] | None = None
+    raw_recs = _safe(lambda: t.recommendations)
+    if isinstance(raw_recs, pd.DataFrame) and not raw_recs.empty:
+        latest = raw_recs.iloc[0]
+        try:
+            ratings = {
+                "strong_buy":  int(latest.get("strongBuy", 0) or 0),
+                "buy":         int(latest.get("buy", 0) or 0),
+                "hold":        int(latest.get("hold", 0) or 0),
+                "sell":        int(latest.get("sell", 0) or 0),
+                "strong_sell": int(latest.get("strongSell", 0) or 0),
+            }
+        except Exception:  # noqa: BLE001
+            ratings = None
+
+    def _num(key: str) -> float | None:
+        v = info.get(key)
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    result = {
+        "ticker": ticker,
+        "current_price": _num("currentPrice") or _num("regularMarketPrice"),
+        "target_mean":  _num("targetMeanPrice"),
+        "target_high":  _num("targetHighPrice"),
+        "target_low":   _num("targetLowPrice"),
+        "target_median": _num("targetMedianPrice"),
+        "recommendation_mean": _num("recommendationMean"),
+        "recommendation_key":  info.get("recommendationKey"),
+        "num_analysts": int(info["numberOfAnalystOpinions"]) if isinstance(info.get("numberOfAnalystOpinions"), (int, float)) else None,
+        "ratings": ratings,
+    }
+    _cache_set(cache_key, result, ttl=900)  # 15 min
+    return result
 
 
 # --- Static frontend ---
