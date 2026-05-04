@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Stock Technical Analysis — Solarpunk</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            forest:     { DEFAULT: '#1A4D2E', dark: '#0F3320', light: '#2D6A40' },
+            sage:       { DEFAULT: '#7A9E5C', light: '#B5CD96', dark: '#5C7D44' },
+            gold:       { DEFAULT: '#FFD700', dark: '#D4AF37', light: '#FFE970' },
+            cream:      '#FAF6E9',
+            sand:       '#F0E8D0',
+            bark:       '#6B4423',
+            sienna:     '#B6351A',
+            terracotta: '#C97B5A',
+            ink:        '#2C3E2D',
+          },
+          fontFamily: {
+            sans: ['Outfit', 'ui-sans-serif', 'system-ui', '-apple-system', 'sans-serif'],
+          },
+        }
+      }
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <style>
+    :root {
+      --forest: #1A4D2E;
+      --forest-dark: #0F3320;
+      --sage: #7A9E5C;
+      --sage-light: #B5CD96;
+      --gold: #FFD700;
+      --gold-dark: #D4AF37;
+      --cream: #FAF6E9;
+      --sand: #F0E8D0;
+      --bark: #6B4423;
+      --sienna: #B6351A;
+      --ink: #2C3E2D;
+    }
+
+    html, body {
+      font-family: 'Outfit', ui-sans-serif, system-ui, sans-serif;
+      letter-spacing: -0.01em;
+    }
+
+    body {
+      color: var(--ink);
+      background:
+        radial-gradient(ellipse at 0% 0%, rgba(255, 215, 0, 0.18) 0%, transparent 45%),
+        radial-gradient(ellipse at 100% 100%, rgba(122, 158, 92, 0.20) 0%, transparent 50%),
+        linear-gradient(135deg, #FAF6E9 0%, #F0E8D0 100%);
+      background-attachment: fixed;
+      min-height: 100vh;
+    }
+
+    /* Decorative organic blobs floating behind everything */
+    .deco {
+      position: fixed;
+      pointer-events: none;
+      z-index: 0;
+      filter: blur(40px);
+      opacity: 0.35;
+    }
+    .deco-1 {
+      width: 520px; height: 520px;
+      top: -180px; right: -160px;
+      background: radial-gradient(circle, var(--gold) 0%, transparent 70%);
+      border-radius: 60% 40% 50% 50% / 50% 60% 40% 50%;
+    }
+    .deco-2 {
+      width: 600px; height: 600px;
+      bottom: -260px; left: -200px;
+      background: radial-gradient(circle, var(--forest) 0%, transparent 70%);
+      border-radius: 40% 60% 70% 30% / 50% 40% 60% 50%;
+      opacity: 0.25;
+    }
+    .deco-3 {
+      width: 360px; height: 360px;
+      top: 35%; left: -120px;
+      background: radial-gradient(circle, var(--sage) 0%, transparent 70%);
+      border-radius: 70% 30% 60% 40% / 40% 70% 30% 60%;
+      opacity: 0.20;
+    }
+
+    /* Asymmetric organic card shapes */
+    .card {
+      background: rgba(255, 253, 244, 0.92);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(122, 158, 92, 0.25);
+      border-radius: 28px 8px 28px 8px;
+      box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.6) inset,
+        0 10px 30px -10px rgba(26, 77, 46, 0.18);
+    }
+    .card-alt {
+      border-radius: 8px 28px 8px 28px;
+    }
+
+    /* Pill (history chip, badge) */
+    .pill {
+      border-radius: 999px;
+    }
+
+    /* Inputs */
+    .input, .select {
+      background: rgba(255, 253, 244, 0.85);
+      border: 1.5px solid rgba(122, 158, 92, 0.45);
+      border-radius: 14px;
+      color: var(--ink);
+      transition: border-color .15s, box-shadow .15s, background .15s;
+    }
+    .input:focus, .select:focus {
+      outline: none;
+      border-color: var(--gold-dark);
+      box-shadow: 0 0 0 4px rgba(255, 215, 0, 0.25);
+      background: #FFFEF7;
+    }
+    .input::placeholder { color: rgba(107, 68, 35, 0.45); }
+
+    /* Primary button */
+    .btn-primary {
+      background: linear-gradient(180deg, var(--forest-dark) 0%, var(--forest) 100%);
+      color: var(--cream);
+      border: 1.5px solid var(--forest-dark);
+      border-radius: 16px;
+      box-shadow: 0 6px 14px -6px rgba(26, 77, 46, 0.6), inset 0 1px 0 rgba(255, 215, 0, 0.15);
+      transition: transform .12s, box-shadow .15s, background .15s;
+      font-weight: 600;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: linear-gradient(180deg, var(--forest) 0%, var(--forest-dark) 100%);
+      box-shadow: 0 0 0 3px rgba(255, 215, 0, 0.35), 0 8px 16px -6px rgba(26, 77, 46, 0.6);
+      transform: translateY(-1px);
+    }
+    .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    /* Verdict badge tones */
+    .v-bullish      { background: var(--forest); color: var(--gold); border: 1px solid var(--forest-dark); }
+    .v-lean-bullish { background: rgba(122, 158, 92, 0.20); color: var(--forest-dark); border: 1px solid rgba(122, 158, 92, 0.5); }
+    .v-neutral      { background: rgba(212, 175, 55, 0.15); color: var(--bark); border: 1px solid rgba(212, 175, 55, 0.45); }
+    .v-lean-bearish { background: rgba(201, 123, 90, 0.18); color: #7C2D12; border: 1px solid rgba(201, 123, 90, 0.5); }
+    .v-bearish      { background: var(--sienna); color: var(--cream); border: 1px solid #7C2D12; }
+
+    /* Bullet tone dots & text — bullish leans on gold accent */
+    .tone-bullish-text { color: var(--forest-dark); }
+    .tone-bearish-text { color: var(--sienna); }
+    .tone-neutral-text { color: var(--bark); }
+    .tone-bullish-dot { background: var(--gold); box-shadow: 0 0 0 2px rgba(255, 215, 0, 0.25); }
+    .tone-bearish-dot { background: var(--sienna); }
+    .tone-neutral-dot { background: var(--sage); }
+
+    /* History chip */
+    .chip {
+      background: linear-gradient(180deg, rgba(255, 253, 244, 0.95) 0%, rgba(245, 239, 216, 0.95) 100%);
+      border: 1.5px solid rgba(122, 158, 92, 0.4);
+      color: var(--ink);
+      transition: all .15s;
+    }
+    .chip:hover {
+      border-color: var(--gold-dark);
+      background: linear-gradient(180deg, #FFFEF7 0%, rgba(255, 215, 0, 0.12) 100%);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 10px -4px rgba(212, 175, 55, 0.5);
+    }
+    .chip-count {
+      background: var(--forest);
+      color: var(--gold);
+      font-weight: 700;
+    }
+
+    /* Status banner */
+    .status-info  { background: rgba(122, 158, 92, 0.15); color: var(--forest-dark); border: 1px solid rgba(122, 158, 92, 0.4); border-radius: 18px; }
+    .status-error { background: rgba(182, 53, 26, 0.10); color: var(--sienna); border: 1px solid rgba(182, 53, 26, 0.35); border-radius: 18px; }
+
+    /* Indicator list rows */
+    .ind-row { border-bottom: 1px dashed rgba(122, 158, 92, 0.25); }
+    .ind-row:last-child { border-bottom: none; }
+
+    /* Numbers / monospace */
+    .mono { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; letter-spacing: 0; }
+
+    /* Header sun motif */
+    .sun {
+      width: 56px; height: 56px;
+      background:
+        radial-gradient(circle at 50% 50%, var(--gold) 0%, var(--gold-dark) 60%, transparent 70%);
+      border-radius: 50%;
+      position: relative;
+      box-shadow: 0 0 30px rgba(255, 215, 0, 0.55);
+      flex-shrink: 0;
+    }
+    .sun::before {
+      content: '';
+      position: absolute; inset: -8px;
+      border-radius: 50%;
+      background: conic-gradient(from 0deg,
+        transparent 0deg, rgba(255, 215, 0, 0.8) 8deg, transparent 22deg,
+        transparent 45deg, rgba(255, 215, 0, 0.8) 53deg, transparent 67deg,
+        transparent 90deg, rgba(255, 215, 0, 0.8) 98deg, transparent 112deg,
+        transparent 135deg, rgba(255, 215, 0, 0.8) 143deg, transparent 157deg,
+        transparent 180deg, rgba(255, 215, 0, 0.8) 188deg, transparent 202deg,
+        transparent 225deg, rgba(255, 215, 0, 0.8) 233deg, transparent 247deg,
+        transparent 270deg, rgba(255, 215, 0, 0.8) 278deg, transparent 292deg,
+        transparent 315deg, rgba(255, 215, 0, 0.8) 323deg, transparent 337deg);
+      mask: radial-gradient(circle, transparent 50%, black 52%);
+      -webkit-mask: radial-gradient(circle, transparent 50%, black 52%);
+      opacity: 0.9;
+    }
+  </style>
+</head>
+<body class="min-h-screen">
+  <!-- Decorative organic blobs -->
+  <div class="deco deco-1"></div>
+  <div class="deco deco-2"></div>
+  <div class="deco deco-3"></div>
+
+  <div class="relative max-w-7xl mx-auto px-4 py-10" style="z-index:1;">
+    <header class="mb-8 flex items-center gap-4">
+      <div class="sun" aria-hidden="true"></div>
+      <div>
+        <h1 class="text-4xl font-extrabold tracking-tight text-forest">Sunrise Ticker</h1>
+        <p class="text-bark/80 mt-1">Pull historical data, compute the standard technical indicators, and read the result in plain English.</p>
+      </div>
+    </header>
+
+    <!-- Controls -->
+    <section class="card p-5 mb-6">
+      <form id="analyze-form" class="flex flex-col sm:flex-row gap-3 sm:items-end">
+        <div class="flex-1">
+          <label class="block text-sm font-semibold text-forest-dark mb-1.5" for="ticker">Ticker</label>
+          <input id="ticker" name="ticker" type="text" required maxlength="10"
+            placeholder="e.g. AAPL, MSFT, NVDA"
+            class="input w-full uppercase px-4 py-2.5 font-medium" />
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-forest-dark mb-1.5" for="period">Lookback period</label>
+          <select id="period" name="period" class="select px-4 py-2.5 font-medium">
+            <option value="1wk">1 week</option>
+            <option value="1mo">1 month</option>
+            <option value="3mo" selected>3 months</option>
+            <option value="6mo">6 months</option>
+            <option value="1yr">1 year</option>
+          </select>
+        </div>
+        <button id="analyze-btn" type="submit" class="btn-primary px-7 py-2.5">
+          Analyze
+        </button>
+      </form>
+    </section>
+
+    <!-- Search history -->
+    <section id="history-card" class="card card-alt p-5 mb-6">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h2 class="font-bold text-forest-dark text-lg">Search history</h2>
+          <p id="history-meta" class="text-xs text-bark/70"></p>
+        </div>
+        <button id="clear-history-btn" type="button"
+          class="text-xs font-medium text-bark/60 hover:text-sienna disabled:opacity-40">Clear all</button>
+      </div>
+      <div id="history-list" class="text-sm text-bark/70">Loading…</div>
+    </section>
+
+    <div id="status" class="hidden mb-6 px-4 py-3 text-sm"></div>
+
+    <!-- Results -->
+    <section id="results" class="hidden space-y-6">
+      <!-- Verdict + Plain-English summary -->
+      <div class="card p-6">
+        <div class="flex items-center justify-between gap-4 mb-3 flex-wrap">
+          <h2 id="result-title" class="text-xl font-bold text-forest-dark"></h2>
+          <span id="verdict-badge" class="text-sm font-bold px-4 py-1.5 pill"></span>
+        </div>
+        <p id="summary-paragraph" class="text-ink/85 leading-relaxed"></p>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <!-- Charts column -->
+        <div class="lg:col-span-2 space-y-6">
+          <div class="card p-5">
+            <h3 class="font-bold text-forest-dark mb-3">Price &amp; overlays</h3>
+            <div class="relative h-80"><canvas id="price-chart"></canvas></div>
+          </div>
+          <div class="card card-alt p-5">
+            <h3 class="font-bold text-forest-dark mb-3">RSI (14)</h3>
+            <div class="relative h-44"><canvas id="rsi-chart"></canvas></div>
+          </div>
+          <div class="card p-5">
+            <h3 class="font-bold text-forest-dark mb-3">MACD (12, 26, 9)</h3>
+            <div class="relative h-44"><canvas id="macd-chart"></canvas></div>
+          </div>
+        </div>
+
+        <!-- Indicators + bullets column -->
+        <div class="space-y-6">
+          <div class="card card-alt p-5">
+            <h3 class="font-bold text-forest-dark mb-3">Indicator values</h3>
+            <dl id="indicator-list" class="text-sm"></dl>
+          </div>
+
+          <div class="card p-5">
+            <h3 class="font-bold text-forest-dark mb-3">Signals</h3>
+            <ul id="bullet-list" class="space-y-3 text-sm"></ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="mt-12 text-xs text-bark/60 text-center">
+      Data via Yahoo Finance / yfinance. Educational use only — not investment advice.
+    </footer>
+  </div>
+
+<script>
+// -------- Theme palette (mirrors CSS vars for Chart.js) --------
+const PALETTE = {
+  forest:    "#1A4D2E",
+  forestDk:  "#0F3320",
+  sage:      "#7A9E5C",
+  sageLight: "#B5CD96",
+  gold:      "#FFD700",
+  goldDk:    "#D4AF37",
+  bark:      "#6B4423",
+  sienna:    "#B6351A",
+  ink:       "#2C3E2D",
+  cream:     "#FAF6E9",
+};
+
+// Apply theme defaults to all Chart.js charts
+Chart.defaults.font.family = "'Outfit', ui-sans-serif, system-ui, sans-serif";
+Chart.defaults.font.size = 11;
+Chart.defaults.color = PALETTE.bark;
+Chart.defaults.borderColor = "rgba(122, 158, 92, 0.25)";
+
+const charts = { price: null, rsi: null, macd: null };
+
+const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
+const fmtBig = (v) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+
+const verdictClass = {
+  "bullish":      "v-bullish",
+  "lean-bullish": "v-lean-bullish",
+  "neutral":      "v-neutral",
+  "lean-bearish": "v-lean-bearish",
+  "bearish":      "v-bearish",
+};
+const verdictLabel = {
+  "bullish":      "Bullish",
+  "lean-bullish": "Leaning bullish",
+  "neutral":      "Neutral",
+  "lean-bearish": "Leaning bearish",
+  "bearish":      "Bearish",
+};
+const toneTextClass = {
+  "bullish": "tone-bullish-text",
+  "bearish": "tone-bearish-text",
+  "neutral": "tone-neutral-text",
+};
+const toneDotClass = {
+  "bullish": "tone-bullish-dot",
+  "bearish": "tone-bearish-dot",
+  "neutral": "tone-neutral-dot",
+};
+
+function setStatus(message, kind = "info") {
+  const el = document.getElementById("status");
+  if (!message) { el.classList.add("hidden"); el.textContent = ""; return; }
+  el.className = `mb-6 px-4 py-3 text-sm ${kind === "error" ? "status-error" : "status-info"}`;
+  el.textContent = message;
+  el.classList.remove("hidden");
+}
+
+function destroyCharts() {
+  for (const k of Object.keys(charts)) {
+    if (charts[k]) { charts[k].destroy(); charts[k] = null; }
+  }
+}
+
+function buildPriceChart(series) {
+  const ctx = document.getElementById("price-chart");
+  const datasets = [
+    { label: "Close",    data: series.close,    borderColor: PALETTE.forest,    backgroundColor: "rgba(26,77,46,0.06)", borderWidth: 2.5, pointRadius: 0, tension: 0.2, fill: true },
+    { label: "SMA 20",   data: series.SMA20,    borderColor: PALETTE.goldDk,    borderWidth: 1.75, pointRadius: 0, borderDash: [5,3] },
+    { label: "SMA 50",   data: series.SMA50,    borderColor: PALETTE.sage,      borderWidth: 1.75, pointRadius: 0, borderDash: [5,3] },
+    { label: "SMA 200",  data: series.SMA200,   borderColor: PALETTE.bark,      borderWidth: 1.75, pointRadius: 0, borderDash: [5,3] },
+    { label: "BB upper", data: series.BB_upper, borderColor: "rgba(122,158,92,0.55)", borderWidth: 1, pointRadius: 0, fill: false },
+    { label: "BB lower", data: series.BB_lower, borderColor: "rgba(122,158,92,0.55)", borderWidth: 1, pointRadius: 0, fill: "-1", backgroundColor: "rgba(255,215,0,0.06)" },
+  ].filter(d => d.data && d.data.some(v => v !== null));
+
+  charts.price = new Chart(ctx, {
+    type: "line",
+    data: { labels: series.labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 10, color: PALETTE.bark } },
+        tooltip: {
+          backgroundColor: PALETTE.forestDk, titleColor: PALETTE.gold, bodyColor: PALETTE.cream,
+          borderColor: PALETTE.gold, borderWidth: 1, padding: 10,
+          callbacks: { title: ctxs => ctxs[0].label?.slice(0,16) ?? "" },
+        },
+      },
+      scales: {
+        x: { grid: { color: "rgba(122,158,92,0.12)" }, ticks: { color: PALETTE.bark, maxTicksLimit: 8, callback: function(v){ return String(this.getLabelForValue(v)).slice(0,10); } } },
+        y: { position: "right", grid: { color: "rgba(122,158,92,0.12)" }, ticks: { color: PALETTE.bark } },
+      },
+    },
+  });
+}
+
+function buildRsiChart(series) {
+  const ctx = document.getElementById("rsi-chart");
+  charts.rsi = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: series.labels,
+      datasets: [
+        { label: "RSI",              data: series.RSI,                borderColor: PALETTE.bark,    backgroundColor: "rgba(107,68,35,0.06)", borderWidth: 2, pointRadius: 0, tension: 0.25, fill: true },
+        { label: "70 (overbought)",  data: series.RSI.map(() => 70),  borderColor: PALETTE.sienna,  borderWidth: 1, pointRadius: 0, borderDash: [3,3] },
+        { label: "30 (oversold)",    data: series.RSI.map(() => 30),  borderColor: PALETTE.sage,    borderWidth: 1, pointRadius: 0, borderDash: [3,3] },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 10, color: PALETTE.bark } },
+        tooltip: { backgroundColor: PALETTE.forestDk, titleColor: PALETTE.gold, bodyColor: PALETTE.cream, borderColor: PALETTE.gold, borderWidth: 1 },
+      },
+      scales: {
+        y: { min: 0, max: 100, position: "right", grid: { color: "rgba(122,158,92,0.12)" }, ticks: { color: PALETTE.bark } },
+        x: { grid: { color: "rgba(122,158,92,0.12)" }, ticks: { color: PALETTE.bark, maxTicksLimit: 8, callback: function(v){ return String(this.getLabelForValue(v)).slice(0,10); } } },
+      },
+    },
+  });
+}
+
+function buildMacdChart(series) {
+  const ctx = document.getElementById("macd-chart");
+  const histColors = series.MACD_hist.map(v =>
+    v === null ? "rgba(0,0,0,0)" :
+    (v >= 0 ? "rgba(122,158,92,0.7)" : "rgba(182,53,26,0.65)"));
+  charts.macd = new Chart(ctx, {
+    data: {
+      labels: series.labels,
+      datasets: [
+        { type: "bar",  label: "Histogram", data: series.MACD_hist,   backgroundColor: histColors, borderWidth: 0, order: 3 },
+        { type: "line", label: "MACD",      data: series.MACD,        borderColor: PALETTE.forest, borderWidth: 2,   pointRadius: 0, tension: 0.25, order: 1 },
+        { type: "line", label: "Signal",    data: series.MACD_signal, borderColor: PALETTE.goldDk, borderWidth: 1.75, pointRadius: 0, tension: 0.25, order: 2 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: "bottom", labels: { boxWidth: 10, color: PALETTE.bark } },
+        tooltip: { backgroundColor: PALETTE.forestDk, titleColor: PALETTE.gold, bodyColor: PALETTE.cream, borderColor: PALETTE.gold, borderWidth: 1 },
+      },
+      scales: {
+        y: { position: "right", grid: { color: "rgba(122,158,92,0.12)" }, ticks: { color: PALETTE.bark } },
+        x: { grid: { color: "rgba(122,158,92,0.12)" }, ticks: { color: PALETTE.bark, maxTicksLimit: 8, callback: function(v){ return String(this.getLabelForValue(v)).slice(0,10); } } },
+      },
+    },
+  });
+}
+
+function renderIndicators(ind) {
+  const rows = [
+    ["Price",            fmt(ind.price)],
+    ["SMA 20",           fmt(ind.SMA20)],
+    ["SMA 50",           fmt(ind.SMA50)],
+    ["SMA 200",          fmt(ind.SMA200)],
+    ["EMA 12",           fmt(ind.EMA12)],
+    ["EMA 26",           fmt(ind.EMA26)],
+    ["RSI (14)",         fmt(ind.RSI, 1)],
+    ["MACD",             fmt(ind.MACD, 3)],
+    ["MACD signal",      fmt(ind.MACD_signal, 3)],
+    ["MACD hist.",       fmt(ind.MACD_hist, 3)],
+    ["BB upper (20,2)",  fmt(ind.BB_upper)],
+    ["BB middle",        fmt(ind.BB_mid)],
+    ["BB lower",         fmt(ind.BB_lower)],
+    ["Volume",           fmtBig(ind.volume_last)],
+    ["Volume avg (20)",  fmtBig(ind.volume_avg20)],
+    ["Support (low)",    fmt(ind.support)],
+    ["Resistance (high)",fmt(ind.resistance)],
+    ["SMA20 slope",      ind.SMA20_slope_pct === null ? "—" : `${ind.SMA20_slope_pct.toFixed(2)}% / bar`],
+  ];
+  const dl = document.getElementById("indicator-list");
+  dl.innerHTML = rows.map(([k, v]) =>
+    `<div class="ind-row flex items-center justify-between py-2"><dt class="text-bark/80">${k}</dt><dd class="mono font-semibold text-forest-dark">${v}</dd></div>`
+  ).join("");
+}
+
+function renderBullets(bullets) {
+  const ul = document.getElementById("bullet-list");
+  ul.innerHTML = bullets.map(b => `
+    <li class="flex gap-3">
+      <span class="mt-1.5 inline-block w-2.5 h-2.5 rounded-full flex-shrink-0 ${toneDotClass[b.tone] || toneDotClass.neutral}"></span>
+      <div>
+        <div class="font-semibold ${toneTextClass[b.tone] || toneTextClass.neutral}">${b.label}</div>
+        <div class="text-ink/75">${b.text}</div>
+      </div>
+    </li>
+  `).join("");
+}
+
+const PERIOD_LABEL = {
+  "1wk": "1 week",
+  "1mo": "1 month",
+  "3mo": "3 months",
+  "6mo": "6 months",
+  "1yr": "1 year",
+};
+
+function timeAgo(iso) {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const diff = Math.max(0, Date.now() - then);
+  const m = Math.floor(diff / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hr ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d} day${d === 1 ? "" : "s"} ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+async function loadHistory() {
+  const list = document.getElementById("history-list");
+  const meta = document.getElementById("history-meta");
+  const clearBtn = document.getElementById("clear-history-btn");
+  try {
+    const res = await fetch("/history");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data.items.length) {
+      list.innerHTML = `<span class="text-bark/50">No searches yet — analyze a ticker to start your history.</span>`;
+      meta.textContent = "";
+      clearBtn.disabled = true;
+      return;
+    }
+    meta.textContent = `${data.unique} ticker${data.unique === 1 ? "" : "s"} · ${data.total} total search${data.total === 1 ? "" : "es"}`;
+    clearBtn.disabled = false;
+    list.innerHTML = `<div class="flex flex-wrap gap-2">${
+      data.items.map(item => {
+        const periodLabel = PERIOD_LABEL[item.last_period] || item.last_period || "";
+        const ago = timeAgo(item.last_searched);
+        const tip = `Last: ${periodLabel}${ago ? " · " + ago : ""}`;
+        return `
+          <button type="button" class="history-chip chip pill inline-flex items-center gap-2 px-3.5 py-1.5"
+            data-ticker="${item.ticker}" data-period="${item.last_period || ""}" title="${tip}">
+            <span class="font-bold tracking-wide">${item.ticker}</span>
+            <span class="chip-count text-xs px-2 py-0.5 pill">${item.count}</span>
+            <span class="text-xs text-bark/70">${periodLabel}${ago ? " · " + ago : ""}</span>
+          </button>
+        `;
+      }).join("")
+    }</div>`;
+
+    list.querySelectorAll(".history-chip").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const t = btn.dataset.ticker;
+        const p = btn.dataset.period;
+        document.getElementById("ticker").value = t;
+        if (p) document.getElementById("period").value = p;
+        document.getElementById("analyze-form").requestSubmit();
+      });
+    });
+  } catch (err) {
+    list.innerHTML = `<span class="text-sienna">Couldn’t load history: ${err.message}</span>`;
+  }
+}
+
+document.getElementById("clear-history-btn").addEventListener("click", async () => {
+  if (!confirm("Clear all search history?")) return;
+  await fetch("/history", { method: "DELETE" });
+  loadHistory();
+});
+
+async function analyze(ticker, period) {
+  const res = await fetch("/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticker, period }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Request failed (${res.status})`);
+  }
+  return res.json();
+}
+
+document.getElementById("analyze-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const ticker = document.getElementById("ticker").value.trim().toUpperCase();
+  const period = document.getElementById("period").value;
+  if (!ticker) return;
+
+  const btn = document.getElementById("analyze-btn");
+  btn.disabled = true; btn.textContent = "Analyzing…";
+  setStatus(`Fetching ${ticker} (${period})…`, "info");
+  document.getElementById("results").classList.add("hidden");
+
+  try {
+    const data = await analyze(ticker, period);
+    setStatus("");
+
+    document.getElementById("result-title").textContent =
+      `${data.ticker} — ${data.period_label} (${data.bars} bars, ${data.interval})`;
+
+    const badge = document.getElementById("verdict-badge");
+    badge.textContent = verdictLabel[data.summary.verdict] || data.summary.verdict;
+    badge.className = `text-sm font-bold px-4 py-1.5 pill ${verdictClass[data.summary.verdict] || verdictClass.neutral}`;
+
+    document.getElementById("summary-paragraph").textContent = data.summary.paragraph;
+
+    destroyCharts();
+    buildPriceChart(data.series);
+    buildRsiChart(data.series);
+    buildMacdChart(data.series);
+    renderIndicators(data.indicators);
+    renderBullets(data.summary.bullets);
+
+    document.getElementById("results").classList.remove("hidden");
+    loadHistory();
+  } catch (err) {
+    setStatus(err.message || "Something went wrong.", "error");
+  } finally {
+    btn.disabled = false; btn.textContent = "Analyze";
+  }
+});
+
+// Prefill for quick demo + load history on page open
+document.getElementById("ticker").value = "AAPL";
+loadHistory();
+</script>
+</body>
+</html>
