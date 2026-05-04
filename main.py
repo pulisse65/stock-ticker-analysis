@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +15,8 @@ import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+
+log = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Stock Ticker Analysis")
 
@@ -40,12 +44,49 @@ class AnalyzeRequest(BaseModel):
 
 
 # ----------------------------- Search history -----------------------------
+#
+# Two backends selected by env:
+#   - Supabase (Postgres) when SUPABASE_URL + SUPABASE_KEY are set — the
+#     production path on Render, since Render free-tier disks are ephemeral.
+#   - Local JSON file otherwise — keeps `./run.sh` working with no env setup.
+#
+# The Postgres table is expected to look like:
+#   create table search_history (
+#     ticker text primary key,
+#     count integer not null default 0,
+#     last_period text,
+#     last_searched timestamptz not null default now(),
+#     first_searched timestamptz not null default now()
+#   );
 
 HISTORY_FILE = Path(__file__).parent / "history.json"
+HISTORY_TABLE = "search_history"
 _history_lock = threading.Lock()
 
+_SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+_SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+_supabase_client: Any = None
 
-def _load_history() -> dict[str, dict[str, Any]]:
+if _SUPABASE_URL and _SUPABASE_KEY:
+    try:
+        from supabase import create_client  # type: ignore
+
+        _supabase_client = create_client(_SUPABASE_URL, _SUPABASE_KEY)
+        log.info("Search history: using Supabase backend.")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Supabase client init failed (%s); falling back to JSON file.", exc)
+        _supabase_client = None
+else:
+    log.info("Search history: using local JSON file (no SUPABASE_URL/SUPABASE_KEY set).")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# --- JSON-file backend ---
+
+def _load_history_json() -> dict[str, dict[str, Any]]:
     if not HISTORY_FILE.exists():
         return {}
     try:
@@ -55,24 +96,117 @@ def _load_history() -> dict[str, dict[str, Any]]:
         return {}
 
 
-def _save_history(data: dict[str, dict[str, Any]]) -> None:
+def _save_history_json(data: dict[str, dict[str, Any]]) -> None:
     tmp = HISTORY_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(HISTORY_FILE)
 
 
-def _record_search(ticker: str, period: str) -> None:
+def _record_search_json(ticker: str, period: str) -> None:
     with _history_lock:
-        h = _load_history()
+        h = _load_history_json()
         entry = h.get(ticker) or {"count": 0, "last_period": None, "last_searched": None}
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now_iso()
         entry["count"] = int(entry.get("count", 0)) + 1
         entry["last_period"] = period
         entry["last_searched"] = now
         if not entry.get("first_searched"):
             entry["first_searched"] = now
         h[ticker] = entry
-        _save_history(h)
+        _save_history_json(h)
+
+
+def _list_history_json() -> list[dict[str, Any]]:
+    h = _load_history_json()
+    items = [{"ticker": t, **entry} for t, entry in h.items()]
+    items.sort(key=lambda x: (x.get("count", 0), x.get("last_searched") or ""), reverse=True)
+    return items
+
+
+def _clear_history_json() -> None:
+    with _history_lock:
+        if HISTORY_FILE.exists():
+            HISTORY_FILE.unlink()
+
+
+# --- Supabase backend ---
+
+def _record_search_supabase(ticker: str, period: str) -> None:
+    assert _supabase_client is not None
+    now = _now_iso()
+    existing = (
+        _supabase_client.table(HISTORY_TABLE)
+        .select("count, first_searched")
+        .eq("ticker", ticker)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        new_count = int(existing.data[0].get("count", 0)) + 1
+        first_searched = existing.data[0].get("first_searched") or now
+    else:
+        new_count = 1
+        first_searched = now
+
+    _supabase_client.table(HISTORY_TABLE).upsert(
+        {
+            "ticker": ticker,
+            "count": new_count,
+            "last_period": period,
+            "last_searched": now,
+            "first_searched": first_searched,
+        },
+        on_conflict="ticker",
+    ).execute()
+
+
+def _list_history_supabase() -> list[dict[str, Any]]:
+    assert _supabase_client is not None
+    res = (
+        _supabase_client.table(HISTORY_TABLE)
+        .select("ticker, count, last_period, last_searched, first_searched")
+        .order("count", desc=True)
+        .order("last_searched", desc=True)
+        .execute()
+    )
+    return list(res.data or [])
+
+
+def _clear_history_supabase() -> None:
+    assert _supabase_client is not None
+    # Supabase requires a filter on delete; this matches every row.
+    _supabase_client.table(HISTORY_TABLE).delete().gte("count", 0).execute()
+
+
+# --- Public dispatch ---
+
+def _record_search(ticker: str, period: str) -> None:
+    if _supabase_client is not None:
+        try:
+            _record_search_supabase(ticker, period)
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Supabase record_search failed (%s); falling back to JSON.", exc)
+    _record_search_json(ticker, period)
+
+
+def _list_history() -> list[dict[str, Any]]:
+    if _supabase_client is not None:
+        try:
+            return _list_history_supabase()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Supabase list_history failed (%s); falling back to JSON.", exc)
+    return _list_history_json()
+
+
+def _clear_history_all() -> None:
+    if _supabase_client is not None:
+        try:
+            _clear_history_supabase()
+            return
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Supabase clear_history failed (%s); falling back to JSON.", exc)
+    _clear_history_json()
 
 
 def _clean(series: pd.Series) -> list[float | None]:
@@ -485,18 +619,19 @@ def analyze(req: AnalyzeRequest):
 
 @app.get("/history")
 def get_history():
-    h = _load_history()
-    items = [{"ticker": ticker, **entry} for ticker, entry in h.items()]
-    items.sort(key=lambda x: (x.get("count", 0), x.get("last_searched") or ""), reverse=True)
+    items = _list_history()
     total = sum(int(item.get("count", 0)) for item in items)
-    return {"items": items, "unique": len(items), "total": total}
+    return {
+        "items": items,
+        "unique": len(items),
+        "total": total,
+        "backend": "supabase" if _supabase_client is not None else "json",
+    }
 
 
 @app.delete("/history")
 def clear_history():
-    with _history_lock:
-        if HISTORY_FILE.exists():
-            HISTORY_FILE.unlink()
+    _clear_history_all()
     return {"ok": True}
 
 
