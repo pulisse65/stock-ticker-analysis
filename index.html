@@ -563,6 +563,8 @@
               <th class="text-left py-3 px-4 font-medium hidden sm:table-cell">Name</th>
               <th class="text-right py-3 px-4 font-medium">Price</th>
               <th class="text-right py-3 px-4 font-medium">Day</th>
+              <th class="text-right py-3 px-4 font-medium hidden md:table-cell">Week</th>
+              <th class="text-right py-3 px-4 font-medium hidden md:table-cell">Month</th>
               <th class="text-center py-3 px-4 font-medium">Verdict</th>
               <th class="py-3 px-4"></th>
             </tr>
@@ -1492,26 +1494,35 @@ function renderWatchlistRows(items, asOf) {
   document.getElementById("watchlist-card").classList.remove("hidden");
   document.getElementById("watchlist-as-of").textContent = asOf ? `as of ${timeAgo(asOf)}` : "";
   const tbody = document.getElementById("watchlist-tbody");
+  const fmtPctCell = (v) => {
+    if (v == null) return { cls: "text-ink-dim", txt: "—" };
+    return {
+      cls: v >= 0 ? "val-up" : "val-down",
+      txt: `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`,
+    };
+  };
   tbody.innerHTML = items.map(it => {
     if (it.error) {
       return `<tr class="border-b border-line">
         <td class="py-2.5 px-4 mono font-semibold text-ink">${escapeHTML(it.ticker)}</td>
-        <td class="py-2.5 px-4 text-down text-xs" colspan="4">${escapeHTML(it.error)}</td>
+        <td class="py-2.5 px-4 text-down text-xs" colspan="6">${escapeHTML(it.error)}</td>
         <td class="py-2.5 px-4 text-right">
           <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
         </td>
       </tr>`;
     }
-    const chg = it.change_pct;
-    const chgCls = chg == null ? "text-ink-dim" : (chg >= 0 ? "val-up" : "val-down");
-    const chgStr = chg == null ? "—" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`;
+    const day = fmtPctCell(it.change_pct);
+    const wk  = fmtPctCell(it.change_pct_1w);
+    const mo  = fmtPctCell(it.change_pct_1mo);
     const verdictCls = verdictPillClass[it.verdict] || verdictPillClass.neutral;
     const verdictTxt = verdictShort[it.verdict] || it.verdict || "—";
     return `<tr class="border-b border-line hover:bg-bg-hover">
       <td class="py-2.5 px-4 mono font-semibold text-ink"><a href="#" class="watchlist-go" data-ticker="${escapeHTML(it.ticker)}">${escapeHTML(it.ticker)}</a></td>
       <td class="py-2.5 px-4 text-ink-dim hidden sm:table-cell text-sm truncate max-w-[200px]">${escapeHTML(it.name || "")}</td>
       <td class="py-2.5 px-4 text-right mono text-ink">${it.price != null ? `$${it.price.toFixed(2)}` : "—"}</td>
-      <td class="py-2.5 px-4 text-right mono ${chgCls}">${chgStr}</td>
+      <td class="py-2.5 px-4 text-right mono ${day.cls}">${day.txt}</td>
+      <td class="py-2.5 px-4 text-right mono ${wk.cls} hidden md:table-cell">${wk.txt}</td>
+      <td class="py-2.5 px-4 text-right mono ${mo.cls} hidden md:table-cell">${mo.txt}</td>
       <td class="py-2.5 px-4 text-center"><span class="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full ${verdictCls}">${verdictTxt}</span></td>
       <td class="py-2.5 px-4 text-right">
         <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
@@ -1545,7 +1556,7 @@ async function refreshWatchlist() {
   document.getElementById("watchlist-card").classList.remove("hidden");
   const tbody = document.getElementById("watchlist-tbody");
   if (!tbody.children.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="py-8 text-center text-ink-faint"><span class="loader inline-block align-middle"></span> <span class="ml-2">Loading…</span></td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="py-8 text-center text-ink-faint"><span class="loader inline-block align-middle"></span> <span class="ml-2">Loading…</span></td></tr>`;
   }
   try {
     const r = await fetch(`/watchlist?tickers=${encodeURIComponent(watchlistTickers.join(","))}`);
@@ -1553,7 +1564,7 @@ async function refreshWatchlist() {
     const data = await r.json();
     renderWatchlistRows(data.items, data.as_of);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-down text-sm">${escapeHTML(err.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-down text-sm">${escapeHTML(err.message)}</td></tr>`;
   }
 }
 

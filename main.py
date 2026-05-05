@@ -295,6 +295,16 @@ def _quick_verdict_from_close(close: pd.Series) -> dict[str, Any]:
 
     n = len(close)
 
+    def _change_pct_back(bars: int) -> float | None:
+        """% change vs the close `bars` trading days ago."""
+        if n <= bars:
+            return None
+        ref = float(close.iloc[-bars - 1])
+        return ((last_price / ref) - 1) * 100.0 if ref else None
+
+    change_pct_1w  = _change_pct_back(5)   # ~1 week (5 trading days)
+    change_pct_1mo = _change_pct_back(21)  # ~1 month (21 trading days)
+
     def _safe_float(v: Any) -> float | None:
         if v is None:
             return None
@@ -347,6 +357,8 @@ def _quick_verdict_from_close(close: pd.Series) -> dict[str, Any]:
         "prev_close": prev_close,
         "change_pct": change_pct,
         "change_abs": change_abs,
+        "change_pct_1w": change_pct_1w,
+        "change_pct_1mo": change_pct_1mo,
         "indicators": {
             "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
             "RSI": rsi, "MACD": macd_v, "MACD_signal": macd_sig_v,
@@ -1124,6 +1136,8 @@ def watchlist(tickers: str):
             "prev_close": v.get("prev_close"),
             "change_pct": v.get("change_pct"),
             "change_abs": v.get("change_abs"),
+            "change_pct_1w": v.get("change_pct_1w"),
+            "change_pct_1mo": v.get("change_pct_1mo"),
             "verdict": v.get("verdict"),
             "score": v.get("score"),
         })
