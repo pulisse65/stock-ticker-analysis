@@ -201,11 +201,6 @@
     .no-scrollbar::-webkit-scrollbar { display: none; }
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
-    /* Theme-aware logo swap */
-    [data-theme="dark"]  .logo-light { display: none; }
-    [data-theme="light"] .logo-dark  { display: none; }
-    [data-theme="light"] .logo-light { display: block; }
-
     /* Theme toggle icon visibility */
     [data-theme="dark"]  .theme-icon-moon { display: none; }
     [data-theme="light"] .theme-icon-sun  { display: none; }
@@ -379,8 +374,7 @@
   <header class="border-b border-line sticky top-0 z-20 backdrop-blur-md" style="background: var(--header-bg);">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
       <a href="/" class="flex items-center" aria-label="Ticker Tracker — home">
-        <img src="/static/logo.png"       alt="Ticker Tracker" class="logo-dark  h-20 w-auto" />
-        <img src="/static/logo-light.png" alt="Ticker Tracker" class="logo-light h-20 w-auto hidden" />
+        <img src="/static/logo.png" alt="Ticker Tracker" class="h-20 w-auto" />
       </a>
 
       <nav class="flex items-center gap-0 overflow-x-auto no-scrollbar">
