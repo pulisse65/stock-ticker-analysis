@@ -16,21 +16,34 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
+  <!-- Set theme before paint to avoid FOUC -->
+  <script>
+    (function() {
+      try {
+        const saved = localStorage.getItem("theme");
+        const theme = (saved === "light" || saved === "dark") ? saved
+          : (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+        document.documentElement.dataset.theme = theme;
+      } catch (e) {
+        document.documentElement.dataset.theme = "dark";
+      }
+    })();
+  </script>
+
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {
-      darkMode: 'class',
       theme: {
         extend: {
           colors: {
-            bg:        { DEFAULT: '#0B0E11', card: '#131720', hover: '#1B202C', input: '#0F141C' },
-            line:      { DEFAULT: '#232936', strong: '#2D3548' },
-            ink:       { DEFAULT: '#E7EAF0', dim: '#9AA3B2', faint: '#5F6A7D' },
-            brand:     { DEFAULT: '#3B82F6', dark: '#1D4ED8', glow: 'rgba(59,130,246,0.18)' },
-            up:        { DEFAULT: '#22C55E', dim: 'rgba(34,197,94,0.18)' },
-            down:      { DEFAULT: '#EF4444', dim: 'rgba(239,68,68,0.18)' },
-            warn:      { DEFAULT: '#F59E0B', dim: 'rgba(245,158,11,0.18)' },
-            accent:    { DEFAULT: '#06B6D4' },
+            bg:        { DEFAULT: 'var(--bg)', card: 'var(--bg-card)', hover: 'var(--bg-hover)', input: 'var(--bg-input)' },
+            line:      { DEFAULT: 'var(--line)', strong: 'var(--line-strong)' },
+            ink:       { DEFAULT: 'var(--ink)', dim: 'var(--ink-dim)', faint: 'var(--ink-faint)' },
+            brand:     { DEFAULT: 'var(--brand)', dark: 'var(--brand-dark)' },
+            up:        { DEFAULT: 'var(--up)' },
+            down:      { DEFAULT: 'var(--down)' },
+            warn:      { DEFAULT: 'var(--warn)' },
+            accent:    { DEFAULT: 'var(--accent)' },
           },
           fontFamily: {
             sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'sans-serif'],
@@ -43,11 +56,13 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
   <style>
-    :root {
+    /* Dark theme (default) */
+    :root, [data-theme="dark"] {
       --bg: #0B0E11;
       --bg-card: #131720;
       --bg-hover: #1B202C;
       --bg-input: #0F141C;
+      --header-bg: rgba(11, 14, 17, 0.85);
       --line: #232936;
       --line-strong: #2D3548;
       --ink: #E7EAF0;
@@ -56,9 +71,39 @@
       --brand: #3B82F6;
       --brand-dark: #1D4ED8;
       --up: #22C55E;
+      --up-text: #4ADE80;
       --down: #EF4444;
+      --down-text: #F87171;
       --warn: #F59E0B;
       --accent: #06B6D4;
+      --grid: rgba(45, 53, 72, 0.4);
+      --tooltip-bg: #0F141C;
+      --card-shadow: none;
+    }
+
+    /* Light theme */
+    [data-theme="light"] {
+      --bg: #F7F8FA;
+      --bg-card: #FFFFFF;
+      --bg-hover: #F1F3F5;
+      --bg-input: #FFFFFF;
+      --header-bg: rgba(255, 255, 255, 0.85);
+      --line: #E1E4E8;
+      --line-strong: #C8CDD3;
+      --ink: #1F2328;
+      --ink-dim: #57606A;
+      --ink-faint: #8B939E;
+      --brand: #2563EB;
+      --brand-dark: #1D4ED8;
+      --up: #16A34A;
+      --up-text: #15803D;
+      --down: #DC2626;
+      --down-text: #B91C1C;
+      --warn: #B45309;
+      --accent: #0891B2;
+      --grid: rgba(190, 197, 206, 0.5);
+      --tooltip-bg: #1F2328;
+      --card-shadow: 0 1px 2px rgba(31, 35, 40, 0.04), 0 0 0 1px rgba(31, 35, 40, 0.04);
     }
 
     html, body {
@@ -85,6 +130,11 @@
       background: var(--bg-card);
       border: 1px solid var(--line);
       border-radius: 12px;
+      box-shadow: var(--card-shadow);
+    }
+
+    .widget {
+      box-shadow: var(--card-shadow);
     }
 
     .card-hover:hover { border-color: var(--line-strong); }
@@ -151,6 +201,15 @@
     .no-scrollbar::-webkit-scrollbar { display: none; }
     .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
 
+    /* Theme-aware logo swap */
+    [data-theme="dark"]  .logo-light { display: none; }
+    [data-theme="light"] .logo-dark  { display: none; }
+    [data-theme="light"] .logo-light { display: block; }
+
+    /* Theme toggle icon visibility */
+    [data-theme="dark"]  .theme-icon-moon { display: none; }
+    [data-theme="light"] .theme-icon-sun  { display: none; }
+
     /* Watchlist + Sectors specifics */
     .pill-up   { background: rgba(34,197,94,0.15);  color: #4ADE80; border: 1px solid rgba(34,197,94,0.4); }
     .pill-down { background: rgba(239,68,68,0.15);  color: #F87171; border: 1px solid rgba(239,68,68,0.4); }
@@ -188,15 +247,15 @@
     .learn-card .read-arrow { color: var(--brand); font-weight: 600; }
 
     /* Verdict badge */
-    .v-bullish      { background: rgba(34,197,94,0.15); color: #4ADE80; border: 1px solid rgba(34,197,94,0.4); }
-    .v-lean-bullish { background: rgba(34,197,94,0.08); color: #86EFAC; border: 1px solid rgba(34,197,94,0.25); }
+    .v-bullish      { background: rgba(34,197,94,0.15); color: var(--up-text);   border: 1px solid rgba(34,197,94,0.4); }
+    .v-lean-bullish { background: rgba(34,197,94,0.08); color: var(--up-text);   border: 1px solid rgba(34,197,94,0.25); }
     .v-neutral      { background: rgba(154,163,178,0.10); color: var(--ink-dim); border: 1px solid var(--line); }
-    .v-lean-bearish { background: rgba(239,68,68,0.08); color: #FCA5A5; border: 1px solid rgba(239,68,68,0.25); }
-    .v-bearish      { background: rgba(239,68,68,0.15); color: #F87171; border: 1px solid rgba(239,68,68,0.4); }
+    .v-lean-bearish { background: rgba(239,68,68,0.08); color: var(--down-text); border: 1px solid rgba(239,68,68,0.25); }
+    .v-bearish      { background: rgba(239,68,68,0.15); color: var(--down-text); border: 1px solid rgba(239,68,68,0.4); }
 
     /* Bullet tones */
-    .tone-bullish-text { color: #4ADE80; }
-    .tone-bearish-text { color: #F87171; }
+    .tone-bullish-text { color: var(--up-text); }
+    .tone-bearish-text { color: var(--down-text); }
     .tone-neutral-text { color: var(--ink-dim); }
     .tone-bullish-dot { background: var(--up); }
     .tone-bearish-dot { background: var(--down); }
@@ -221,8 +280,8 @@
     }
 
     /* Status banners */
-    .status-info  { background: rgba(59,130,246,0.10); color: #93C5FD; border: 1px solid rgba(59,130,246,0.30); border-radius: 8px; }
-    .status-error { background: rgba(239,68,68,0.10); color: #FCA5A5; border: 1px solid rgba(239,68,68,0.30); border-radius: 8px; }
+    .status-info  { background: rgba(59,130,246,0.10); color: var(--brand);     border: 1px solid rgba(59,130,246,0.30); border-radius: 8px; }
+    .status-error { background: rgba(239,68,68,0.10); color: var(--down-text);  border: 1px solid rgba(239,68,68,0.30); border-radius: 8px; }
 
     /* Indicator rows */
     .ind-row { border-bottom: 1px solid var(--line); }
@@ -317,10 +376,11 @@
 </head>
 <body>
   <!-- Header -->
-  <header class="border-b border-line sticky top-0 z-20 backdrop-blur-md" style="background: rgba(11,14,17,0.85);">
+  <header class="border-b border-line sticky top-0 z-20 backdrop-blur-md" style="background: var(--header-bg);">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
       <a href="/" class="flex items-center" aria-label="Ticker Tracker — home">
-        <img src="/static/logo.png" alt="Ticker Tracker" class="h-12 w-auto" />
+        <img src="/static/logo.png"       alt="Ticker Tracker" class="logo-dark  h-20 w-auto" />
+        <img src="/static/logo-light.png" alt="Ticker Tracker" class="logo-light h-20 w-auto hidden" />
       </a>
 
       <nav class="flex items-center gap-0 overflow-x-auto no-scrollbar">
@@ -333,6 +393,17 @@
 
       <div class="flex items-center gap-3">
         <span id="active-ticker-pill" class="ticker-pill hidden">—</span>
+        <button id="theme-toggle" type="button" class="btn-ghost px-2.5 py-2 flex items-center justify-center" title="Toggle theme" aria-label="Toggle theme">
+          <!-- Moon icon (shown in light mode → click to go dark) -->
+          <svg class="theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+          <!-- Sun icon (shown in dark mode → click to go light) -->
+          <svg class="theme-icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+          </svg>
+        </button>
       </div>
     </div>
   </header>
@@ -676,22 +747,29 @@
   </footer>
 
 <script>
-// ===================== Theme palette (mirrors CSS for Chart.js) =====================
-const PALETTE = {
-  bg:        "#0B0E11",
-  bgCard:    "#131720",
-  line:      "#232936",
-  lineSt:    "#2D3548",
-  ink:       "#E7EAF0",
-  inkDim:    "#9AA3B2",
-  inkFaint:  "#5F6A7D",
-  brand:     "#3B82F6",
-  brandDk:   "#1D4ED8",
-  up:        "#22C55E",
-  down:      "#EF4444",
-  warn:      "#F59E0B",
-  accent:    "#06B6D4",
-};
+// ===================== Theme palette (live-reads from CSS vars) =====================
+const PALETTE = {};
+
+function readPalette() {
+  const css = getComputedStyle(document.documentElement);
+  const v = (n) => css.getPropertyValue(n).trim();
+  PALETTE.bg       = v("--bg");
+  PALETTE.bgCard   = v("--bg-card");
+  PALETTE.line     = v("--line");
+  PALETTE.lineSt   = v("--line-strong");
+  PALETTE.ink      = v("--ink");
+  PALETTE.inkDim   = v("--ink-dim");
+  PALETTE.inkFaint = v("--ink-faint");
+  PALETTE.brand    = v("--brand");
+  PALETTE.brandDk  = v("--brand-dark");
+  PALETTE.up       = v("--up");
+  PALETTE.down     = v("--down");
+  PALETTE.warn     = v("--warn");
+  PALETTE.accent   = v("--accent");
+  PALETTE.grid     = v("--grid");
+  PALETTE.tooltipBg = v("--tooltip-bg");
+}
+readPalette();
 
 Chart.defaults.font.family = "'Inter', ui-sans-serif, system-ui, sans-serif";
 Chart.defaults.font.size = 11;
@@ -701,7 +779,34 @@ Chart.defaults.borderColor = PALETTE.line;
 // ===================== Shared state =====================
 const state = {
   currentTicker: null,
+  lastAnalyze: null,  // cached so we can redraw charts on theme change
 };
+
+// ===================== Theme toggle =====================
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  try { localStorage.setItem("theme", theme); } catch {}
+  readPalette();
+  Chart.defaults.color = PALETTE.inkDim;
+  Chart.defaults.borderColor = PALETTE.line;
+  // Redraw any open analysis charts with new palette
+  if (state.lastAnalyze) {
+    destroyCharts();
+    buildPriceChart(state.lastAnalyze.series);
+    buildRsiChart(state.lastAnalyze.series);
+    buildMacdChart(state.lastAnalyze.series);
+  }
+  // Re-mount TradingView widget if visible (it bakes the theme into the iframe)
+  const tvBody = document.getElementById("widget-tradingview-body");
+  if (tvBody && tvBody.children.length && state.currentTicker && enabledWidgets.includes("tradingview")) {
+    renderTradingView(state.currentTicker);
+  }
+}
+
+document.getElementById("theme-toggle").addEventListener("click", () => {
+  const cur = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+  applyTheme(cur === "light" ? "dark" : "light");
+});
 
 // ===================== Helpers =====================
 const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "—" : Number(v).toFixed(d);
@@ -797,14 +902,14 @@ function destroyCharts() {
 
 function commonAxis() {
   return {
-    grid: { color: "rgba(45,53,72,0.4)", drawBorder: false },
+    grid: { color: PALETTE.grid, drawBorder: false },
     ticks: { color: PALETTE.inkFaint, maxTicksLimit: 8, callback: function(v){ return String(this.getLabelForValue(v)).slice(0,10); } },
   };
 }
 
 function commonTooltip() {
   return {
-    backgroundColor: "#0F141C",
+    backgroundColor: PALETTE.tooltipBg,
     titleColor: PALETTE.ink, bodyColor: PALETTE.inkDim,
     borderColor: PALETTE.lineSt, borderWidth: 1, padding: 10, displayColors: true,
   };
@@ -1010,6 +1115,8 @@ document.getElementById("analyze-form").addEventListener("submit", async (e) => 
     badge.className = `text-xs font-bold uppercase tracking-wider px-3 py-1 rounded-full ${verdictClass[data.summary.verdict] || verdictClass.neutral}`;
 
     document.getElementById("summary-paragraph").textContent = data.summary.paragraph;
+
+    state.lastAnalyze = data;  // cache for theme-toggle redraws
 
     destroyCharts();
     buildPriceChart(data.series);
@@ -1303,13 +1410,14 @@ function renderTradingView(ticker) {
     body.innerHTML = `<div class="tradingview-widget-container" style="height: 320px; width: 100%;">
       <div class="tradingview-widget-container__widget" style="height:100%; width:100%;"></div>
     </div>`;
+    const isLight = document.documentElement.dataset.theme === "light";
     const config = {
       symbol: ticker,
       width: "100%",
       height: "100%",
       locale: "en",
       dateRange: "12M",
-      colorTheme: "dark",
+      colorTheme: isLight ? "light" : "dark",
       isTransparent: true,
       autosize: false,
       largeChartUrl: "",
