@@ -17,6 +17,7 @@ import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("uvicorn.error")
@@ -1191,7 +1192,21 @@ def sectors():
 
 
 # --- Static frontend ---
-INDEX = Path(__file__).parent / "index.html"
+ROOT = Path(__file__).parent
+INDEX = ROOT / "index.html"
+STATIC_DIR = ROOT / "static"
+
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """Serve favicon.ico at root path because browsers auto-fetch /favicon.ico."""
+    f = STATIC_DIR / "favicon.ico"
+    if f.exists():
+        return FileResponse(f, media_type="image/x-icon")
+    raise HTTPException(status_code=404)
 
 
 @app.get("/")
