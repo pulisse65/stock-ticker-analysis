@@ -262,6 +262,98 @@ def _slope_pct(series: pd.Series) -> float | None:
     return float(slope / mean * 100.0)
 
 
+def _verdict_from_score(score: int) -> str:
+    """Map an aggregate signal score to a verdict label."""
+    if score >= 3:
+        return "bullish"
+    if score >= 1:
+        return "lean-bullish"
+    if score <= -3:
+        return "bearish"
+    if score <= -1:
+        return "lean-bearish"
+    return "neutral"
+
+
+def _quick_verdict_from_close(close: pd.Series) -> dict[str, Any]:
+    """Compute a verdict + change% from a daily close series.
+
+    Used by /watchlist and /sectors to score many tickers cheaply.
+    Mirrors the same signals as /analyze (price vs SMAs, RSI, MACD, BB)
+    but skips bullet-text generation.
+    """
+    close = close.dropna()
+    if len(close) < 2:
+        return {"verdict": "neutral", "score": 0, "price": None, "prev_close": None,
+                "change_pct": None, "change_abs": None, "indicators": {}}
+
+    last_price = float(close.iloc[-1])
+    prev_close = float(close.iloc[-2])
+    change_abs = last_price - prev_close
+    change_pct = (change_abs / prev_close * 100.0) if prev_close else None
+
+    n = len(close)
+
+    def _safe_float(v: Any) -> float | None:
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return None if math.isnan(f) else f
+
+    sma20 = _safe_float(close.rolling(20).mean().iloc[-1]) if n >= 20 else None
+    sma50 = _safe_float(close.rolling(50).mean().iloc[-1]) if n >= 50 else None
+    sma200 = _safe_float(close.rolling(200).mean().iloc[-1]) if n >= 200 else None
+
+    rsi_series = _rsi(close, 14)
+    rsi = _safe_float(rsi_series.iloc[-1]) if not rsi_series.dropna().empty else None
+
+    macd_line, macd_signal, _ = _macd(close)
+    macd_v = _safe_float(macd_line.iloc[-1])
+    macd_sig_v = _safe_float(macd_signal.iloc[-1])
+
+    bb_upper, bb_mid, bb_lower = _bollinger(close, 20, 2.0)
+    bbu = _safe_float(bb_upper.iloc[-1]) if n >= 20 else None
+    bbl = _safe_float(bb_lower.iloc[-1]) if n >= 20 else None
+
+    score = 0
+    if sma20 is not None:
+        score += 1 if last_price > sma20 else -1
+    if sma20 is not None and sma50 is not None:
+        score += 1 if sma20 > sma50 else -1
+    if sma200 is not None:
+        score += 1 if last_price > sma200 else -1
+    if rsi is not None:
+        if rsi >= 70:
+            score -= 1
+        elif rsi <= 30:
+            score += 1
+    if macd_v is not None and macd_sig_v is not None:
+        score += 1 if macd_v > macd_sig_v else -1
+    if bbu is not None and bbl is not None and (bbu - bbl) > 0:
+        pos = (last_price - bbl) / (bbu - bbl)
+        if pos >= 0.95:
+            score -= 1
+        elif pos <= 0.05:
+            score += 1
+
+    return {
+        "verdict": _verdict_from_score(score),
+        "score": score,
+        "price": last_price,
+        "prev_close": prev_close,
+        "change_pct": change_pct,
+        "change_abs": change_abs,
+        "indicators": {
+            "SMA20": sma20, "SMA50": sma50, "SMA200": sma200,
+            "RSI": rsi, "MACD": macd_v, "MACD_signal": macd_sig_v,
+            "BB_upper": bbu, "BB_lower": bbl,
+        },
+    }
+
+
 def _build_summary(ind: dict[str, Any], price: float, period_label: str, ticker: str) -> tuple[str, list[dict[str, str]], str]:
     """Return (paragraph_summary, bullet_signals, overall_verdict)."""
     bullets: list[dict[str, str]] = []
@@ -473,21 +565,14 @@ def _build_summary(ind: dict[str, Any], price: float, period_label: str, ticker:
         })
 
     # --- Verdict ---
-    if score >= 3:
-        verdict = "bullish"
-        verdict_text = "an overall bullish setup"
-    elif score >= 1:
-        verdict = "lean-bullish"
-        verdict_text = "a slight bullish lean"
-    elif score <= -3:
-        verdict = "bearish"
-        verdict_text = "an overall bearish setup"
-    elif score <= -1:
-        verdict = "lean-bearish"
-        verdict_text = "a slight bearish lean"
-    else:
-        verdict = "neutral"
-        verdict_text = "a mixed/neutral picture"
+    verdict = _verdict_from_score(score)
+    verdict_text = {
+        "bullish": "an overall bullish setup",
+        "lean-bullish": "a slight bullish lean",
+        "bearish": "an overall bearish setup",
+        "lean-bearish": "a slight bearish lean",
+        "neutral": "a mixed/neutral picture",
+    }[verdict]
 
     paragraph = (
         f"Over the past {period_label}, {ticker.upper()} is showing {verdict_text}. "
@@ -906,6 +991,201 @@ def widget_analysts(ticker: str):
         "num_analysts": int(info["numberOfAnalystOpinions"]) if isinstance(info.get("numberOfAnalystOpinions"), (int, float)) else None,
         "ratings": ratings,
     }
+    _cache_set(cache_key, result, ttl=900)  # 15 min
+    return result
+
+
+# ----------------------------- Watchlist + Sectors -----------------------------
+#
+# Both endpoints reuse `_quick_verdict_from_close` to score many tickers from
+# a single batched yf.download() call instead of one HTTP round-trip per ticker.
+
+# 11 SPDR sector ETFs + their top large-cap components (US-listed, by market
+# cap; not strictly NYSE-only since most tech / communication-services giants
+# trade on NASDAQ — strict NYSE filtering would gut the most useful sectors).
+SECTORS: list[dict[str, Any]] = [
+    {"name": "Technology", "etf": "XLK",
+     "components": ["AAPL","MSFT","NVDA","AVGO","ORCL","CRM","ADBE","AMD","CSCO","INTC","TXN","QCOM","IBM","NOW","INTU"]},
+    {"name": "Financials", "etf": "XLF",
+     "components": ["JPM","BAC","WFC","GS","MS","BLK","AXP","C","SCHW","BX","KKR","USB","PNC","COF","MMC"]},
+    {"name": "Health Care", "etf": "XLV",
+     "components": ["LLY","UNH","JNJ","MRK","ABBV","TMO","PFE","ABT","DHR","ISRG","AMGN","GILD","BMY","CI","MDT"]},
+    {"name": "Consumer Discretionary", "etf": "XLY",
+     "components": ["AMZN","TSLA","HD","MCD","NKE","LOW","BKNG","TJX","SBUX","CMG","MAR","ABNB","F","GM","ORLY"]},
+    {"name": "Consumer Staples", "etf": "XLP",
+     "components": ["WMT","COST","PG","KO","PEP","PM","MO","MDLZ","CL","TGT","KHC","MNST","GIS","KMB","KR"]},
+    {"name": "Energy", "etf": "XLE",
+     "components": ["XOM","CVX","COP","EOG","SLB","MPC","OXY","PSX","VLO","WMB","KMI","OKE","BKR","HAL","FANG"]},
+    {"name": "Industrials", "etf": "XLI",
+     "components": ["CAT","GE","RTX","HON","UPS","BA","UNP","ETN","DE","LMT","ADP","NOC","TT","GD","EMR"]},
+    {"name": "Materials", "etf": "XLB",
+     "components": ["LIN","SHW","ECL","APD","FCX","NEM","DOW","DD","CTVA","NUE","MLM","VMC","IFF","PPG","IP"]},
+    {"name": "Utilities", "etf": "XLU",
+     "components": ["NEE","SO","DUK","AEP","SRE","CEG","D","EXC","XEL","EIX","WEC","PCG","PEG","ED","ETR"]},
+    {"name": "Real Estate", "etf": "XLRE",
+     "components": ["PLD","AMT","EQIX","WELL","SPG","CCI","PSA","O","DLR","EXR","AVB","EQR","INVH","ARE","VICI"]},
+    {"name": "Communication Services", "etf": "XLC",
+     "components": ["META","GOOGL","GOOG","NFLX","TMUS","DIS","CMCSA","T","VZ","CHTR","EA","WBD","TTWO","OMC","IPG"]},
+]
+
+
+def _safe_str(v: Any) -> str | None:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    return str(v)
+
+
+def _score_tickers_bulk(tickers: list[str], period: str = "3mo") -> dict[str, dict[str, Any]]:
+    """Batch-fetch closes for many tickers and run _quick_verdict on each.
+
+    Returns {ticker: {price, change_pct, verdict, ...}} or {error} per ticker.
+    """
+    if not tickers:
+        return {}
+
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for t in tickers:
+        u = t.strip().upper()
+        if u and u not in seen:
+            seen.add(u)
+            unique.append(u)
+
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        df = yf.download(
+            tickers=unique,
+            period=period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Bulk yf.download failed: %s", exc)
+        return {t: {"error": f"download failed: {exc}"} for t in unique}
+
+    for t in unique:
+        try:
+            if len(unique) == 1:
+                close = df["Close"] if "Close" in df.columns else None
+            else:
+                close = df[t]["Close"] if (t in df.columns.get_level_values(0)) else None
+
+            if close is None or close.dropna().empty:
+                out[t] = {"error": "no data"}
+                continue
+
+            v = _quick_verdict_from_close(close.astype(float))
+            out[t] = v
+        except Exception as exc:  # noqa: BLE001
+            out[t] = {"error": f"compute failed: {exc}"}
+
+    return out
+
+
+@app.get("/watchlist")
+def watchlist(tickers: str):
+    """Score a list of tickers cheaply for the Watchlist tab.
+
+    Query param: tickers=AAPL,MSFT,NVDA  (max 50)
+    Returns: { items: [ {ticker, name, price, change_pct, verdict, ...}, ... ], as_of }
+    """
+    raw = [t.strip().upper() for t in (tickers or "").split(",") if t.strip()]
+    if not raw:
+        raise HTTPException(400, "Provide at least one ticker.")
+    if len(raw) > 50:
+        raise HTTPException(400, "Max 50 tickers per request.")
+
+    cache_key = ("watchlist", tuple(sorted(raw)))
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    scored = _score_tickers_bulk(raw, period="3mo")
+
+    # Try to enrich with company short-name (cheap; uses already-cached info
+    # path inside yfinance). Best-effort — don't fail the whole request if
+    # one name lookup blows up.
+    items: list[dict[str, Any]] = []
+    for t in raw:
+        v = scored.get(t, {})
+        if "error" in v:
+            items.append({"ticker": t, "error": v["error"]})
+            continue
+        name = _safe(lambda t=t: yf.Ticker(t).info.get("shortName") or yf.Ticker(t).info.get("longName"))
+        items.append({
+            "ticker": t,
+            "name": name,
+            "price": v.get("price"),
+            "prev_close": v.get("prev_close"),
+            "change_pct": v.get("change_pct"),
+            "change_abs": v.get("change_abs"),
+            "verdict": v.get("verdict"),
+            "score": v.get("score"),
+        })
+
+    result = {"items": items, "as_of": _now_iso()}
+    _cache_set(cache_key, result, ttl=120)  # 2 min — markets move
+    return result
+
+
+@app.get("/sectors")
+def sectors():
+    """Sector overview: 11 sector ETFs as headlines + top components per sector.
+
+    Heavy: ~225 tickers per cache miss; aggressively cached for 15 min.
+    """
+    cache_key = ("sectors",)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    all_tickers: list[str] = []
+    for sec in SECTORS:
+        all_tickers.append(sec["etf"])
+        all_tickers.extend(sec["components"])
+
+    scored = _score_tickers_bulk(all_tickers, period="3mo")
+
+    sectors_out: list[dict[str, Any]] = []
+    for sec in SECTORS:
+        etf_v = scored.get(sec["etf"], {})
+        components_out: list[dict[str, Any]] = []
+        for c in sec["components"]:
+            cv = scored.get(c, {})
+            if "error" in cv:
+                continue
+            components_out.append({
+                "ticker": c,
+                "price": cv.get("price"),
+                "change_pct": cv.get("change_pct"),
+                "verdict": cv.get("verdict"),
+                "score": cv.get("score"),
+            })
+
+        # Sector tally — how the components break down
+        tally = {"bullish": 0, "lean-bullish": 0, "neutral": 0, "lean-bearish": 0, "bearish": 0}
+        for c in components_out:
+            v = c.get("verdict")
+            if v in tally:
+                tally[v] += 1
+
+        sectors_out.append({
+            "name": sec["name"],
+            "etf": {
+                "ticker": sec["etf"],
+                "price": etf_v.get("price"),
+                "change_pct": etf_v.get("change_pct"),
+                "verdict": etf_v.get("verdict"),
+            } if "error" not in etf_v else {"ticker": sec["etf"], "error": etf_v.get("error")},
+            "components": components_out,
+            "tally": tally,
+        })
+
+    result = {"sectors": sectors_out, "as_of": _now_iso()}
     _cache_set(cache_key, result, ttl=900)  # 15 min
     return result
 

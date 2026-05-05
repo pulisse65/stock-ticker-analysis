@@ -141,6 +141,45 @@
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
 
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+    /* Watchlist + Sectors specifics */
+    .pill-up   { background: rgba(34,197,94,0.15);  color: #4ADE80; border: 1px solid rgba(34,197,94,0.4); }
+    .pill-down { background: rgba(239,68,68,0.15);  color: #F87171; border: 1px solid rgba(239,68,68,0.4); }
+    .pill-flat { background: rgba(154,163,178,0.10); color: var(--ink-dim); border: 1px solid var(--line); }
+
+    .tally-bar { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--line); }
+    .tally-seg { height: 100%; }
+
+    /* Sector card hover */
+    .sector-card { transition: border-color .12s, transform .12s; }
+    .sector-card:hover { border-color: var(--line-strong); }
+
+    /* Learn tab styling */
+    .learn-card h3 { color: var(--ink); font-weight: 600; }
+    .learn-card .term {
+      display: inline-block;
+      background: var(--bg-input);
+      border: 1px solid var(--line);
+      padding: 0.05rem 0.45rem;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--brand);
+      margin-right: 0.25rem;
+    }
+    .learn-card kbd {
+      background: var(--bg-input);
+      border: 1px solid var(--line);
+      padding: 0 0.35rem;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.78rem;
+      color: var(--ink-dim);
+    }
+    .learn-card .read-arrow { color: var(--brand); font-weight: 600; }
+
     /* Verdict badge */
     .v-bullish      { background: rgba(34,197,94,0.15); color: #4ADE80; border: 1px solid rgba(34,197,94,0.4); }
     .v-lean-bullish { background: rgba(34,197,94,0.08); color: #86EFAC; border: 1px solid rgba(34,197,94,0.25); }
@@ -292,9 +331,12 @@
         <h1 class="text-lg font-bold tracking-tight">Ticker Tracker</h1>
       </div>
 
-      <nav class="flex items-center gap-1">
+      <nav class="flex items-center gap-0 overflow-x-auto no-scrollbar">
         <button class="tab-btn active" data-tab="analysis">Analysis</button>
         <button class="tab-btn" data-tab="dashboard">Dashboard</button>
+        <button class="tab-btn" data-tab="watchlist">Watchlist</button>
+        <button class="tab-btn" data-tab="sectors">Sectors</button>
+        <button class="tab-btn" data-tab="learn">Learn</button>
       </nav>
 
       <div class="flex items-center gap-3">
@@ -426,6 +468,213 @@
       <!-- Widget grid -->
       <div id="widget-grid" class="hidden grid grid-cols-1 lg:grid-cols-2 gap-5">
         <!-- widgets injected here -->
+      </div>
+    </section>
+
+    <!-- ============================== WATCHLIST TAB ============================== -->
+    <section id="tab-watchlist" class="tab-panel space-y-5">
+      <section class="card p-4 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+        <form id="watchlist-add-form" class="flex items-center gap-2">
+          <label class="text-xs font-medium text-ink-dim uppercase tracking-wider" for="watchlist-input">Add ticker</label>
+          <input id="watchlist-input" type="text" maxlength="10" placeholder="e.g. AAPL"
+            class="input uppercase px-3 py-1.5 font-medium mono w-32" />
+          <button type="submit" class="btn-primary px-4 py-1.5 text-sm">Add</button>
+        </form>
+        <div class="flex items-center gap-2">
+          <span id="watchlist-as-of" class="text-xs text-ink-faint mono"></span>
+          <button id="watchlist-refresh" type="button" class="btn-ghost px-3 py-1.5 text-sm flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <polyline points="1 20 1 14 7 14"/>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+            </svg>
+            Refresh
+          </button>
+        </div>
+      </section>
+
+      <div id="watchlist-empty" class="card p-10 text-center text-ink-dim">
+        <div class="text-base font-medium text-ink mb-1">Your watchlist is empty</div>
+        <div class="text-sm">Add tickers above to track them here. Verdicts are based on a 3-month technical read of the same indicators as the Analysis tab.</div>
+      </div>
+
+      <div id="watchlist-card" class="card hidden overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="text-xs uppercase tracking-wider text-ink-dim border-b border-line">
+            <tr>
+              <th class="text-left py-3 px-4 font-medium">Ticker</th>
+              <th class="text-left py-3 px-4 font-medium hidden sm:table-cell">Name</th>
+              <th class="text-right py-3 px-4 font-medium">Price</th>
+              <th class="text-right py-3 px-4 font-medium">Day</th>
+              <th class="text-center py-3 px-4 font-medium">Verdict</th>
+              <th class="py-3 px-4"></th>
+            </tr>
+          </thead>
+          <tbody id="watchlist-tbody"></tbody>
+        </table>
+      </div>
+
+      <p class="text-xs text-ink-faint">
+        Tip: the verdict reflects multi-week trend (SMAs, RSI, MACD, Bollinger). A stock can be down today but still "bullish" if the longer-term trend is intact — see the <a href="#" data-go-tab="learn" class="text-brand hover:underline">Learn</a> tab for what each indicator means.
+      </p>
+    </section>
+
+    <!-- ============================== SECTORS TAB ============================== -->
+    <section id="tab-sectors" class="tab-panel space-y-5">
+      <section class="card p-4 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+        <div>
+          <h2 class="font-semibold text-ink">Market Sectors</h2>
+          <p class="text-xs text-ink-faint mt-0.5">11 SPDR sector ETFs as headlines, with ~15 top large-cap components per sector. Verdicts use the same 3-month indicator read as the Analysis tab.</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="sectors-as-of" class="text-xs text-ink-faint mono"></span>
+          <button id="sectors-refresh" type="button" class="btn-ghost px-3 py-1.5 text-sm flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <polyline points="1 20 1 14 7 14"/>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+            </svg>
+            Refresh
+          </button>
+        </div>
+      </section>
+
+      <div id="sectors-loading" class="card p-10 text-center text-ink-dim">
+        <div class="flex items-center justify-center gap-2 text-sm"><span class="loader"></span><span>Loading sectors… (first load can take 5-10s while the cache warms)</span></div>
+      </div>
+      <div id="sectors-grid" class="hidden grid grid-cols-1 lg:grid-cols-2 gap-5"></div>
+    </section>
+
+    <!-- ============================== LEARN TAB ============================== -->
+    <section id="tab-learn" class="tab-panel space-y-5">
+      <div class="card p-5">
+        <h2 class="text-lg font-semibold text-ink mb-2">How to read this app</h2>
+        <p class="text-sm text-ink-dim leading-relaxed">
+          Ticker Tracker computes a small set of widely-used technical indicators on a stock's recent price action and rolls them up into an overall verdict — <span class="tone-bullish-text font-semibold">bullish</span>,
+          <span class="tone-bullish-text font-semibold">leaning bullish</span>,
+          <span class="tone-neutral-text font-semibold">neutral</span>,
+          <span class="tone-bearish-text font-semibold">leaning bearish</span>, or
+          <span class="tone-bearish-text font-semibold">bearish</span>. Each indicator below contributes ±1 to a score; the score maps to the verdict. Indicators measure different things, so they can disagree — that's normal, and the spread is itself information.
+        </p>
+        <p class="text-xs text-ink-faint mt-3">None of this is investment advice. Indicators describe past price behavior; markets do not reliably repeat. Always pair technicals with fundamentals and risk management.</p>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+        <!-- Trend -->
+        <div class="card p-5 learn-card">
+          <h3 class="text-base mb-3">📈 Trend — Moving Averages</h3>
+          <div class="space-y-3 text-sm">
+            <div>
+              <span class="term">SMA</span><span class="text-ink">Simple Moving Average</span>
+              <p class="text-ink-dim mt-1">The unweighted average of the last N closing prices. <span class="term">SMA 20</span> uses 20 bars, <span class="term">SMA 50</span> uses 50, <span class="term">SMA 200</span> uses 200.</p>
+              <p class="text-ink-dim mt-1"><span class="read-arrow">▸</span> Price <em>above</em> a moving average = uptrend (bullish). <em>Below</em> = downtrend (bearish). Short SMA above long SMA confirms the trend (the classic "golden cross" / "death cross" setup).</p>
+            </div>
+            <div>
+              <span class="term">EMA</span><span class="text-ink">Exponential Moving Average</span>
+              <p class="text-ink-dim mt-1">Same idea as SMA but recent prices are weighted more heavily, so EMA reacts faster. Used as the inputs to MACD.</p>
+            </div>
+            <div>
+              <span class="term">SMA20 slope</span><span class="text-ink">Direction of the short-term trend</span>
+              <p class="text-ink-dim mt-1">Linear regression slope of the SMA20 over the period, in % per bar. Positive = the short-term trend is rising; negative = falling; near zero = consolidation.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- RSI -->
+        <div class="card p-5 learn-card">
+          <h3 class="text-base mb-3">⚡ Momentum — RSI</h3>
+          <div class="space-y-3 text-sm">
+            <div>
+              <span class="term">RSI(14)</span><span class="text-ink">Relative Strength Index</span>
+              <p class="text-ink-dim mt-1">Compares the average size of recent up moves to recent down moves on a 0-100 scale. 14-bar window is the standard.</p>
+              <p class="text-ink-dim mt-1"><span class="read-arrow">▸</span> <kbd>≥ 70</kbd> overbought (move is stretched, possible pullback). <kbd>≤ 30</kbd> oversold (selloff is stretched, possible bounce). <kbd>30-70</kbd> neutral. RSI works best in range-bound markets — in strong trends it can stay overbought/oversold for weeks.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- MACD -->
+        <div class="card p-5 learn-card">
+          <h3 class="text-base mb-3">🌊 Momentum — MACD</h3>
+          <div class="space-y-3 text-sm">
+            <div>
+              <span class="term">MACD(12,26,9)</span><span class="text-ink">Moving Average Convergence Divergence</span>
+              <p class="text-ink-dim mt-1">The MACD line is the difference between the 12-bar and 26-bar EMAs. The signal line is a 9-bar EMA of the MACD line. The histogram is the gap between them.</p>
+              <p class="text-ink-dim mt-1"><span class="read-arrow">▸</span> MACD <em>crossing above</em> signal = bullish. MACD <em>crossing below</em> signal = bearish. A growing histogram = momentum is building in that direction; a shrinking histogram = it's fading.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Bollinger -->
+        <div class="card p-5 learn-card">
+          <h3 class="text-base mb-3">🎯 Volatility — Bollinger Bands</h3>
+          <div class="space-y-3 text-sm">
+            <div>
+              <span class="term">BB(20,2)</span><span class="text-ink">20-bar SMA ± 2 standard deviations</span>
+              <p class="text-ink-dim mt-1">A volatility envelope around price. The middle line is the SMA20; the upper/lower bands are 2σ above/below.</p>
+              <p class="text-ink-dim mt-1"><span class="read-arrow">▸</span> Price <em>pinned to upper band</em> (≥ 95% of the way up) = stretched, possible mean reversion. <em>Pinned to lower band</em> = oversold. Bands <em>squeezing tight</em> = volatility is compressed and a breakout is likely (direction not specified).</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Volume -->
+        <div class="card p-5 learn-card">
+          <h3 class="text-base mb-3">📊 Volume</h3>
+          <div class="space-y-3 text-sm">
+            <div>
+              <span class="term">Volume vs avg(20)</span><span class="text-ink">Conviction check</span>
+              <p class="text-ink-dim mt-1">Today's volume compared to the 20-bar average.</p>
+              <p class="text-ink-dim mt-1"><span class="read-arrow">▸</span> <kbd>≥ 1.5×</kbd> avg = high conviction (the move has buyers/sellers behind it). <kbd>≤ 0.6×</kbd> avg = light volume (move is less reliable; can be reversed easily).</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Support / resistance -->
+        <div class="card p-5 learn-card">
+          <h3 class="text-base mb-3">🧱 Support &amp; Resistance</h3>
+          <div class="space-y-3 text-sm">
+            <div>
+              <span class="term">Swing high / low</span><span class="text-ink">Levels where price has reacted</span>
+              <p class="text-ink-dim mt-1">Resistance is the highest high in the period — past sellers stepped in there. Support is the lowest low — past buyers stepped in.</p>
+              <p class="text-ink-dim mt-1"><span class="read-arrow">▸</span> Watch these as price approaches them. A clean break + retest typically signals trend continuation; failure to break = trend exhaustion.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- How verdict scoring works -->
+        <div class="card p-5 learn-card lg:col-span-2">
+          <h3 class="text-base mb-3">🧮 How the verdict is scored</h3>
+          <div class="text-sm text-ink-dim space-y-2">
+            <p>Each indicator contributes ±1 to a running score:</p>
+            <ul class="list-disc pl-5 space-y-1">
+              <li>Price above SMA20 → +1, below → −1</li>
+              <li>SMA20 above SMA50 → +1, below → −1</li>
+              <li>Price above SMA200 → +1, below → −1 (only if 200 bars are available)</li>
+              <li>RSI ≥ 70 → −1 (overbought is bearish), ≤ 30 → +1 (oversold is bullish)</li>
+              <li>MACD line above signal → +1, below → −1</li>
+              <li>Price ≥ 95% of BB range → −1, ≤ 5% → +1</li>
+            </ul>
+            <p class="mt-2">Final score → verdict: <kbd>≥ 3</kbd> bullish · <kbd>1-2</kbd> leaning bullish · <kbd>0</kbd> neutral · <kbd>-1 to -2</kbd> leaning bearish · <kbd>≤ -3</kbd> bearish.</p>
+          </div>
+        </div>
+
+        <!-- How to read the charts -->
+        <div class="card p-5 learn-card lg:col-span-2">
+          <h3 class="text-base mb-3">🗺️ How to read the charts (Analysis tab)</h3>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+            <div>
+              <div class="font-semibold text-ink mb-1">Price &amp; overlays</div>
+              <p class="text-ink-dim">The blue filled line is closing price. The dashed lines are SMAs (20=amber, 50=green, 200=cyan). The grey channel is the Bollinger Band envelope. Look for: where price sits in the channel, whether it's above/below SMAs, whether SMAs are stacked in trend order.</p>
+            </div>
+            <div>
+              <div class="font-semibold text-ink mb-1">RSI panel</div>
+              <p class="text-ink-dim">A 0-100 oscillator. The two dashed lines are 70 (red, overbought) and 30 (green, oversold). Sustained moves above/below are momentum extremes. Divergence vs price (RSI making lower highs while price makes higher highs, or vice versa) is a classic reversal warning.</p>
+            </div>
+            <div>
+              <div class="font-semibold text-ink mb-1">MACD panel</div>
+              <p class="text-ink-dim">Blue = MACD line, amber = signal line. Histogram bars are the gap between them — green when MACD &gt; signal, red when below. Watch for crossovers (sign change in the histogram) and for the histogram expanding vs shrinking.</p>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
   </main>
@@ -1109,6 +1358,269 @@ document.addEventListener("click", (e) => {
 });
 
 renderWidgetToggles();
+
+// ===================== Watchlist =====================
+function loadWatchlistTickers() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("watchlist.tickers") || "null");
+    if (Array.isArray(saved)) return saved.filter(t => typeof t === "string" && t.length > 0 && t.length <= 10);
+  } catch {}
+  return [];
+}
+function saveWatchlistTickers(arr) {
+  localStorage.setItem("watchlist.tickers", JSON.stringify(arr));
+}
+let watchlistTickers = loadWatchlistTickers();
+
+const verdictPillClass = {
+  "bullish":      "v-bullish",
+  "lean-bullish": "v-lean-bullish",
+  "neutral":      "v-neutral",
+  "lean-bearish": "v-lean-bearish",
+  "bearish":      "v-bearish",
+};
+const verdictShort = {
+  "bullish": "Bullish",
+  "lean-bullish": "Lean bull",
+  "neutral": "Neutral",
+  "lean-bearish": "Lean bear",
+  "bearish": "Bearish",
+};
+
+function renderWatchlistEmpty() {
+  document.getElementById("watchlist-empty").classList.remove("hidden");
+  document.getElementById("watchlist-card").classList.add("hidden");
+  document.getElementById("watchlist-as-of").textContent = "";
+}
+
+function renderWatchlistRows(items, asOf) {
+  document.getElementById("watchlist-empty").classList.add("hidden");
+  document.getElementById("watchlist-card").classList.remove("hidden");
+  document.getElementById("watchlist-as-of").textContent = asOf ? `as of ${timeAgo(asOf)}` : "";
+  const tbody = document.getElementById("watchlist-tbody");
+  tbody.innerHTML = items.map(it => {
+    if (it.error) {
+      return `<tr class="border-b border-line">
+        <td class="py-2.5 px-4 mono font-semibold text-ink">${escapeHTML(it.ticker)}</td>
+        <td class="py-2.5 px-4 text-down text-xs" colspan="4">${escapeHTML(it.error)}</td>
+        <td class="py-2.5 px-4 text-right">
+          <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
+        </td>
+      </tr>`;
+    }
+    const chg = it.change_pct;
+    const chgCls = chg == null ? "text-ink-dim" : (chg >= 0 ? "val-up" : "val-down");
+    const chgStr = chg == null ? "—" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}%`;
+    const verdictCls = verdictPillClass[it.verdict] || verdictPillClass.neutral;
+    const verdictTxt = verdictShort[it.verdict] || it.verdict || "—";
+    return `<tr class="border-b border-line hover:bg-bg-hover">
+      <td class="py-2.5 px-4 mono font-semibold text-ink"><a href="#" class="watchlist-go" data-ticker="${escapeHTML(it.ticker)}">${escapeHTML(it.ticker)}</a></td>
+      <td class="py-2.5 px-4 text-ink-dim hidden sm:table-cell text-sm truncate max-w-[200px]">${escapeHTML(it.name || "")}</td>
+      <td class="py-2.5 px-4 text-right mono text-ink">${it.price != null ? `$${it.price.toFixed(2)}` : "—"}</td>
+      <td class="py-2.5 px-4 text-right mono ${chgCls}">${chgStr}</td>
+      <td class="py-2.5 px-4 text-center"><span class="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full ${verdictCls}">${verdictTxt}</span></td>
+      <td class="py-2.5 px-4 text-right">
+        <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
+      </td>
+    </tr>`;
+  }).join("");
+
+  tbody.querySelectorAll(".watchlist-remove").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const t = btn.dataset.ticker;
+      watchlistTickers = watchlistTickers.filter(x => x !== t);
+      saveWatchlistTickers(watchlistTickers);
+      refreshWatchlist();
+    });
+  });
+  tbody.querySelectorAll(".watchlist-go").forEach(a => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      const t = a.dataset.ticker;
+      document.getElementById("ticker").value = t;
+      document.getElementById("analyze-form").requestSubmit();
+      setTab("analysis");
+    });
+  });
+}
+
+async function refreshWatchlist() {
+  if (!watchlistTickers.length) { renderWatchlistEmpty(); return; }
+  // Show prior data while fetching; otherwise show a tiny spinner
+  document.getElementById("watchlist-empty").classList.add("hidden");
+  document.getElementById("watchlist-card").classList.remove("hidden");
+  const tbody = document.getElementById("watchlist-tbody");
+  if (!tbody.children.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="py-8 text-center text-ink-faint"><span class="loader inline-block align-middle"></span> <span class="ml-2">Loading…</span></td></tr>`;
+  }
+  try {
+    const r = await fetch(`/watchlist?tickers=${encodeURIComponent(watchlistTickers.join(","))}`);
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    renderWatchlistRows(data.items, data.as_of);
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-down text-sm">${escapeHTML(err.message)}</td></tr>`;
+  }
+}
+
+document.getElementById("watchlist-add-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const inp = document.getElementById("watchlist-input");
+  const t = inp.value.trim().toUpperCase();
+  if (!t) return;
+  if (!watchlistTickers.includes(t)) {
+    watchlistTickers.push(t);
+    saveWatchlistTickers(watchlistTickers);
+  }
+  inp.value = "";
+  refreshWatchlist();
+});
+document.getElementById("watchlist-refresh").addEventListener("click", refreshWatchlist);
+
+// ===================== Sectors =====================
+async function refreshSectors(force = false) {
+  const loading = document.getElementById("sectors-loading");
+  const grid = document.getElementById("sectors-grid");
+  if (force || grid.classList.contains("hidden")) {
+    loading.classList.remove("hidden");
+    grid.classList.add("hidden");
+  }
+  try {
+    const r = await fetch("/sectors");
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    const data = await r.json();
+    document.getElementById("sectors-as-of").textContent = data.as_of ? `as of ${timeAgo(data.as_of)}` : "";
+    grid.innerHTML = data.sectors.map(s => sectorCardHTML(s)).join("");
+    grid.querySelectorAll(".sector-toggle").forEach(b => {
+      b.addEventListener("click", () => {
+        const wrapper = b.closest(".sector-card");
+        const list = wrapper.querySelector(".sector-components");
+        const open = !list.classList.contains("hidden");
+        list.classList.toggle("hidden");
+        b.querySelector(".chev").textContent = open ? "▼" : "▲";
+      });
+    });
+    grid.querySelectorAll(".sector-go").forEach(a => {
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        const t = a.dataset.ticker;
+        document.getElementById("ticker").value = t;
+        document.getElementById("analyze-form").requestSubmit();
+        setTab("analysis");
+      });
+    });
+    loading.classList.add("hidden");
+    grid.classList.remove("hidden");
+  } catch (err) {
+    loading.innerHTML = `<div class="text-down text-sm">Couldn't load sectors: ${escapeHTML(err.message)}</div>`;
+  }
+}
+
+function tallySegments(tally) {
+  const total = (tally.bullish || 0) + (tally["lean-bullish"] || 0) + (tally.neutral || 0) + (tally["lean-bearish"] || 0) + (tally.bearish || 0);
+  if (!total) return "";
+  const segs = [
+    { v: tally.bullish || 0,        c: "#16A34A" },
+    { v: tally["lean-bullish"] || 0,c: "#22C55E" },
+    { v: tally.neutral || 0,        c: "#5F6A7D" },
+    { v: tally["lean-bearish"] || 0,c: "#F87171" },
+    { v: tally.bearish || 0,        c: "#DC2626" },
+  ];
+  return segs.map(s => s.v > 0 ? `<div class="tally-seg" style="width:${(s.v/total*100).toFixed(2)}%; background:${s.c};"></div>` : "").join("");
+}
+
+function sectorCardHTML(s) {
+  const etf = s.etf;
+  const components = (s.components || []).slice().sort((a,b) => (b.score||0) - (a.score||0));
+  const t = s.tally;
+  const bullCount = (t.bullish || 0) + (t["lean-bullish"] || 0);
+  const bearCount = (t.bearish || 0) + (t["lean-bearish"] || 0);
+  const neutralCount = t.neutral || 0;
+
+  const etfHeader = etf.error ? `
+    <div class="text-down text-xs">ETF data unavailable: ${escapeHTML(etf.error)}</div>
+  ` : `
+    <div class="flex items-baseline gap-3">
+      <span class="mono text-2xl font-bold text-ink">$${etf.price != null ? etf.price.toFixed(2) : "—"}</span>
+      <span class="mono text-sm font-semibold ${etf.change_pct == null ? "text-ink-dim" : (etf.change_pct >= 0 ? "val-up" : "val-down")}">
+        ${etf.change_pct == null ? "—" : `${etf.change_pct >= 0 ? "+" : ""}${etf.change_pct.toFixed(2)}%`}
+      </span>
+      <span class="ml-auto text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full ${verdictPillClass[etf.verdict] || verdictPillClass.neutral}">
+        ${verdictShort[etf.verdict] || "—"}
+      </span>
+    </div>
+  `;
+
+  return `
+    <div class="sector-card card p-5 flex flex-col gap-3">
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="text-xs text-ink-faint uppercase tracking-wider mono">${escapeHTML(etf.ticker || "")}</div>
+          <h3 class="font-semibold text-ink">${escapeHTML(s.name)}</h3>
+        </div>
+      </div>
+      ${etfHeader}
+      <div>
+        <div class="flex items-center justify-between text-xs text-ink-dim mb-1.5">
+          <span><span class="val-up font-semibold">${bullCount}</span> bull · <span class="text-ink-faint">${neutralCount}</span> neutral · <span class="val-down font-semibold">${bearCount}</span> bear</span>
+          <span class="text-ink-faint">${components.length} components</span>
+        </div>
+        <div class="tally-bar">${tallySegments(t)}</div>
+      </div>
+      <button class="sector-toggle btn-ghost px-3 py-1.5 text-xs flex items-center justify-between">
+        <span>Show components</span>
+        <span class="chev">▼</span>
+      </button>
+      <div class="sector-components hidden">
+        <table class="w-full text-xs">
+          <thead class="text-ink-faint uppercase tracking-wider">
+            <tr>
+              <th class="text-left py-1.5">Ticker</th>
+              <th class="text-right py-1.5">Price</th>
+              <th class="text-right py-1.5">Day</th>
+              <th class="text-center py-1.5">Verdict</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${components.map(c => {
+              const chgCls = c.change_pct == null ? "text-ink-dim" : (c.change_pct >= 0 ? "val-up" : "val-down");
+              const chgStr = c.change_pct == null ? "—" : `${c.change_pct >= 0 ? "+" : ""}${c.change_pct.toFixed(2)}%`;
+              return `<tr class="border-t border-line">
+                <td class="py-1.5 mono font-semibold"><a href="#" class="sector-go text-ink hover:text-brand" data-ticker="${escapeHTML(c.ticker)}">${escapeHTML(c.ticker)}</a></td>
+                <td class="py-1.5 mono text-right">${c.price != null ? `$${c.price.toFixed(2)}` : "—"}</td>
+                <td class="py-1.5 mono text-right ${chgCls}">${chgStr}</td>
+                <td class="py-1.5 text-center"><span class="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full ${verdictPillClass[c.verdict] || verdictPillClass.neutral}">${verdictShort[c.verdict] || "—"}</span></td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+document.getElementById("sectors-refresh").addEventListener("click", () => refreshSectors(true));
+
+// ===================== Tab nav: extend setTab to load on demand =====================
+const _origSetTab = setTab;
+window.setTab = function(name) {
+  _origSetTab(name);
+  if (name === "watchlist") refreshWatchlist();
+  else if (name === "sectors") refreshSectors(false);
+};
+// Re-bind tab buttons to the wrapped setTab
+document.querySelectorAll(".tab-btn").forEach(b => {
+  b.replaceWith(b.cloneNode(true));
+});
+document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => window.setTab(b.dataset.tab)));
+
+// "Go to Learn" link in watchlist tip
+document.querySelectorAll('[data-go-tab]').forEach(a => {
+  a.addEventListener("click", (e) => {
+    e.preventDefault();
+    window.setTab(a.dataset.goTab);
+  });
+});
 
 // ===================== Init =====================
 document.getElementById("ticker").value = "AAPL";
