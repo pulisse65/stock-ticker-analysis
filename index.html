@@ -228,15 +228,6 @@
     .ind-row { border-bottom: 1px solid var(--line); }
     .ind-row:last-child { border-bottom: none; }
 
-    /* Logo mark */
-    .logo-mark {
-      width: 32px; height: 32px;
-      background: linear-gradient(135deg, var(--brand) 0%, var(--accent) 100%);
-      border-radius: 8px;
-      display: flex; align-items: center; justify-content: center;
-      box-shadow: 0 4px 12px rgba(59,130,246,0.35);
-    }
-
     /* Configure menu popover */
     .popover {
       position: absolute;
@@ -328,15 +319,9 @@
   <!-- Header -->
   <header class="border-b border-line sticky top-0 z-20 backdrop-blur-md" style="background: rgba(11,14,17,0.85);">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
-        <div class="logo-mark">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="3 17 9 11 13 15 21 7"/>
-            <polyline points="14 7 21 7 21 14"/>
-          </svg>
-        </div>
-        <h1 class="text-lg font-bold tracking-tight">Ticker Tracker</h1>
-      </div>
+      <a href="/" class="flex items-center" aria-label="Ticker Tracker — home">
+        <img src="/static/logo.png" alt="Ticker Tracker" class="h-12 w-auto" />
+      </a>
 
       <nav class="flex items-center gap-0 overflow-x-auto no-scrollbar">
         <button class="tab-btn active" data-tab="analysis">Analysis</button>
