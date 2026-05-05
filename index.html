@@ -537,8 +537,14 @@
             class="input uppercase px-3 py-1.5 font-medium mono w-32" />
           <button type="submit" class="btn-primary px-4 py-1.5 text-sm">Add</button>
         </form>
-        <div class="flex items-center gap-2">
-          <span id="watchlist-as-of" class="text-xs text-ink-faint mono"></span>
+        <div class="flex items-center gap-2 flex-wrap">
+          <label class="text-xs text-ink-dim uppercase tracking-wider" for="watchlist-group-by">Group by</label>
+          <select id="watchlist-group-by" class="select px-2.5 py-1.5 text-sm">
+            <option value="none">None</option>
+            <option value="sector">Sector</option>
+            <option value="verdict">Verdict</option>
+          </select>
+          <span id="watchlist-as-of" class="text-xs text-ink-faint mono ml-1"></span>
           <button id="watchlist-refresh" type="button" class="btn-ghost px-3 py-1.5 text-sm flex items-center gap-2">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="23 4 23 10 17 10"/>
@@ -557,15 +563,15 @@
 
       <div id="watchlist-card" class="card hidden overflow-hidden">
         <table class="w-full text-sm">
-          <thead class="text-xs uppercase tracking-wider text-ink-dim border-b border-line">
+          <thead class="text-xs uppercase tracking-wider text-ink-dim border-b border-line select-none">
             <tr>
-              <th class="text-left py-3 px-4 font-medium">Ticker</th>
-              <th class="text-left py-3 px-4 font-medium hidden sm:table-cell">Name</th>
-              <th class="text-right py-3 px-4 font-medium">Price</th>
-              <th class="text-right py-3 px-4 font-medium">Day</th>
-              <th class="text-right py-3 px-4 font-medium hidden md:table-cell">Week</th>
-              <th class="text-right py-3 px-4 font-medium hidden md:table-cell">Month</th>
-              <th class="text-center py-3 px-4 font-medium">Verdict</th>
+              <th class="text-left py-3 px-4 font-medium cursor-pointer hover:text-ink wl-sort" data-key="ticker">Ticker <span class="wl-sort-arrow"></span></th>
+              <th class="text-left py-3 px-4 font-medium cursor-pointer hover:text-ink wl-sort hidden sm:table-cell" data-key="name">Name <span class="wl-sort-arrow"></span></th>
+              <th class="text-right py-3 px-4 font-medium cursor-pointer hover:text-ink wl-sort" data-key="price">Price <span class="wl-sort-arrow"></span></th>
+              <th class="text-right py-3 px-4 font-medium cursor-pointer hover:text-ink wl-sort" data-key="change_pct">Day <span class="wl-sort-arrow"></span></th>
+              <th class="text-right py-3 px-4 font-medium cursor-pointer hover:text-ink wl-sort hidden md:table-cell" data-key="change_pct_1w">Week <span class="wl-sort-arrow"></span></th>
+              <th class="text-right py-3 px-4 font-medium cursor-pointer hover:text-ink wl-sort hidden md:table-cell" data-key="change_pct_1mo">Month <span class="wl-sort-arrow"></span></th>
+              <th class="text-center py-3 px-4 font-medium cursor-pointer hover:text-ink wl-sort" data-key="score">Verdict <span class="wl-sort-arrow"></span></th>
               <th class="py-3 px-4"></th>
             </tr>
           </thead>
@@ -1468,6 +1474,28 @@ function saveWatchlistTickers(arr) {
 }
 let watchlistTickers = loadWatchlistTickers();
 
+// Sort + group state — persisted across reloads
+const STRING_KEYS = new Set(["ticker", "name"]);
+const DEFAULT_SORT = { key: "ticker", dir: "asc" };
+const DEFAULT_GROUP = "none";
+function loadWatchlistSort() {
+  try {
+    const s = JSON.parse(localStorage.getItem("watchlist.sort") || "null");
+    if (s && typeof s.key === "string" && (s.dir === "asc" || s.dir === "desc")) return s;
+  } catch {}
+  return { ...DEFAULT_SORT };
+}
+function loadWatchlistGroup() {
+  const g = localStorage.getItem("watchlist.groupBy");
+  return (g === "sector" || g === "verdict") ? g : DEFAULT_GROUP;
+}
+let watchlistSort = loadWatchlistSort();
+let watchlistGroup = loadWatchlistGroup();
+let watchlistRows = [];  // last fetched, for re-rendering on sort/group change
+
+const VERDICT_RANK = { "bullish": 5, "lean-bullish": 4, "neutral": 3, "lean-bearish": 2, "bearish": 1 };
+const VERDICT_GROUP_ORDER = ["bullish", "lean-bullish", "neutral", "lean-bearish", "bearish"];
+
 const verdictPillClass = {
   "bullish":      "v-bullish",
   "lean-bullish": "v-lean-bullish",
@@ -1489,46 +1517,110 @@ function renderWatchlistEmpty() {
   document.getElementById("watchlist-as-of").textContent = "";
 }
 
+function compareWatchlistRows(a, b, key, dir) {
+  const isString = STRING_KEYS.has(key);
+  let av = a[key], bv = b[key];
+  if (key === "score") {
+    av = a.error ? -Infinity : (VERDICT_RANK[a.verdict] ?? 0);
+    bv = b.error ? -Infinity : (VERDICT_RANK[b.verdict] ?? 0);
+  }
+  // Errored rows always sink to the bottom regardless of direction
+  if (a.error && !b.error) return 1;
+  if (b.error && !a.error) return -1;
+  // Nulls go after non-nulls in any direction
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  let cmp = isString
+    ? String(av).localeCompare(String(bv))
+    : (av < bv ? -1 : av > bv ? 1 : 0);
+  return dir === "desc" ? -cmp : cmp;
+}
+
+function rowHTML(it) {
+  const fmtPctCell = (v) => v == null
+    ? { cls: "text-ink-dim", txt: "—" }
+    : { cls: v >= 0 ? "val-up" : "val-down", txt: `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` };
+  if (it.error) {
+    return `<tr class="border-b border-line">
+      <td class="py-2.5 px-4 mono font-semibold text-ink">${escapeHTML(it.ticker)}</td>
+      <td class="py-2.5 px-4 text-down text-xs" colspan="6">${escapeHTML(it.error)}</td>
+      <td class="py-2.5 px-4 text-right">
+        <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
+      </td>
+    </tr>`;
+  }
+  const day = fmtPctCell(it.change_pct);
+  const wk  = fmtPctCell(it.change_pct_1w);
+  const mo  = fmtPctCell(it.change_pct_1mo);
+  const verdictCls = verdictPillClass[it.verdict] || verdictPillClass.neutral;
+  const verdictTxt = verdictShort[it.verdict] || it.verdict || "—";
+  return `<tr class="border-b border-line hover:bg-bg-hover">
+    <td class="py-2.5 px-4 mono font-semibold text-ink"><a href="#" class="watchlist-go" data-ticker="${escapeHTML(it.ticker)}">${escapeHTML(it.ticker)}</a></td>
+    <td class="py-2.5 px-4 text-ink-dim hidden sm:table-cell text-sm truncate max-w-[200px]">${escapeHTML(it.name || "")}</td>
+    <td class="py-2.5 px-4 text-right mono text-ink">${it.price != null ? `$${it.price.toFixed(2)}` : "—"}</td>
+    <td class="py-2.5 px-4 text-right mono ${day.cls}">${day.txt}</td>
+    <td class="py-2.5 px-4 text-right mono ${wk.cls} hidden md:table-cell">${wk.txt}</td>
+    <td class="py-2.5 px-4 text-right mono ${mo.cls} hidden md:table-cell">${mo.txt}</td>
+    <td class="py-2.5 px-4 text-center"><span class="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full ${verdictCls}">${verdictTxt}</span></td>
+    <td class="py-2.5 px-4 text-right">
+      <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
+    </td>
+  </tr>`;
+}
+
+function groupHeaderHTML(label, count) {
+  return `<tr class="bg-bg-hover">
+    <td colspan="8" class="py-2 px-4 text-xs font-bold uppercase tracking-wider text-ink-dim">
+      ${escapeHTML(label)} <span class="text-ink-faint font-normal ml-1">· ${count}</span>
+    </td>
+  </tr>`;
+}
+
 function renderWatchlistRows(items, asOf) {
   document.getElementById("watchlist-empty").classList.add("hidden");
   document.getElementById("watchlist-card").classList.remove("hidden");
   document.getElementById("watchlist-as-of").textContent = asOf ? `as of ${timeAgo(asOf)}` : "";
   const tbody = document.getElementById("watchlist-tbody");
-  const fmtPctCell = (v) => {
-    if (v == null) return { cls: "text-ink-dim", txt: "—" };
-    return {
-      cls: v >= 0 ? "val-up" : "val-down",
-      txt: `${v >= 0 ? "+" : ""}${v.toFixed(2)}%`,
-    };
-  };
-  tbody.innerHTML = items.map(it => {
-    if (it.error) {
-      return `<tr class="border-b border-line">
-        <td class="py-2.5 px-4 mono font-semibold text-ink">${escapeHTML(it.ticker)}</td>
-        <td class="py-2.5 px-4 text-down text-xs" colspan="6">${escapeHTML(it.error)}</td>
-        <td class="py-2.5 px-4 text-right">
-          <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
-        </td>
-      </tr>`;
+
+  // 1) Sort all rows
+  const sorted = items.slice().sort((a, b) => compareWatchlistRows(a, b, watchlistSort.key, watchlistSort.dir));
+
+  // 2) Optionally group
+  let html = "";
+  if (watchlistGroup === "sector") {
+    const groups = new Map();
+    for (const it of sorted) {
+      const key = it.sector || "Other";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(it);
     }
-    const day = fmtPctCell(it.change_pct);
-    const wk  = fmtPctCell(it.change_pct_1w);
-    const mo  = fmtPctCell(it.change_pct_1mo);
-    const verdictCls = verdictPillClass[it.verdict] || verdictPillClass.neutral;
-    const verdictTxt = verdictShort[it.verdict] || it.verdict || "—";
-    return `<tr class="border-b border-line hover:bg-bg-hover">
-      <td class="py-2.5 px-4 mono font-semibold text-ink"><a href="#" class="watchlist-go" data-ticker="${escapeHTML(it.ticker)}">${escapeHTML(it.ticker)}</a></td>
-      <td class="py-2.5 px-4 text-ink-dim hidden sm:table-cell text-sm truncate max-w-[200px]">${escapeHTML(it.name || "")}</td>
-      <td class="py-2.5 px-4 text-right mono text-ink">${it.price != null ? `$${it.price.toFixed(2)}` : "—"}</td>
-      <td class="py-2.5 px-4 text-right mono ${day.cls}">${day.txt}</td>
-      <td class="py-2.5 px-4 text-right mono ${wk.cls} hidden md:table-cell">${wk.txt}</td>
-      <td class="py-2.5 px-4 text-right mono ${mo.cls} hidden md:table-cell">${mo.txt}</td>
-      <td class="py-2.5 px-4 text-center"><span class="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-full ${verdictCls}">${verdictTxt}</span></td>
-      <td class="py-2.5 px-4 text-right">
-        <button class="watchlist-remove text-ink-faint hover:text-down" data-ticker="${escapeHTML(it.ticker)}" title="Remove">✕</button>
-      </td>
-    </tr>`;
-  }).join("");
+    const sectorNames = Array.from(groups.keys()).sort((a, b) => a.localeCompare(b));
+    for (const s of sectorNames) {
+      const rows = groups.get(s);
+      html += groupHeaderHTML(s, rows.length);
+      html += rows.map(rowHTML).join("");
+    }
+  } else if (watchlistGroup === "verdict") {
+    const groups = new Map();
+    for (const it of sorted) {
+      const key = it.error ? "—" : (it.verdict || "—");
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(it);
+    }
+    for (const v of VERDICT_GROUP_ORDER.concat(["—"])) {
+      if (!groups.has(v)) continue;
+      const rows = groups.get(v);
+      const label = verdictShort[v] || v;
+      html += groupHeaderHTML(label, rows.length);
+      html += rows.map(rowHTML).join("");
+    }
+  } else {
+    html = sorted.map(rowHTML).join("");
+  }
+
+  tbody.innerHTML = html;
+  updateSortArrows();
 
   tbody.querySelectorAll(".watchlist-remove").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -1549,6 +1641,16 @@ function renderWatchlistRows(items, asOf) {
   });
 }
 
+function updateSortArrows() {
+  document.querySelectorAll(".wl-sort").forEach(th => {
+    const arrow = th.querySelector(".wl-sort-arrow");
+    if (!arrow) return;
+    arrow.textContent = (th.dataset.key === watchlistSort.key)
+      ? (watchlistSort.dir === "asc" ? "▲" : "▼")
+      : "";
+  });
+}
+
 async function refreshWatchlist() {
   if (!watchlistTickers.length) { renderWatchlistEmpty(); return; }
   // Show prior data while fetching; otherwise show a tiny spinner
@@ -1562,11 +1664,39 @@ async function refreshWatchlist() {
     const r = await fetch(`/watchlist?tickers=${encodeURIComponent(watchlistTickers.join(","))}`);
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
     const data = await r.json();
-    renderWatchlistRows(data.items, data.as_of);
+    watchlistRows = data.items;
+    watchlistAsOf = data.as_of;
+    renderWatchlistRows(watchlistRows, watchlistAsOf);
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="8" class="py-6 text-center text-down text-sm">${escapeHTML(err.message)}</td></tr>`;
   }
 }
+let watchlistAsOf = null;
+
+// Column-header click → toggle sort direction or set new sort key
+document.querySelectorAll(".wl-sort").forEach(th => {
+  th.addEventListener("click", () => {
+    const key = th.dataset.key;
+    if (watchlistSort.key === key) {
+      watchlistSort.dir = watchlistSort.dir === "asc" ? "desc" : "asc";
+    } else {
+      watchlistSort.key = key;
+      // Strings default to asc; numbers default to desc (gainers first, biggest first)
+      watchlistSort.dir = STRING_KEYS.has(key) ? "asc" : "desc";
+    }
+    try { localStorage.setItem("watchlist.sort", JSON.stringify(watchlistSort)); } catch {}
+    if (watchlistRows.length) renderWatchlistRows(watchlistRows, watchlistAsOf);
+  });
+});
+
+// Group-by dropdown
+const groupBySelect = document.getElementById("watchlist-group-by");
+groupBySelect.value = watchlistGroup;
+groupBySelect.addEventListener("change", () => {
+  watchlistGroup = groupBySelect.value;
+  try { localStorage.setItem("watchlist.groupBy", watchlistGroup); } catch {}
+  if (watchlistRows.length) renderWatchlistRows(watchlistRows, watchlistAsOf);
+});
 
 document.getElementById("watchlist-add-form").addEventListener("submit", (e) => {
   e.preventDefault();

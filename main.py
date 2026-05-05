@@ -1119,19 +1119,27 @@ def watchlist(tickers: str):
 
     scored = _score_tickers_bulk(raw, period="3mo")
 
-    # Try to enrich with company short-name (cheap; uses already-cached info
-    # path inside yfinance). Best-effort — don't fail the whole request if
-    # one name lookup blows up.
+    # Best-effort name + sector enrichment — yfinance caches .info per
+    # Ticker instance, so we only pay the network round-trip once per
+    # ticker. Don't fail the whole request if one lookup blows up.
+    def _info_pair(tk: str) -> tuple[str | None, str | None]:
+        info = yf.Ticker(tk).info or {}
+        return (
+            info.get("shortName") or info.get("longName"),
+            info.get("sector"),
+        )
+
     items: list[dict[str, Any]] = []
     for t in raw:
         v = scored.get(t, {})
         if "error" in v:
             items.append({"ticker": t, "error": v["error"]})
             continue
-        name = _safe(lambda t=t: yf.Ticker(t).info.get("shortName") or yf.Ticker(t).info.get("longName"))
+        name, sector = _safe(lambda t=t: _info_pair(t), default=(None, None))
         items.append({
             "ticker": t,
             "name": name,
+            "sector": sector,
             "price": v.get("price"),
             "prev_close": v.get("prev_close"),
             "change_pct": v.get("change_pct"),
