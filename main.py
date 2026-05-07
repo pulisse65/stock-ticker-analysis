@@ -4,12 +4,14 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 import numpy as np
 import pandas as pd
@@ -794,11 +796,23 @@ def widget_reddit(ticker: str):
         return cached
 
     subs = "wallstreetbets+stocks+investing+StockMarket"
-    url = (
-        f"https://www.reddit.com/r/{subs}/search.json"
-        f"?q={ticker}&restrict_sr=on&sort=new&limit=15&t=month"
-    )
+
+    # Two-pronged query so we cover both conventions:
+    #   "$TICKER"     — the cashtag, used on r/wallstreetbets etc.
+    #   title:TICKER  — posts that mention the ticker in the title, even
+    #                   without a $ prefix (common on r/stocks, r/investing)
+    # We over-fetch and post-filter so that posts which only mention the
+    # ticker incidentally (e.g. listed in a portfolio screenshot) get dropped.
+    params = {
+        "q": f'"${ticker}" OR title:{ticker}',
+        "restrict_sr": "on",
+        "sort": "relevance",
+        "limit": "30",
+        "t": "month",
+    }
+    url = f"https://www.reddit.com/r/{subs}/search.json?{urlencode(params)}"
     headers = {"User-Agent": "stock-ticker-analysis/1.0 (https://github.com/pulisse65/stock-ticker-analysis)"}
+
     try:
         r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
@@ -806,19 +820,48 @@ def widget_reddit(ticker: str):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Reddit fetch failed: {exc}") from exc
 
-    posts = []
+    cashtag_re = re.compile(rf"\${re.escape(ticker)}\b", re.IGNORECASE)
+    word_re = re.compile(rf"\b{re.escape(ticker)}\b", re.IGNORECASE)
+    # Single- and two-letter tickers (F, T, M, GE, BP, ...) collide with
+    # English words too easily. Require the explicit cashtag for those.
+    cashtag_only = len(ticker) <= 2
+
+    candidates: list[dict[str, Any]] = []
     for child in (data.get("data") or {}).get("children", []):
         d = child.get("data") or {}
-        posts.append({
-            "title": d.get("title"),
+        title = d.get("title") or ""
+        selftext = d.get("selftext") or ""
+
+        # Match strength:
+        #   2 = cashtag in title or body (strongest signal)
+        #   1 = ticker as a whole word in the title (skipped for short tickers)
+        #   0 = no real match (drop it)
+        if cashtag_re.search(title) or cashtag_re.search(selftext):
+            strength = 2
+        elif not cashtag_only and word_re.search(title):
+            strength = 1
+        else:
+            continue
+
+        candidates.append({
+            "title": title,
             "subreddit": d.get("subreddit"),
-            "score": d.get("score", 0),
-            "num_comments": d.get("num_comments", 0),
+            "score": int(d.get("score") or 0),
+            "num_comments": int(d.get("num_comments") or 0),
             "created_utc": d.get("created_utc"),
             "permalink": f"https://www.reddit.com{d.get('permalink', '')}",
             "author": d.get("author"),
             "flair": d.get("link_flair_text"),
+            "_strength": strength,
         })
+
+    # Re-rank: stronger matches first, then by Reddit upvotes
+    candidates.sort(key=lambda x: (x["_strength"], x.get("score", 0)), reverse=True)
+
+    posts = []
+    for c in candidates[:15]:
+        c.pop("_strength", None)
+        posts.append(c)
 
     result = {"ticker": ticker, "posts": posts}
     _cache_set(cache_key, result, ttl=300)  # 5 min
