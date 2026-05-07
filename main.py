@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -740,11 +740,51 @@ def clear_history():
 
 # ----------------------------- Dashboard widgets -----------------------------
 #
-# Five server-fed widget endpoints. The TradingView mini-chart is fully
-# client-side and doesn't need a backend.
+# Server-fed widget endpoints. The TradingView mini-chart is fully client-side
+# and doesn't need a backend.
 #
-# All endpoints are wrapped in a tiny in-memory TTL cache so we don't hammer
-# yfinance / Reddit / Google News on every dashboard refresh.
+# Some endpoints prefer Financial Modeling Prep (FMP) when FMP_API_KEY is
+# set, falling back to yfinance / public APIs otherwise. FMP gives cleaner
+# structured data than yfinance .info, but the free tier is 250 req/day and
+# many endpoints are gated to paid plans — so we cache aggressively (hours,
+# not minutes) and degrade gracefully on 401/403/429.
+#
+# All endpoints are wrapped in a tiny in-memory TTL cache.
+
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "").strip()
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
+
+class FMPError(Exception):
+    """FMP returned an error we should surface or fall back from."""
+
+
+def _fmp_enabled() -> bool:
+    return bool(FMP_API_KEY)
+
+
+def _fmp_get(endpoint: str, params: dict[str, Any] | None = None, timeout: int = 10) -> Any:
+    """Hit an FMP endpoint. Raises FMPError on auth/plan/rate problems so
+    callers can decide whether to fall back."""
+    if not _fmp_enabled():
+        raise FMPError("FMP_API_KEY not configured")
+    p = dict(params or {})
+    p["apikey"] = FMP_API_KEY
+    r = requests.get(f"{FMP_BASE}{endpoint}", params=p, timeout=timeout)
+    if r.status_code in (401, 403):
+        raise FMPError(f"FMP auth/plan rejected ({r.status_code}) — endpoint may require paid tier")
+    if r.status_code == 429:
+        raise FMPError("FMP rate limit reached (free tier = 250 req/day)")
+    r.raise_for_status()
+    try:
+        data = r.json()
+    except ValueError as exc:
+        raise FMPError(f"FMP returned non-JSON: {exc}") from exc
+    # FMP returns {"Error Message": "..."} for some plan-restricted endpoints with HTTP 200
+    if isinstance(data, dict) and "Error Message" in data:
+        raise FMPError(f"FMP error: {data['Error Message']}")
+    return data
+
 
 _WIDGET_CACHE: dict[tuple, tuple[float, Any]] = {}
 
@@ -915,6 +955,58 @@ def widget_fundamentals(ticker: str):
     if cached is not None:
         return cached
 
+    # Prefer FMP — cleaner structured data than yfinance .info
+    if _fmp_enabled():
+        try:
+            profile_arr = _fmp_get(f"/profile/{ticker}")
+            quote_arr = _fmp_get(f"/quote/{ticker}")
+            profile = (profile_arr[0] if profile_arr else {}) or {}
+            quote = (quote_arr[0] if quote_arr else {}) or {}
+
+            if profile or quote:
+                price = quote.get("price")
+                last_div = profile.get("lastDiv")
+                data = {
+                    "longName":   profile.get("companyName") or quote.get("name"),
+                    "shortName":  quote.get("name"),
+                    "sector":     profile.get("sector"),
+                    "industry":   profile.get("industry"),
+                    "country":    profile.get("country"),
+                    "currency":   profile.get("currency"),
+                    "exchange":   profile.get("exchangeShortName") or quote.get("exchange"),
+                    "marketCap":  profile.get("mktCap") or quote.get("marketCap"),
+                    "trailingPE": quote.get("pe"),
+                    "trailingEps": quote.get("eps"),
+                    "beta":       profile.get("beta"),
+                    "fiftyTwoWeekLow":  quote.get("yearLow"),
+                    "fiftyTwoWeekHigh": quote.get("yearHigh"),
+                    "fiftyDayAverage":  quote.get("priceAvg50"),
+                    "twoHundredDayAverage": quote.get("priceAvg200"),
+                    "currentPrice":     price,
+                    "regularMarketPrice": price,
+                    "previousClose":    quote.get("previousClose"),
+                    "regularMarketChange":        quote.get("change"),
+                    "regularMarketChangePercent": quote.get("changesPercentage"),
+                    "volume":         quote.get("volume"),
+                    "averageVolume":  quote.get("avgVolume"),
+                    "sharesOutstanding": quote.get("sharesOutstanding"),
+                    "dividendRate":   last_div,
+                    "dividendYield":  (last_div / price * 100) if (last_div and price) else None,
+                }
+                # Normalize NaN floats
+                for k, v in list(data.items()):
+                    if isinstance(v, float) and math.isnan(v):
+                        data[k] = None
+
+                result = {"ticker": ticker, "data": data, "source": "fmp"}
+                _cache_set(cache_key, result, ttl=21600)  # 6 hours
+                return result
+        except FMPError as exc:
+            log.warning("FMP fundamentals failed for %s: %s; falling back to yfinance", ticker, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FMP fundamentals errored for %s: %s; falling back to yfinance", ticker, exc)
+
+    # Fallback: yfinance .info
     info = _safe(lambda: yf.Ticker(ticker).info, default={}) or {}
     if not info:
         raise HTTPException(404, f"No fundamentals available for '{ticker}'.")
@@ -941,7 +1033,7 @@ def widget_fundamentals(ticker: str):
             v = None
         data[k] = v
 
-    result = {"ticker": ticker, "data": data}
+    result = {"ticker": ticker, "data": data, "source": "yfinance"}
     _cache_set(cache_key, result, ttl=600)  # 10 min
     return result
 
@@ -1008,6 +1100,54 @@ def widget_analysts(ticker: str):
     if cached is not None:
         return cached
 
+    # Prefer FMP — daily-updated price targets and clean rating breakdown.
+    # Some of these endpoints require a paid plan; we degrade to yfinance.
+    if _fmp_enabled():
+        try:
+            tgt_arr = _fmp_get("/price-target-consensus", {"symbol": ticker})
+            rec_arr = _fmp_get("/upgrades-downgrades-consensus", {"symbol": ticker})
+            quote_arr = _fmp_get(f"/quote/{ticker}")
+            tgt = (tgt_arr[0] if tgt_arr else {}) or {}
+            rec = (rec_arr[0] if rec_arr else {}) or {}
+            quote = (quote_arr[0] if quote_arr else {}) or {}
+
+            ratings = None
+            if rec:
+                try:
+                    ratings = {
+                        "strong_buy":  int(rec.get("strongBuy", 0) or 0),
+                        "buy":         int(rec.get("buy", 0) or 0),
+                        "hold":        int(rec.get("hold", 0) or 0),
+                        "sell":        int(rec.get("sell", 0) or 0),
+                        "strong_sell": int(rec.get("strongSell", 0) or 0),
+                    }
+                except (TypeError, ValueError):
+                    ratings = None
+
+            num_analysts = sum(ratings.values()) if ratings else None
+
+            if tgt or rec:
+                result = {
+                    "ticker":              ticker,
+                    "current_price":       quote.get("price"),
+                    "target_mean":         tgt.get("targetConsensus"),
+                    "target_high":         tgt.get("targetHigh"),
+                    "target_low":          tgt.get("targetLow"),
+                    "target_median":       tgt.get("targetMedian"),
+                    "recommendation_mean": None,  # FMP gives a string consensus, not a 1-5
+                    "recommendation_key":  (rec.get("consensus") or "").lower() or None,
+                    "num_analysts":        num_analysts,
+                    "ratings":             ratings,
+                    "source":              "fmp",
+                }
+                _cache_set(cache_key, result, ttl=21600)  # 6 hours
+                return result
+        except FMPError as exc:
+            log.warning("FMP analysts failed for %s: %s; falling back to yfinance", ticker, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FMP analysts errored for %s: %s; falling back to yfinance", ticker, exc)
+
+    # Fallback: yfinance
     t = yf.Ticker(ticker)
     info = _safe(lambda: t.info, default={}) or {}
 
@@ -1046,6 +1186,7 @@ def widget_analysts(ticker: str):
         "recommendation_key":  info.get("recommendationKey"),
         "num_analysts": int(info["numberOfAnalystOpinions"]) if isinstance(info.get("numberOfAnalystOpinions"), (int, float)) else None,
         "ratings": ratings,
+        "source":  "yfinance",
     }
     _cache_set(cache_key, result, ttl=900)  # 15 min
     return result
@@ -1142,6 +1283,112 @@ def _score_tickers_bulk(tickers: list[str], period: str = "3mo") -> dict[str, di
     return out
 
 
+@app.get("/widgets/insider")
+def widget_insider(ticker: str):
+    """Recent insider transactions for a ticker (FMP only)."""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Missing ticker.")
+
+    cache_key = ("insider", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not _fmp_enabled():
+        raise HTTPException(503, "Insider widget requires FMP_API_KEY env var.")
+
+    try:
+        rows = _fmp_get("/insider-trading", {"symbol": ticker, "limit": 25}) or []
+    except FMPError as exc:
+        # Surface as 503 so the widget shows the message instead of a generic error
+        raise HTTPException(503, f"FMP insider data unavailable: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Insider fetch failed: {exc}") from exc
+
+    items: list[dict[str, Any]] = []
+    for row in rows[:25]:
+        if not isinstance(row, dict):
+            continue
+        # FMP transactionType is like "S-Sale" / "P-Purchase" / "A-Award" / "M-Exempt" / "F-In-Kind"
+        ttype = (row.get("transactionType") or "").strip()
+        # acquistionOrDisposition is "A" (acquired) or "D" (disposed of)
+        side = row.get("acquistionOrDisposition") or row.get("acquisitionOrDisposition")
+        items.append({
+            "filing_date":      row.get("filingDate"),
+            "transaction_date": row.get("transactionDate"),
+            "name":             row.get("reportingName"),
+            "title":            row.get("typeOfOwner"),
+            "transaction_type": ttype,
+            "side":             "buy" if side == "A" else ("sell" if side == "D" else None),
+            "shares":           row.get("securitiesTransacted"),
+            "price":            row.get("price"),
+            "value":            (row.get("securitiesTransacted") or 0) * (row.get("price") or 0) if isinstance(row.get("securitiesTransacted"), (int, float)) and isinstance(row.get("price"), (int, float)) else None,
+            "shares_owned_after": row.get("securitiesOwned"),
+            "form_type":        row.get("formType"),
+            "link":             row.get("link"),
+        })
+
+    result = {"ticker": ticker, "items": items}
+    _cache_set(cache_key, result, ttl=43200)  # 12 hours
+    return result
+
+
+@app.get("/widgets/economic")
+def widget_economic():
+    """Upcoming high-impact US economic events for the next 30 days (FMP only)."""
+    cache_key = ("economic", "us-30d")
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not _fmp_enabled():
+        raise HTTPException(503, "Economic calendar requires FMP_API_KEY env var.")
+
+    today = datetime.now(timezone.utc).date()
+    to_date = today + timedelta(days=30)
+
+    try:
+        rows = _fmp_get("/economic_calendar", {
+            "from": today.isoformat(),
+            "to":   to_date.isoformat(),
+        }) or []
+    except FMPError as exc:
+        raise HTTPException(503, f"FMP economic calendar unavailable: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Economic calendar fetch failed: {exc}") from exc
+
+    # Filter: US-only, non-Low impact, future events. Cap at 25.
+    impact_rank = {"high": 3, "medium": 2, "low": 1}
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        country = (row.get("country") or "").strip()
+        if country and country.upper() not in ("US", "USA", "UNITED STATES"):
+            continue
+        impact = (row.get("impact") or "").strip().lower()
+        if impact == "low":
+            continue
+        items.append({
+            "event":    row.get("event"),
+            "date":     row.get("date"),
+            "country":  country or "US",
+            "impact":   impact or "medium",
+            "actual":   row.get("actual"),
+            "previous": row.get("previous"),
+            "estimate": row.get("estimate"),
+            "currency": row.get("currency"),
+        })
+
+    items.sort(key=lambda x: x.get("date") or "")
+    items = items[:25]
+
+    result = {"items": items, "as_of": _now_iso()}
+    _cache_set(cache_key, result, ttl=86400)  # 24 hours
+    return result
+
+
 @app.get("/watchlist")
 def watchlist(tickers: str):
     """Score a list of tickers cheaply for the Watchlist tab.
@@ -1216,6 +1463,25 @@ def sectors():
 
     scored = _score_tickers_bulk(all_tickers, period="3mo")
 
+    # Optional: overlay FMP's authoritative live intraday sector % on the
+    # ETF headlines. Our yfinance bars give yesterday-close-vs-day-before,
+    # not today's intraday move. FMP /sectors-performance is one cheap call.
+    fmp_sector_pct: dict[str, float] = {}
+    if _fmp_enabled():
+        try:
+            rows = _fmp_get("/sectors-performance") or []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                name = (row.get("sector") or "").strip()
+                pct_str = (row.get("changesPercentage") or "").strip().rstrip("%")
+                try:
+                    fmp_sector_pct[name] = float(pct_str)
+                except (TypeError, ValueError):
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FMP /sectors-performance failed: %s", exc)
+
     sectors_out: list[dict[str, Any]] = []
     for sec in SECTORS:
         etf_v = scored.get(sec["etf"], {})
@@ -1239,12 +1505,17 @@ def sectors():
             if v in tally:
                 tally[v] += 1
 
+        # Prefer FMP's live intraday sector % when available (more current than
+        # our daily-bar computed change). Yfinance number stays as fallback.
+        live_pct = fmp_sector_pct.get(sec["name"])
+
         sectors_out.append({
             "name": sec["name"],
             "etf": {
                 "ticker": sec["etf"],
                 "price": etf_v.get("price"),
-                "change_pct": etf_v.get("change_pct"),
+                "change_pct": live_pct if live_pct is not None else etf_v.get("change_pct"),
+                "change_pct_source": "fmp-live" if live_pct is not None else "yfinance-eod",
                 "verdict": etf_v.get("verdict"),
             } if "error" not in etf_v else {"ticker": sec["etf"], "error": etf_v.get("error")},
             "components": components_out,

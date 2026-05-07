@@ -1138,12 +1138,14 @@ document.getElementById("analyze-form").addEventListener("submit", async (e) => 
 
 // ===================== Dashboard =====================
 const WIDGETS = [
-  { id: "fundamentals", label: "Key Fundamentals",   icon: "📊", render: renderFundamentals  },
-  { id: "earnings",     label: "Earnings & Calendar", icon: "📅", render: renderEarnings      },
-  { id: "analysts",     label: "Analyst Ratings",    icon: "🎯", render: renderAnalysts      },
-  { id: "news",         label: "News Headlines",     icon: "📰", render: renderNews          },
-  { id: "reddit",       label: "Reddit Pulse",       icon: "💬", render: renderReddit        },
-  { id: "tradingview",  label: "TradingView Chart",  icon: "📈", render: renderTradingView   },
+  { id: "fundamentals", label: "Key Fundamentals",   icon: "📊", render: renderFundamentals, perTicker: true  },
+  { id: "earnings",     label: "Earnings & Calendar", icon: "📅", render: renderEarnings,     perTicker: true  },
+  { id: "analysts",     label: "Analyst Ratings",    icon: "🎯", render: renderAnalysts,     perTicker: true  },
+  { id: "insider",      label: "Insider Trading",    icon: "🕵️", render: renderInsider,      perTicker: true  },
+  { id: "news",         label: "News Headlines",     icon: "📰", render: renderNews,         perTicker: true  },
+  { id: "reddit",       label: "Reddit Pulse",       icon: "💬", render: renderReddit,       perTicker: true  },
+  { id: "tradingview",  label: "TradingView Chart",  icon: "📈", render: renderTradingView,  perTicker: true  },
+  { id: "economic",     label: "Economic Calendar",  icon: "🗓️", render: renderEconomic,     perTicker: false },
 ];
 
 const DEFAULT_ENABLED = WIDGETS.map(w => w.id);
@@ -1403,6 +1405,99 @@ async function renderReddit(ticker) {
       </a>`).join("");
     widgetSetStatus("reddit", `${posts.length} posts`);
   } catch (e) { widgetError("reddit", e.message); }
+}
+
+async function renderInsider(ticker) {
+  try {
+    const r = await fetch(`/widgets/insider?ticker=${encodeURIComponent(ticker)}`);
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    const { items } = await r.json();
+    const body = document.getElementById("widget-insider-body");
+    if (!items.length) {
+      body.innerHTML = `<div class="text-ink-faint text-sm">No recent insider transactions on file.</div>`;
+      widgetSetStatus("insider", "0");
+      return;
+    }
+    // Quick tally: net buys vs sells in shares
+    let buys = 0, sells = 0;
+    for (const it of items) {
+      if (it.side === "buy") buys += (it.shares || 0);
+      else if (it.side === "sell") sells += (it.shares || 0);
+    }
+    const net = buys - sells;
+    const netCls = net > 0 ? "val-up" : (net < 0 ? "val-down" : "text-ink-dim");
+    const netStr = net === 0 ? "balanced" : `${net > 0 ? "+" : ""}${Math.round(net).toLocaleString()} sh net`;
+
+    body.innerHTML = `
+      <div class="mb-3 flex items-center justify-between text-xs">
+        <div class="text-ink-dim"><span class="val-up font-semibold">${Math.round(buys).toLocaleString()}</span> bought · <span class="val-down font-semibold">${Math.round(sells).toLocaleString()}</span> sold</div>
+        <div class="mono font-semibold ${netCls}">${netStr}</div>
+      </div>
+      <table class="w-full text-xs">
+        <thead class="text-ink-faint uppercase tracking-wider">
+          <tr>
+            <th class="text-left py-1.5">Date</th>
+            <th class="text-left py-1.5">Insider</th>
+            <th class="text-center py-1.5">Side</th>
+            <th class="text-right py-1.5">Shares</th>
+            <th class="text-right py-1.5">Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${items.slice(0, 12).map(it => {
+            const date = it.transaction_date ? new Date(it.transaction_date).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "2-digit" }) : "—";
+            const sideCls = it.side === "buy" ? "val-up" : (it.side === "sell" ? "val-down" : "text-ink-dim");
+            const sideTxt = it.side === "buy" ? "BUY" : (it.side === "sell" ? "SELL" : "—");
+            const value = it.value ? `$${(it.value >= 1e6 ? (it.value/1e6).toFixed(1) + "M" : it.value >= 1e3 ? (it.value/1e3).toFixed(0) + "K" : it.value.toFixed(0))}` : "—";
+            const sharesStr = it.shares != null ? Math.round(it.shares).toLocaleString() : "—";
+            return `<tr class="border-t border-line">
+              <td class="py-1.5 mono text-ink-dim">${date}</td>
+              <td class="py-1.5 truncate max-w-[140px]" title="${escapeHTML((it.name || "") + (it.title ? " · " + it.title : ""))}">${escapeHTML(it.name || "—")}</td>
+              <td class="py-1.5 text-center"><span class="text-[9px] font-bold ${sideCls}">${sideTxt}</span></td>
+              <td class="py-1.5 mono text-right">${sharesStr}</td>
+              <td class="py-1.5 mono text-right">${value}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>`;
+    widgetSetStatus("insider", `${items.length} filings`);
+  } catch (e) { widgetError("insider", e.message); }
+}
+
+async function renderEconomic(_ticker) {
+  try {
+    const r = await fetch("/widgets/economic");
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    const { items } = await r.json();
+    const body = document.getElementById("widget-economic-body");
+    if (!items.length) {
+      body.innerHTML = `<div class="text-ink-faint text-sm">No upcoming high/medium-impact US events in the next 30 days.</div>`;
+      widgetSetStatus("economic", "0");
+      return;
+    }
+    body.innerHTML = `
+      <ul class="space-y-2 text-sm">
+        ${items.map(it => {
+          const dt = it.date ? new Date(it.date.replace(" ", "T") + "Z") : null;
+          const dateStr = dt && !isNaN(dt) ? dt.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }) + " · " + dt.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : (it.date || "—");
+          const impactCls = it.impact === "high" ? "v-bearish" : "v-neutral";
+          return `<li class="flex items-start gap-2 py-1.5 border-t border-line first:border-t-0">
+            <span class="mt-0.5 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded ${impactCls}">${escapeHTML(it.impact || "med")}</span>
+            <div class="flex-1">
+              <div class="text-ink font-medium">${escapeHTML(it.event || "—")}</div>
+              <div class="feed-meta">${escapeHTML(dateStr)}${it.estimate != null ? ` · est ${escapeHTML(String(it.estimate))}` : ""}${it.previous != null ? ` · prev ${escapeHTML(String(it.previous))}` : ""}</div>
+            </div>
+          </li>`;
+        }).join("")}
+      </ul>`;
+    widgetSetStatus("economic", `${items.length} events`);
+  } catch (e) { widgetError("economic", e.message); }
 }
 
 function renderTradingView(ticker) {
