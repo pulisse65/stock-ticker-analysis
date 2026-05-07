@@ -8,7 +8,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
@@ -1283,9 +1283,24 @@ def _score_tickers_bulk(tickers: list[str], period: str = "3mo") -> dict[str, di
     return out
 
 
+_INSIDER_BUY_TOKENS  = ("buy", "purchase", "acquisition", "acquired")
+_INSIDER_SELL_TOKENS = ("sale", "sell", "disposition", "disposed")
+
+
+def _classify_insider_txn(text: str) -> str | None:
+    t = (text or "").lower()
+    if any(tok in t for tok in _INSIDER_BUY_TOKENS):
+        return "buy"
+    if any(tok in t for tok in _INSIDER_SELL_TOKENS):
+        return "sell"
+    return None
+
+
 @app.get("/widgets/insider")
 def widget_insider(ticker: str):
-    """Recent insider transactions for a ticker (FMP only)."""
+    """Recent insider transactions for a ticker. Tries FMP first (cleaner
+    structured data, but gated to paid plans); falls back to yfinance which
+    scrapes Yahoo's insider-transactions table — works without auth."""
     ticker = ticker.strip().upper()
     if not ticker:
         raise HTTPException(400, "Missing ticker.")
@@ -1295,96 +1310,168 @@ def widget_insider(ticker: str):
     if cached is not None:
         return cached
 
-    if not _fmp_enabled():
-        raise HTTPException(503, "Insider widget requires FMP_API_KEY env var.")
+    # Prefer FMP when available
+    if _fmp_enabled():
+        try:
+            rows = _fmp_get("/insider-trading", {"symbol": ticker, "limit": 25}) or []
+            items: list[dict[str, Any]] = []
+            for row in rows[:25]:
+                if not isinstance(row, dict):
+                    continue
+                ttype = (row.get("transactionType") or "").strip()
+                side = row.get("acquistionOrDisposition") or row.get("acquisitionOrDisposition")
+                items.append({
+                    "filing_date":      row.get("filingDate"),
+                    "transaction_date": row.get("transactionDate"),
+                    "name":             row.get("reportingName"),
+                    "title":            row.get("typeOfOwner"),
+                    "transaction_type": ttype,
+                    "side":             "buy" if side == "A" else ("sell" if side == "D" else None),
+                    "shares":           row.get("securitiesTransacted"),
+                    "price":            row.get("price"),
+                    "value":            (row.get("securitiesTransacted") or 0) * (row.get("price") or 0) if isinstance(row.get("securitiesTransacted"), (int, float)) and isinstance(row.get("price"), (int, float)) else None,
+                    "shares_owned_after": row.get("securitiesOwned"),
+                    "form_type":        row.get("formType"),
+                    "link":             row.get("link"),
+                })
+            result = {"ticker": ticker, "items": items, "source": "fmp"}
+            _cache_set(cache_key, result, ttl=43200)
+            return result
+        except FMPError as exc:
+            log.info("FMP insider unavailable for %s (%s); falling back to yfinance", ticker, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FMP insider errored for %s: %s; falling back to yfinance", ticker, exc)
 
-    try:
-        rows = _fmp_get("/insider-trading", {"symbol": ticker, "limit": 25}) or []
-    except FMPError as exc:
-        # Surface as 503 so the widget shows the message instead of a generic error
-        raise HTTPException(503, f"FMP insider data unavailable: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"Insider fetch failed: {exc}") from exc
+    # Fallback: yfinance .insider_transactions
+    df = _safe(lambda: yf.Ticker(ticker).insider_transactions)
+    items = []
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        for _, row in df.head(25).iterrows():
+            ttype = str(row.get("Transaction") or row.get("Text") or "").strip()
+            shares = row.get("Shares")
+            value = row.get("Value")
+            shares_f = float(shares) if shares is not None and not pd.isna(shares) else None
+            value_f = float(value) if value is not None and not pd.isna(value) else None
+            price_f = (value_f / shares_f) if (value_f and shares_f) else None
+            items.append({
+                "filing_date":      _ts_to_iso(row.get("Start Date")),
+                "transaction_date": _ts_to_iso(row.get("Start Date")),
+                "name":             row.get("Insider"),
+                "title":            row.get("Position"),
+                "transaction_type": ttype,
+                "side":             _classify_insider_txn(ttype),
+                "shares":           shares_f,
+                "price":            price_f,
+                "value":            value_f,
+                "shares_owned_after": None,
+                "form_type":        None,
+                "link":             row.get("URL"),
+            })
 
-    items: list[dict[str, Any]] = []
-    for row in rows[:25]:
-        if not isinstance(row, dict):
-            continue
-        # FMP transactionType is like "S-Sale" / "P-Purchase" / "A-Award" / "M-Exempt" / "F-In-Kind"
-        ttype = (row.get("transactionType") or "").strip()
-        # acquistionOrDisposition is "A" (acquired) or "D" (disposed of)
-        side = row.get("acquistionOrDisposition") or row.get("acquisitionOrDisposition")
-        items.append({
-            "filing_date":      row.get("filingDate"),
-            "transaction_date": row.get("transactionDate"),
-            "name":             row.get("reportingName"),
-            "title":            row.get("typeOfOwner"),
-            "transaction_type": ttype,
-            "side":             "buy" if side == "A" else ("sell" if side == "D" else None),
-            "shares":           row.get("securitiesTransacted"),
-            "price":            row.get("price"),
-            "value":            (row.get("securitiesTransacted") or 0) * (row.get("price") or 0) if isinstance(row.get("securitiesTransacted"), (int, float)) and isinstance(row.get("price"), (int, float)) else None,
-            "shares_owned_after": row.get("securitiesOwned"),
-            "form_type":        row.get("formType"),
-            "link":             row.get("link"),
-        })
-
-    result = {"ticker": ticker, "items": items}
-    _cache_set(cache_key, result, ttl=43200)  # 12 hours
+    result = {"ticker": ticker, "items": items, "source": "yfinance"}
+    _cache_set(cache_key, result, ttl=43200)
     return result
+
+
+# ----- Economic calendar (no free API exists, so we generate it) -----
+#
+# FOMC dates are hardcoded from the Fed's published schedule. Recurring BLS
+# releases (NFP, Jobless Claims, ISM) follow deterministic monthly patterns
+# and are computed algorithmically. CPI/PPI/Retail Sales dates aren't
+# strictly periodic so they're omitted (better to omit than mislead with a
+# date that's a few days off).
+#
+# Update FOMC_MEETINGS once a year — the Fed publishes the next year's
+# schedule around September.
+
+FOMC_MEETINGS = [
+    # 2026 — published by the Fed
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16",
+]
+
+
+def _first_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    """First date in (year, month) with the given weekday (0=Mon..6=Sun)."""
+    d = date(year, month, 1)
+    return d + timedelta(days=(weekday - d.weekday()) % 7)
+
+
+def _nth_business_day(year: int, month: int, n: int) -> date:
+    """Nth business day of the month (n>=1, M-F only, no holiday calendar)."""
+    d = date(year, month, 1)
+    count = 0
+    while True:
+        if d.weekday() < 5:
+            count += 1
+            if count == n:
+                return d
+        d += timedelta(days=1)
+
+
+def _generate_economic_events(start: date, days: int = 30) -> list[dict[str, Any]]:
+    """US economic-event calendar built from hardcoded FOMC dates + algorithmic
+    rules for recurring BLS releases. All times ET → expressed in UTC assuming
+    EDT (UTC-4); off by one hour during EST. Good enough for "what day".
+    """
+    end = start + timedelta(days=days)
+    events: list[dict[str, Any]] = []
+
+    def add(d: date, time_utc: str, name: str, impact: str) -> None:
+        if start <= d <= end:
+            events.append({
+                "event":    name,
+                "date":     f"{d.isoformat()} {time_utc}",
+                "country":  "US",
+                "impact":   impact,
+                "actual":   None,
+                "previous": None,
+                "estimate": None,
+                "currency": "USD",
+            })
+
+    # FOMC meetings — rate decision 2 PM ET (= 18:00 UTC during EDT)
+    for ds in FOMC_MEETINGS:
+        d = date.fromisoformat(ds)
+        add(d, "18:00:00", "FOMC Meeting + Rate Decision", "high")
+        # Meeting Minutes released exactly 3 weeks later, also 2 PM ET
+        add(d + timedelta(days=21), "18:00:00", "FOMC Meeting Minutes", "medium")
+
+    # Walk every month that overlaps [start, end] and add monthly recurring events
+    cur_month = date(start.year, start.month, 1)
+    while cur_month <= end:
+        y, m = cur_month.year, cur_month.month
+        # Employment Situation (NFP) — first Friday at 8:30 AM ET (= 12:30 UTC EDT)
+        add(_first_weekday_of_month(y, m, 4), "12:30:00", "Employment Situation (NFP)", "high")
+        # ISM Manufacturing PMI — first business day at 10:00 AM ET (= 14:00 UTC)
+        add(_nth_business_day(y, m, 1), "14:00:00", "ISM Manufacturing PMI", "medium")
+        # ISM Services PMI — third business day at 10:00 AM ET
+        add(_nth_business_day(y, m, 3), "14:00:00", "ISM Services PMI", "medium")
+        # Next month
+        cur_month = (date(y, 12, 1) + timedelta(days=32)).replace(day=1) if m == 12 else date(y, m + 1, 1)
+
+    # Initial Jobless Claims — every Thursday at 8:30 AM ET
+    cur = start + timedelta(days=(3 - start.weekday()) % 7)
+    while cur <= end:
+        add(cur, "12:30:00", "Initial Jobless Claims", "medium")
+        cur += timedelta(days=7)
+
+    events.sort(key=lambda x: x["date"])
+    return events
 
 
 @app.get("/widgets/economic")
 def widget_economic():
-    """Upcoming high-impact US economic events for the next 30 days (FMP only)."""
-    cache_key = ("economic", "us-30d")
+    """Generated US economic calendar for the next 30 days. No upstream API
+    needed — FMP gates the real /economic_calendar to paid plans."""
+    cache_key = ("economic-static", "us-30d")
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    if not _fmp_enabled():
-        raise HTTPException(503, "Economic calendar requires FMP_API_KEY env var.")
-
     today = datetime.now(timezone.utc).date()
-    to_date = today + timedelta(days=30)
-
-    try:
-        rows = _fmp_get("/economic_calendar", {
-            "from": today.isoformat(),
-            "to":   to_date.isoformat(),
-        }) or []
-    except FMPError as exc:
-        raise HTTPException(503, f"FMP economic calendar unavailable: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"Economic calendar fetch failed: {exc}") from exc
-
-    # Filter: US-only, non-Low impact, future events. Cap at 25.
-    impact_rank = {"high": 3, "medium": 2, "low": 1}
-    items: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        country = (row.get("country") or "").strip()
-        if country and country.upper() not in ("US", "USA", "UNITED STATES"):
-            continue
-        impact = (row.get("impact") or "").strip().lower()
-        if impact == "low":
-            continue
-        items.append({
-            "event":    row.get("event"),
-            "date":     row.get("date"),
-            "country":  country or "US",
-            "impact":   impact or "medium",
-            "actual":   row.get("actual"),
-            "previous": row.get("previous"),
-            "estimate": row.get("estimate"),
-            "currency": row.get("currency"),
-        })
-
-    items.sort(key=lambda x: x.get("date") or "")
-    items = items[:25]
-
-    result = {"items": items, "as_of": _now_iso()}
+    items = _generate_economic_events(today, days=30)
+    result = {"items": items, "as_of": _now_iso(), "source": "static"}
     _cache_set(cache_key, result, ttl=86400)  # 24 hours
     return result
 
