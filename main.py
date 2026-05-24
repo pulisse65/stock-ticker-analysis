@@ -326,6 +326,29 @@ def _quick_verdict_from_close(close: pd.Series) -> dict[str, Any]:
     macd_line, macd_signal, _ = _macd(close)
     macd_v = _safe_float(macd_line.iloc[-1])
     macd_sig_v = _safe_float(macd_signal.iloc[-1])
+    macd_v_prev = _safe_float(macd_line.iloc[-2]) if len(macd_line) >= 2 else None
+    macd_sig_v_prev = _safe_float(macd_signal.iloc[-2]) if len(macd_signal) >= 2 else None
+
+    # Detect a fresh MACD cross on the last bar
+    macd_cross: str | None = None
+    if all(x is not None for x in [macd_v, macd_sig_v, macd_v_prev, macd_sig_v_prev]):
+        if macd_v_prev <= macd_sig_v_prev and macd_v > macd_sig_v:
+            macd_cross = "up"
+        elif macd_v_prev >= macd_sig_v_prev and macd_v < macd_sig_v:
+            macd_cross = "down"
+
+    # Detect a fresh golden/death cross (SMA50 vs SMA200) on the last bar
+    ma_cross: str | None = None
+    if n >= 201:
+        sma50_now = _safe_float(close.rolling(50).mean().iloc[-1])
+        sma200_now = _safe_float(close.rolling(200).mean().iloc[-1])
+        sma50_prev = _safe_float(close.rolling(50).mean().iloc[-2])
+        sma200_prev = _safe_float(close.rolling(200).mean().iloc[-2])
+        if all(x is not None for x in [sma50_now, sma200_now, sma50_prev, sma200_prev]):
+            if sma50_prev <= sma200_prev and sma50_now > sma200_now:
+                ma_cross = "golden"
+            elif sma50_prev >= sma200_prev and sma50_now < sma200_now:
+                ma_cross = "death"
 
     bb_upper, bb_mid, bb_lower = _bollinger(close, 20, 2.0)
     bbu = _safe_float(bb_upper.iloc[-1]) if n >= 20 else None
@@ -366,6 +389,8 @@ def _quick_verdict_from_close(close: pd.Series) -> dict[str, Any]:
             "RSI": rsi, "MACD": macd_v, "MACD_signal": macd_sig_v,
             "BB_upper": bbu, "BB_lower": bbl,
         },
+        "macd_cross": macd_cross,
+        "ma_cross":   ma_cross,
     }
 
 
@@ -1473,6 +1498,233 @@ def widget_economic():
     items = _generate_economic_events(today, days=30)
     result = {"items": items, "as_of": _now_iso(), "source": "static"}
     _cache_set(cache_key, result, ttl=86400)  # 24 hours
+    return result
+
+
+# Performance horizons in (key, label, trading-days-back) tuples
+_PERFORMANCE_HORIZONS: list[tuple[str, str, int]] = [
+    ("1d",  "1 day",    1),
+    ("1w",  "1 week",   5),
+    ("1mo", "1 month",  21),
+    ("3mo", "3 months", 63),
+    ("6mo", "6 months", 126),
+    ("1y",  "1 year",   252),
+]
+
+
+@app.get("/widgets/performance")
+def widget_performance(ticker: str):
+    """% change at 1d / 1w / 1mo / 3mo / 6mo / 1y in a single response, so the
+    user can compare horizons without re-pulling /analyze five times."""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        raise HTTPException(400, "Missing ticker.")
+
+    cache_key = ("performance", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Pull 2y of bars so the 1-year horizon (252 trading days) is always
+    # safely reachable; "1y" period gives ~250 bars which sometimes falls short.
+    try:
+        df = yf.Ticker(ticker).history(period="2y", interval="1d", auto_adjust=False)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Failed to fetch data: {exc}") from exc
+    if df is None or df.empty:
+        raise HTTPException(404, f"No data for '{ticker}'.")
+
+    close = df["Close"].dropna().astype(float)
+    if len(close) < 2:
+        raise HTTPException(404, f"Insufficient data for '{ticker}'.")
+
+    last_price = float(close.iloc[-1])
+
+    periods: list[dict[str, Any]] = []
+    for key, label, bars in _PERFORMANCE_HORIZONS:
+        if len(close) <= bars:
+            periods.append({"key": key, "label": label, "change_pct": None,
+                            "change_abs": None, "from_price": None})
+            continue
+        from_price = float(close.iloc[-bars - 1])
+        change_abs = last_price - from_price
+        change_pct = (change_abs / from_price * 100) if from_price else None
+        periods.append({
+            "key": key,
+            "label": label,
+            "change_pct": change_pct,
+            "change_abs": change_abs,
+            "from_price": from_price,
+        })
+
+    result = {
+        "ticker": ticker,
+        "price": last_price,
+        "periods": periods,
+        "as_of": _now_iso(),
+    }
+    _cache_set(cache_key, result, ttl=300)  # 5 min
+    return result
+
+
+@app.get("/search")
+def search(q: str, limit: int = 8):
+    """Company-name / ticker search. FMP-powered; degrades to empty results
+    + a message if FMP isn't configured or rejects the query."""
+    q = (q or "").strip()
+    if not q:
+        return {"results": [], "source": "none"}
+    limit = max(1, min(int(limit), 20))
+
+    cache_key = ("search", q.lower(), limit)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    if not _fmp_enabled():
+        return {"results": [], "source": "none", "message": "Search requires FMP_API_KEY"}
+
+    try:
+        rows = _fmp_get("/search", {"query": q, "limit": limit}) or []
+    except FMPError as exc:
+        return {"results": [], "source": "none", "message": str(exc)}
+
+    results: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            continue
+        results.append({
+            "symbol":   row.get("symbol"),
+            "name":     row.get("name"),
+            "exchange": row.get("exchangeShortName") or row.get("stockExchange"),
+            "currency": row.get("currency"),
+        })
+
+    result = {"results": results, "source": "fmp"}
+    _cache_set(cache_key, result, ttl=1800)  # 30 min
+    return result
+
+
+@app.get("/movers")
+def movers():
+    """Market overview: today's gainers / losers / most active, technical
+    signals scanned across our sector universe, and upcoming earnings."""
+    cache_key = ("movers",)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # 1) Today's movers from FMP
+    gainers: list[dict[str, Any]] = []
+    losers: list[dict[str, Any]] = []
+    actives: list[dict[str, Any]] = []
+
+    if _fmp_enabled():
+        for target, endpoint in [(gainers, "/stock_market/gainers"),
+                                  (losers,  "/stock_market/losers"),
+                                  (actives, "/stock_market/actives")]:
+            try:
+                rows = _fmp_get(endpoint) or []
+                for row in rows[:10]:
+                    if not isinstance(row, dict):
+                        continue
+                    target.append({
+                        "symbol":     row.get("symbol"),
+                        "name":       row.get("name"),
+                        "price":      row.get("price"),
+                        "change_pct": row.get("changesPercentage"),
+                        "change_abs": row.get("change"),
+                    })
+            except Exception as exc:  # noqa: BLE001
+                log.warning("FMP %s failed: %s", endpoint, exc)
+
+    # 2) Technical signals scan across our sector universe (~165 stocks)
+    universe = sorted({c for sec in SECTORS for c in sec["components"]})
+    scored = _score_tickers_bulk(universe, period="1y")
+
+    signals: dict[str, list[dict[str, Any]]] = {
+        "oversold":        [],
+        "overbought":      [],
+        "macd_cross_up":   [],
+        "macd_cross_down": [],
+        "golden_cross":    [],
+        "death_cross":     [],
+    }
+
+    for t, v in scored.items():
+        if "error" in v:
+            continue
+        ind = v.get("indicators", {}) or {}
+        rsi = ind.get("RSI")
+        common = {
+            "symbol":     t,
+            "price":      v.get("price"),
+            "change_pct": v.get("change_pct"),
+            "rsi":        rsi,
+            "verdict":    v.get("verdict"),
+        }
+        if rsi is not None:
+            if rsi <= 30:
+                signals["oversold"].append(common)
+            elif rsi >= 70:
+                signals["overbought"].append(common)
+        mc = v.get("macd_cross")
+        if mc == "up":
+            signals["macd_cross_up"].append(common)
+        elif mc == "down":
+            signals["macd_cross_down"].append(common)
+        mac = v.get("ma_cross")
+        if mac == "golden":
+            signals["golden_cross"].append(common)
+        elif mac == "death":
+            signals["death_cross"].append(common)
+
+    # Sort signals by extremity / score
+    signals["oversold"].sort(key=lambda x: (x.get("rsi") or 100))
+    signals["overbought"].sort(key=lambda x: -(x.get("rsi") or 0))
+    for k in ("macd_cross_up", "macd_cross_down", "golden_cross", "death_cross"):
+        signals[k].sort(key=lambda x: (x.get("change_pct") or 0), reverse=(k.endswith("_up") or k == "golden_cross"))
+
+    # 3) Upcoming earnings within the next 7 days for our universe
+    earnings: list[dict[str, Any]] = []
+    if _fmp_enabled():
+        today = datetime.now(timezone.utc).date()
+        next_week = today + timedelta(days=7)
+        try:
+            rows = _fmp_get("/earning_calendar", {
+                "from": today.isoformat(),
+                "to":   next_week.isoformat(),
+            }) or []
+            uni_set = set(universe) | {sec["etf"] for sec in SECTORS}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                sym = row.get("symbol")
+                if sym not in uni_set:
+                    continue
+                earnings.append({
+                    "symbol":           sym,
+                    "date":             row.get("date"),
+                    "time":             row.get("time"),
+                    "eps_estimate":     row.get("epsEstimated"),
+                    "revenue_estimate": row.get("revenueEstimated"),
+                })
+            earnings.sort(key=lambda x: (x.get("date") or "", x.get("symbol") or ""))
+        except FMPError as exc:
+            log.info("FMP /earning_calendar unavailable: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FMP earnings calendar errored: %s", exc)
+
+    result = {
+        "gainers":  gainers,
+        "losers":   losers,
+        "actives":  actives,
+        "signals":  signals,
+        "earnings": earnings,
+        "universe_size": len(universe),
+        "as_of": _now_iso(),
+    }
+    _cache_set(cache_key, result, ttl=600)  # 10 min
     return result
 
 

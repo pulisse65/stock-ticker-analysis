@@ -217,6 +217,16 @@
     .sector-card { transition: border-color .12s, transform .12s; }
     .sector-card:hover { border-color: var(--line-strong); }
 
+    /* Movers inner-tab buttons */
+    .movers-tab-btn.active, .signals-tab-btn.active {
+      background: var(--bg-hover);
+      border-color: var(--brand);
+      color: var(--ink);
+    }
+
+    /* Autocomplete dropdown */
+    .ac-dropdown { box-shadow: 0 12px 28px rgba(0,0,0,0.4); }
+
     /* Learn tab styling */
     .learn-card h3 { color: var(--ink); font-weight: 600; }
     .learn-card .term {
@@ -382,6 +392,7 @@
         <button class="tab-btn" data-tab="dashboard">Dashboard</button>
         <button class="tab-btn" data-tab="watchlist">Watchlist</button>
         <button class="tab-btn" data-tab="sectors">Sectors</button>
+        <button class="tab-btn" data-tab="movers">Movers</button>
         <button class="tab-btn" data-tab="learn">Learn</button>
       </nav>
 
@@ -608,6 +619,68 @@
         <div class="flex items-center justify-center gap-2 text-sm"><span class="loader"></span><span>Loading sectors… (first load can take 5-10s while the cache warms)</span></div>
       </div>
       <div id="sectors-grid" class="hidden grid grid-cols-1 lg:grid-cols-2 gap-5"></div>
+    </section>
+
+    <!-- ============================== MOVERS & SIGNALS TAB ============================== -->
+    <section id="tab-movers" class="tab-panel space-y-5">
+      <section class="card p-4 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+        <div>
+          <h2 class="font-semibold text-ink">Movers &amp; Signals</h2>
+          <p class="text-xs text-ink-faint mt-0.5">Today's biggest movers, a technical-signal scan across our sector universe, and upcoming earnings. Surfacing notable activity — not predictions.</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="movers-as-of" class="text-xs text-ink-faint mono"></span>
+          <button id="movers-refresh" type="button" class="btn-ghost px-3 py-1.5 text-sm flex items-center gap-2">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <polyline points="1 20 1 14 7 14"/>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+            </svg>
+            Refresh
+          </button>
+        </div>
+      </section>
+
+      <div id="movers-loading" class="card p-10 text-center text-ink-dim">
+        <div class="flex items-center justify-center gap-2 text-sm"><span class="loader"></span><span>Loading movers &amp; signals… (first load scans ~165 stocks)</span></div>
+      </div>
+
+      <div id="movers-content" class="hidden space-y-5">
+        <!-- Today's Movers -->
+        <div class="card p-5">
+          <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+            <h3 class="font-semibold text-ink">📈 Today's Movers</h3>
+            <div class="flex items-center gap-1 text-xs">
+              <button class="movers-tab-btn btn-ghost px-3 py-1 active" data-movers-tab="gainers">Gainers</button>
+              <button class="movers-tab-btn btn-ghost px-3 py-1" data-movers-tab="losers">Losers</button>
+              <button class="movers-tab-btn btn-ghost px-3 py-1" data-movers-tab="actives">Active</button>
+            </div>
+          </div>
+          <div id="movers-list" class="text-sm"></div>
+        </div>
+
+        <!-- Technical Signals -->
+        <div class="card p-5">
+          <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+            <h3 class="font-semibold text-ink">🎯 Technical Signals</h3>
+            <div class="flex flex-wrap items-center gap-1 text-xs">
+              <button class="signals-tab-btn btn-ghost px-2.5 py-1 active" data-signals-tab="oversold">RSI ≤ 30</button>
+              <button class="signals-tab-btn btn-ghost px-2.5 py-1" data-signals-tab="overbought">RSI ≥ 70</button>
+              <button class="signals-tab-btn btn-ghost px-2.5 py-1" data-signals-tab="macd_cross_up">MACD ↑</button>
+              <button class="signals-tab-btn btn-ghost px-2.5 py-1" data-signals-tab="macd_cross_down">MACD ↓</button>
+              <button class="signals-tab-btn btn-ghost px-2.5 py-1" data-signals-tab="golden_cross">Golden</button>
+              <button class="signals-tab-btn btn-ghost px-2.5 py-1" data-signals-tab="death_cross">Death</button>
+            </div>
+          </div>
+          <div id="signals-list" class="text-sm"></div>
+        </div>
+
+        <!-- Upcoming Earnings -->
+        <div class="card p-5">
+          <h3 class="font-semibold text-ink mb-3">📅 Earnings This Week</h3>
+          <div id="earnings-list" class="text-sm"></div>
+        </div>
+      </div>
     </section>
 
     <!-- ============================== LEARN TAB ============================== -->
@@ -1138,6 +1211,8 @@ document.getElementById("analyze-form").addEventListener("submit", async (e) => 
 
 // ===================== Dashboard =====================
 const WIDGETS = [
+  { id: "technical",    label: "Technical Signals",  icon: "🧪", render: renderTechnical,    perTicker: true  },
+  { id: "performance",  label: "Performance",        icon: "📐", render: renderPerformance,  perTicker: true  },
   { id: "fundamentals", label: "Key Fundamentals",   icon: "📊", render: renderFundamentals, perTicker: true  },
   { id: "earnings",     label: "Earnings & Calendar", icon: "📅", render: renderEarnings,     perTicker: true  },
   { id: "analysts",     label: "Analyst Ratings",    icon: "🎯", render: renderAnalysts,     perTicker: true  },
@@ -1405,6 +1480,84 @@ async function renderReddit(ticker) {
       </a>`).join("");
     widgetSetStatus("reddit", `${posts.length} posts`);
   } catch (e) { widgetError("reddit", e.message); }
+}
+
+async function renderTechnical(ticker) {
+  try {
+    const r = await fetch("/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker, period: "3mo" }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    const body = document.getElementById("widget-technical-body");
+    const verdictCls = verdictPillClass[data.summary.verdict] || verdictPillClass.neutral;
+    const verdictTxt = verdictLabel[data.summary.verdict] || data.summary.verdict;
+    body.innerHTML = `
+      <div class="flex items-center justify-between gap-3 mb-3">
+        <div class="text-xs text-ink-faint mono">${escapeHTML(data.period_label)} · ${data.bars} bars</div>
+        <span class="text-[10px] font-bold uppercase tracking-wider px-2.5 py-1 rounded-full ${verdictCls}">${verdictTxt}</span>
+      </div>
+      <p class="text-sm text-ink-dim leading-relaxed mb-4">${escapeHTML(data.summary.paragraph)}</p>
+      <ul class="space-y-2.5">
+        ${data.summary.bullets.map(b => `
+          <li class="flex gap-2.5">
+            <span class="mt-1.5 inline-block w-2 h-2 rounded-full flex-shrink-0 ${toneDotClass[b.tone] || toneDotClass.neutral}"></span>
+            <div class="flex-1">
+              <div class="text-xs font-semibold ${toneTextClass[b.tone] || toneTextClass.neutral}">${escapeHTML(b.label)}</div>
+              <div class="text-[11px] text-ink-dim leading-snug mt-0.5">${escapeHTML(b.text)}</div>
+            </div>
+          </li>`).join("")}
+      </ul>`;
+    widgetSetStatus("technical", verdictTxt.toLowerCase());
+  } catch (e) { widgetError("technical", e.message); }
+}
+
+async function renderPerformance(ticker) {
+  try {
+    const r = await fetch(`/widgets/performance?ticker=${encodeURIComponent(ticker)}`);
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    const body = document.getElementById("widget-performance-body");
+    const valid = data.periods.filter(p => p.change_pct != null);
+    const maxAbs = Math.max(0.5, ...valid.map(p => Math.abs(p.change_pct)));
+    body.innerHTML = `
+      <div class="text-xs text-ink-faint mb-3 flex items-center justify-between">
+        <span>Current</span>
+        <span class="mono text-ink font-semibold">$${data.price.toFixed(2)}</span>
+      </div>
+      <ul class="space-y-2.5">
+        ${data.periods.map(p => {
+          if (p.change_pct == null) {
+            return `<li class="flex items-center justify-between text-sm py-1 border-t border-line first:border-t-0 first:pt-0">
+              <span class="text-ink-dim">${escapeHTML(p.label)}</span>
+              <span class="text-ink-faint mono">—</span>
+            </li>`;
+          }
+          const up = p.change_pct >= 0;
+          const cls = up ? "val-up" : "val-down";
+          const widthPct = (Math.abs(p.change_pct) / maxAbs * 100).toFixed(1);
+          const barColor = up ? "var(--up)" : "var(--down)";
+          return `<li class="py-1.5 border-t border-line first:border-t-0 first:pt-0">
+            <div class="flex items-center justify-between text-sm">
+              <span class="text-ink-dim">${escapeHTML(p.label)}</span>
+              <span class="mono font-semibold ${cls}">${up ? "+" : ""}${p.change_pct.toFixed(2)}%</span>
+            </div>
+            <div class="mt-1.5 h-1.5 rounded-full bg-bg-input overflow-hidden">
+              <div class="h-full rounded-full" style="width: ${widthPct}%; background: ${barColor};"></div>
+            </div>
+          </li>`;
+        }).join("")}
+      </ul>`;
+    widgetSetStatus("performance", "ok");
+  } catch (e) { widgetError("performance", e.message); }
 }
 
 async function renderInsider(ticker) {
@@ -1931,12 +2084,190 @@ function sectorCardHTML(s) {
 
 document.getElementById("sectors-refresh").addEventListener("click", () => refreshSectors(true));
 
+// ===================== Movers & Signals =====================
+let moversData = null;
+let activeMoversTab = "gainers";
+let activeSignalsTab = "oversold";
+
+const SIGNAL_LABELS = {
+  oversold:        "Oversold (RSI ≤ 30)",
+  overbought:      "Overbought (RSI ≥ 70)",
+  macd_cross_up:   "MACD crossed above signal today",
+  macd_cross_down: "MACD crossed below signal today",
+  golden_cross:    "Golden cross (SMA50 ↑ SMA200) today",
+  death_cross:     "Death cross (SMA50 ↓ SMA200) today",
+};
+
+function renderMoverRow(it) {
+  const cp = it.change_pct;
+  const cls = cp == null ? "text-ink-dim" : (cp >= 0 ? "val-up" : "val-down");
+  const txt = cp == null ? "—" : `${cp >= 0 ? "+" : ""}${cp.toFixed(2)}%`;
+  return `<tr class="border-t border-line">
+    <td class="py-2 pr-3 mono font-semibold"><a href="#" class="movers-go text-ink hover:text-brand" data-ticker="${escapeHTML(it.symbol)}">${escapeHTML(it.symbol)}</a></td>
+    <td class="py-2 pr-3 text-ink-dim text-xs truncate max-w-[200px]">${escapeHTML(it.name || "")}</td>
+    <td class="py-2 pr-3 mono text-right">${it.price != null ? `$${Number(it.price).toFixed(2)}` : "—"}</td>
+    <td class="py-2 pl-3 mono text-right ${cls}">${txt}</td>
+  </tr>`;
+}
+
+function renderSignalRow(it) {
+  const cp = it.change_pct;
+  const cls = cp == null ? "text-ink-dim" : (cp >= 0 ? "val-up" : "val-down");
+  const txt = cp == null ? "—" : `${cp >= 0 ? "+" : ""}${cp.toFixed(2)}%`;
+  const verdictCls = verdictPillClass[it.verdict] || verdictPillClass.neutral;
+  return `<tr class="border-t border-line">
+    <td class="py-2 pr-3 mono font-semibold"><a href="#" class="movers-go text-ink hover:text-brand" data-ticker="${escapeHTML(it.symbol)}">${escapeHTML(it.symbol)}</a></td>
+    <td class="py-2 pr-3 mono text-right">${it.price != null ? `$${Number(it.price).toFixed(2)}` : "—"}</td>
+    <td class="py-2 pr-3 mono text-right ${cls}">${txt}</td>
+    <td class="py-2 pr-3 mono text-right text-ink-dim">${it.rsi != null ? Number(it.rsi).toFixed(1) : "—"}</td>
+    <td class="py-2 pl-3 text-center"><span class="text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full ${verdictCls}">${verdictShort[it.verdict] || "—"}</span></td>
+  </tr>`;
+}
+
+function renderMoversTabContent() {
+  const container = document.getElementById("movers-list");
+  if (!moversData) return;
+  const rows = moversData[activeMoversTab] || [];
+  if (!rows.length) {
+    container.innerHTML = `<div class="text-ink-faint text-sm py-4">No data — this likely needs FMP_API_KEY to be set in the deployment env.</div>`;
+    return;
+  }
+  container.innerHTML = `
+    <table class="w-full">
+      <thead class="text-xs uppercase tracking-wider text-ink-faint">
+        <tr>
+          <th class="text-left pb-2 pr-3">Symbol</th>
+          <th class="text-left pb-2 pr-3">Name</th>
+          <th class="text-right pb-2 pr-3">Price</th>
+          <th class="text-right pb-2 pl-3">Day</th>
+        </tr>
+      </thead>
+      <tbody>${rows.map(renderMoverRow).join("")}</tbody>
+    </table>`;
+  attachMoversGoLinks();
+}
+
+function renderSignalsTabContent() {
+  const container = document.getElementById("signals-list");
+  if (!moversData) return;
+  const rows = (moversData.signals || {})[activeSignalsTab] || [];
+  const label = SIGNAL_LABELS[activeSignalsTab] || activeSignalsTab;
+  if (!rows.length) {
+    container.innerHTML = `<div class="text-ink-faint text-sm py-4">No tickers currently match: <span class="text-ink">${escapeHTML(label)}</span>.</div>`;
+    return;
+  }
+  container.innerHTML = `
+    <div class="text-xs text-ink-faint mb-2">${escapeHTML(label)} · ${rows.length} hits</div>
+    <table class="w-full">
+      <thead class="text-xs uppercase tracking-wider text-ink-faint">
+        <tr>
+          <th class="text-left pb-2 pr-3">Symbol</th>
+          <th class="text-right pb-2 pr-3">Price</th>
+          <th class="text-right pb-2 pr-3">Day</th>
+          <th class="text-right pb-2 pr-3">RSI</th>
+          <th class="text-center pb-2 pl-3">Verdict</th>
+        </tr>
+      </thead>
+      <tbody>${rows.map(renderSignalRow).join("")}</tbody>
+    </table>`;
+  attachMoversGoLinks();
+}
+
+function renderEarnings() {
+  const container = document.getElementById("earnings-list");
+  if (!moversData) return;
+  const earnings = moversData.earnings || [];
+  if (!earnings.length) {
+    container.innerHTML = `<div class="text-ink-faint text-sm py-4">No upcoming earnings in our universe this week (or FMP earnings calendar is gated).</div>`;
+    return;
+  }
+  // Group by date
+  const byDate = {};
+  for (const e of earnings) {
+    const d = e.date || "—";
+    if (!byDate[d]) byDate[d] = [];
+    byDate[d].push(e);
+  }
+  container.innerHTML = Object.entries(byDate).map(([d, items]) => {
+    const dt = d && d !== "—" ? new Date(d + "T00:00:00Z") : null;
+    const head = dt && !isNaN(dt) ? dt.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }) : d;
+    return `
+      <div class="mb-3 last:mb-0">
+        <div class="text-xs text-ink-faint uppercase tracking-wider mb-1.5">${escapeHTML(head)}</div>
+        <div class="flex flex-wrap gap-2">
+          ${items.map(e => {
+            const time = (e.time || "").toLowerCase();
+            const tag = time.includes("bmo") ? "BMO" : time.includes("amc") ? "AMC" : (time || "");
+            const eps = e.eps_estimate != null ? `est $${Number(e.eps_estimate).toFixed(2)}` : "";
+            return `<a href="#" class="movers-go chip rounded-full inline-flex items-center gap-2 px-3 py-1 text-xs" data-ticker="${escapeHTML(e.symbol)}">
+              <span class="mono font-semibold text-ink">${escapeHTML(e.symbol)}</span>
+              ${tag ? `<span class="text-[10px] text-ink-faint">${escapeHTML(tag)}</span>` : ""}
+              ${eps ? `<span class="text-[10px] text-ink-faint">· ${escapeHTML(eps)}</span>` : ""}
+            </a>`;
+          }).join("")}
+        </div>
+      </div>`;
+  }).join("");
+  attachMoversGoLinks();
+}
+
+function attachMoversGoLinks() {
+  document.querySelectorAll(".movers-go").forEach(a => {
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      const t = a.dataset.ticker;
+      document.getElementById("ticker").value = t;
+      document.getElementById("analyze-form").requestSubmit();
+      window.setTab("analysis");
+    });
+  });
+}
+
+async function refreshMovers(force = false) {
+  const loading = document.getElementById("movers-loading");
+  const content = document.getElementById("movers-content");
+  if (force || content.classList.contains("hidden")) {
+    loading.classList.remove("hidden");
+    content.classList.add("hidden");
+  }
+  try {
+    const r = await fetch("/movers");
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    moversData = await r.json();
+    document.getElementById("movers-as-of").textContent = moversData.as_of ? `as of ${timeAgo(moversData.as_of)} · ${moversData.universe_size} scanned` : "";
+    renderMoversTabContent();
+    renderSignalsTabContent();
+    renderEarnings();
+    loading.classList.add("hidden");
+    content.classList.remove("hidden");
+  } catch (err) {
+    loading.innerHTML = `<div class="text-down text-sm">Couldn't load: ${escapeHTML(err.message)}</div>`;
+  }
+}
+
+document.querySelectorAll(".movers-tab-btn").forEach(b => {
+  b.addEventListener("click", () => {
+    activeMoversTab = b.dataset.moversTab;
+    document.querySelectorAll(".movers-tab-btn").forEach(x => x.classList.toggle("active", x === b));
+    renderMoversTabContent();
+  });
+});
+document.querySelectorAll(".signals-tab-btn").forEach(b => {
+  b.addEventListener("click", () => {
+    activeSignalsTab = b.dataset.signalsTab;
+    document.querySelectorAll(".signals-tab-btn").forEach(x => x.classList.toggle("active", x === b));
+    renderSignalsTabContent();
+  });
+});
+document.getElementById("movers-refresh").addEventListener("click", () => refreshMovers(true));
+
 // ===================== Tab nav: extend setTab to load on demand =====================
 const _origSetTab = setTab;
 window.setTab = function(name) {
   _origSetTab(name);
   if (name === "watchlist") refreshWatchlist();
   else if (name === "sectors") refreshSectors(false);
+  else if (name === "movers") refreshMovers(false);
 };
 // Re-bind tab buttons to the wrapped setTab
 document.querySelectorAll(".tab-btn").forEach(b => {
@@ -1951,6 +2282,91 @@ document.querySelectorAll('[data-go-tab]').forEach(a => {
     window.setTab(a.dataset.goTab);
   });
 });
+
+// ===================== Ticker search typeahead =====================
+function attachTickerSearch(input, { onSubmit } = {}) {
+  if (!input || input.dataset.searchAttached === "1") return;
+  input.dataset.searchAttached = "1";
+  input.setAttribute("autocomplete", "off");
+  input.setAttribute("autocapitalize", "characters");
+
+  // Wrap input in a relative container so the dropdown can position correctly.
+  const wrap = document.createElement("div");
+  wrap.className = "relative ac-wrap";
+  if (input.classList.contains("flex-1")) wrap.classList.add("flex-1");
+  if (input.classList.contains("w-full")) wrap.classList.add("w-full");
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+
+  const dropdown = document.createElement("div");
+  dropdown.className = "ac-dropdown card hidden absolute z-30 left-0 right-0 mt-1 max-h-72 overflow-y-auto";
+  dropdown.style.minWidth = "240px";
+  wrap.appendChild(dropdown);
+
+  let debounceTimer = null;
+  let results = [];
+  let activeIdx = -1;
+
+  function close() { dropdown.classList.add("hidden"); activeIdx = -1; }
+  function selectIndex(i) {
+    if (i < 0 || i >= results.length) return;
+    input.value = results[i].symbol;
+    close();
+    if (onSubmit) onSubmit(results[i].symbol);
+  }
+  function render() {
+    if (!results.length) { close(); return; }
+    dropdown.innerHTML = results.map((r, i) => `
+      <button type="button" class="ac-item w-full text-left px-3 py-2 ${i === activeIdx ? 'bg-bg-hover' : ''} hover:bg-bg-hover" data-idx="${i}">
+        <div class="flex items-center justify-between gap-2">
+          <span class="mono font-semibold text-ink">${escapeHTML(r.symbol || '')}</span>
+          <span class="text-[10px] text-ink-faint uppercase tracking-wider">${escapeHTML(r.exchange || '')}</span>
+        </div>
+        <div class="text-xs text-ink-dim truncate">${escapeHTML(r.name || '')}</div>
+      </button>`).join("");
+    dropdown.classList.remove("hidden");
+    dropdown.querySelectorAll(".ac-item").forEach(btn => {
+      btn.addEventListener("mousedown", (e) => {
+        e.preventDefault();  // beats input.blur which would close the dropdown first
+        selectIndex(parseInt(btn.dataset.idx, 10));
+      });
+    });
+  }
+
+  async function runSearch() {
+    const q = input.value.trim();
+    // Looks like a typed ticker already (1-5 uppercase letters/digits/dots): skip search
+    if (q.length < 2 || /^[A-Z0-9.\-]{1,5}$/.test(q.toUpperCase())) {
+      results = []; close(); return;
+    }
+    try {
+      const r = await fetch(`/search?q=${encodeURIComponent(q)}&limit=8`);
+      if (!r.ok) { close(); return; }
+      const data = await r.json();
+      results = data.results || [];
+      activeIdx = -1;
+      render();
+    } catch { close(); }
+  }
+
+  input.addEventListener("input", () => {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(runSearch, 200);
+  });
+  input.addEventListener("keydown", (e) => {
+    if (dropdown.classList.contains("hidden")) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); activeIdx = Math.min(results.length - 1, activeIdx + 1); render(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); activeIdx = Math.max(0, activeIdx - 1); render(); }
+    else if (e.key === "Enter" && activeIdx >= 0) { e.preventDefault(); selectIndex(activeIdx); }
+    else if (e.key === "Escape") { close(); }
+  });
+  input.addEventListener("blur", () => setTimeout(close, 150));
+  document.addEventListener("click", (e) => { if (!wrap.contains(e.target)) close(); });
+}
+
+attachTickerSearch(document.getElementById("ticker"));
+attachTickerSearch(document.getElementById("dashboard-ticker"));
+attachTickerSearch(document.getElementById("watchlist-input"));
 
 // ===================== Init =====================
 document.getElementById("ticker").value = "AAPL";
