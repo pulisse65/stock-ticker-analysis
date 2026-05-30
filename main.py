@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import math
@@ -849,6 +850,54 @@ def _ts_to_iso(value: Any) -> str | None:
     return str(value)
 
 
+REDDIT_USER_AGENT = os.environ.get(
+    "REDDIT_USER_AGENT",
+    "web:ticker-tracker:v1.0 (by /u/anonymous)",
+)
+
+
+def _get_reddit_token() -> str | None:
+    """Get a Reddit OAuth client-credentials token, cached ~23h.
+
+    Returns None when REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET aren't set or
+    when Reddit refuses the auth — caller should surface a 503 in that case.
+    Reddit started blocking unauthenticated server-side hits to
+    www.reddit.com in 2023; OAuth + oauth.reddit.com is the supported path.
+    """
+    cid = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+    cs = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+    if not cid or not cs:
+        return None
+
+    cache_key = ("reddit_token",)
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    try:
+        auth = base64.b64encode(f"{cid}:{cs}".encode()).decode()
+        r = requests.post(
+            "https://www.reddit.com/api/v1/access_token",
+            data={"grant_type": "client_credentials"},
+            headers={
+                "Authorization": f"Basic {auth}",
+                "User-Agent": REDDIT_USER_AGENT,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        token = (r.json() or {}).get("access_token")
+        if not token:
+            log.warning("Reddit token response missing access_token")
+            return None
+        # Tokens last 24h; cache for 23h so we refresh before expiry.
+        _cache_set(cache_key, token, ttl=23 * 3600)
+        return token
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Reddit OAuth token fetch failed: %s", exc)
+        return None
+
+
 @app.get("/widgets/reddit")
 def widget_reddit(ticker: str):
     ticker = ticker.strip().upper()
@@ -859,6 +908,15 @@ def widget_reddit(ticker: str):
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+
+    token = _get_reddit_token()
+    if not token:
+        raise HTTPException(
+            503,
+            "Reddit widget requires REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET "
+            "env vars (Reddit blocked unauthenticated access in 2023). "
+            "Register a free app at https://www.reddit.com/prefs/apps.",
+        )
 
     subs = "wallstreetbets+stocks+investing+StockMarket"
 
@@ -875,8 +933,11 @@ def widget_reddit(ticker: str):
         "limit": "30",
         "t": "month",
     }
-    url = f"https://www.reddit.com/r/{subs}/search.json?{urlencode(params)}"
-    headers = {"User-Agent": "stock-ticker-analysis/1.0 (https://github.com/pulisse65/stock-ticker-analysis)"}
+    url = f"https://oauth.reddit.com/r/{subs}/search.json?{urlencode(params)}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": REDDIT_USER_AGENT,
+    }
 
     try:
         r = requests.get(url, headers=headers, timeout=10)
