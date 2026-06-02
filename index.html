@@ -393,6 +393,7 @@
         <button class="tab-btn" data-tab="watchlist">Watchlist</button>
         <button class="tab-btn" data-tab="sectors">Sectors</button>
         <button class="tab-btn" data-tab="movers">Movers</button>
+        <button class="tab-btn" data-tab="ai">AI</button>
         <button class="tab-btn" data-tab="learn">Learn</button>
       </nav>
 
@@ -681,6 +682,45 @@
           <div id="earnings-list" class="text-sm"></div>
         </div>
       </div>
+    </section>
+
+    <!-- ============================== AI TAB ============================== -->
+    <section id="tab-ai" class="tab-panel space-y-5">
+      <!-- Controls row -->
+      <section class="card p-4 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+        <form id="ai-form" class="flex items-center gap-2 flex-wrap">
+          <label class="text-xs font-medium text-ink-dim uppercase tracking-wider" for="ai-ticker">Ticker</label>
+          <input id="ai-ticker" type="text" maxlength="10" placeholder="AAPL"
+            class="input uppercase px-3 py-1.5 font-medium mono w-32" />
+          <label class="text-xs font-medium text-ink-dim uppercase tracking-wider ml-2" for="ai-model">Model</label>
+          <select id="ai-model" class="select px-2.5 py-1.5 text-sm"></select>
+        </form>
+        <div class="flex items-center gap-2">
+          <button id="ai-analyze-btn" type="button" class="btn-primary px-4 py-1.5 text-sm">🧠 Analyze technicals</button>
+          <button id="ai-reset-btn" type="button" class="btn-ghost px-3 py-1.5 text-sm">Reset chat</button>
+        </div>
+      </section>
+
+      <div id="ai-empty" class="card p-10 text-center text-ink-dim">
+        <div class="text-base font-medium text-ink mb-1">Ready to chat</div>
+        <div class="text-sm">Enter a ticker, then click <span class="text-ink">🧠 Analyze technicals</span> or ask anything.</div>
+        <div class="text-xs text-ink-faint mt-3">The AI sees the same technicals, fundamentals, and news/Reddit sentiment as the rest of the app — grounded answers, not generic ones.</div>
+      </div>
+
+      <div id="ai-chat-card" class="card hidden p-0">
+        <div id="ai-messages" class="px-5 py-4 space-y-4 overflow-y-auto" style="max-height: 60vh;"></div>
+      </div>
+
+      <!-- Input row -->
+      <section class="card p-3">
+        <form id="ai-input-form" class="flex items-end gap-2">
+          <textarea id="ai-input" rows="1" maxlength="4000"
+            placeholder="Ask about this ticker… (Enter to send, Shift+Enter for newline)"
+            class="input flex-1 px-3 py-2 text-sm resize-none" style="max-height: 140px;"></textarea>
+          <button id="ai-send-btn" type="submit" class="btn-primary px-4 py-2 text-sm">Send</button>
+        </form>
+        <div id="ai-status" class="text-xs text-ink-faint mt-2"></div>
+      </section>
     </section>
 
     <!-- ============================== LEARN TAB ============================== -->
@@ -2302,6 +2342,260 @@ document.querySelectorAll(".signals-tab-btn").forEach(b => {
 });
 document.getElementById("movers-refresh").addEventListener("click", () => refreshMovers(true));
 
+// ===================== AI chat =====================
+const MODEL_LABELS = {
+  "anthropic/claude-sonnet-4":              "Claude Sonnet 4",
+  "anthropic/claude-3.5-sonnet":            "Claude 3.5 Sonnet",
+  "anthropic/claude-haiku-4":               "Claude Haiku 4",
+  "openai/gpt-4o":                          "GPT-4o",
+  "openai/gpt-4o-mini":                     "GPT-4o mini",
+  "google/gemini-2.0-flash-001":            "Gemini 2.0 Flash",
+  "meta-llama/llama-3.3-70b-instruct:free": "Llama 3.3 70B (free)",
+  "x-ai/grok-2-1212":                       "Grok 2",
+};
+const aiState = {
+  messages: [],          // [{role: 'user'|'assistant', content: '...'}]
+  ticker: null,
+  model: "anthropic/claude-sonnet-4",
+  streaming: false,
+  abort: null,
+};
+
+// Tiny markdown renderer: bold, italic, code, links, lists, headings, newlines
+function mdToHtml(s) {
+  if (!s) return "";
+  let html = escapeHTML(s);
+  // Code fences
+  html = html.replace(/```([\s\S]*?)```/g, (_, code) =>
+    `<pre class="bg-bg-input border border-line rounded p-3 my-2 text-xs mono overflow-x-auto"><code>${code}</code></pre>`);
+  // Inline code
+  html = html.replace(/`([^`\n]+)`/g, '<code class="bg-bg-input border border-line rounded px-1 mono text-xs">$1</code>');
+  // Bold
+  html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  // Italic (lightweight, single _ or *)
+  html = html.replace(/(^|\s)\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  // Headings (must be at start of line)
+  html = html.replace(/^### (.+)$/gm, '<div class="font-semibold text-ink mt-3 mb-1">$1</div>');
+  html = html.replace(/^## (.+)$/gm,  '<div class="font-semibold text-ink mt-3 mb-1">$1</div>');
+  html = html.replace(/^# (.+)$/gm,   '<div class="font-bold text-ink mt-3 mb-1">$1</div>');
+  // Unordered list items (- or *)
+  html = html.replace(/^[-*] (.+)$/gm, '<li class="ml-4 list-disc">$1</li>');
+  // Numbered list items
+  html = html.replace(/^\d+\. (.+)$/gm, '<li class="ml-4 list-decimal">$1</li>');
+  // Paragraph breaks (double newlines)
+  html = html.replace(/\n\n/g, "<br/><br/>");
+  // Single newlines → <br>
+  html = html.replace(/\n/g, "<br/>");
+  return html;
+}
+
+function aiShowChat() {
+  document.getElementById("ai-empty").classList.add("hidden");
+  document.getElementById("ai-chat-card").classList.remove("hidden");
+}
+
+function aiRenderMessages() {
+  const container = document.getElementById("ai-messages");
+  if (!aiState.messages.length) {
+    document.getElementById("ai-empty").classList.remove("hidden");
+    document.getElementById("ai-chat-card").classList.add("hidden");
+    return;
+  }
+  aiShowChat();
+  container.innerHTML = aiState.messages.map((m, i) => {
+    if (m.role === "user") {
+      return `<div class="flex gap-3 justify-end">
+        <div class="max-w-[85%] rounded-lg px-3.5 py-2 text-sm" style="background: var(--brand); color: white;">
+          ${escapeHTML(m.content).replace(/\n/g, "<br/>")}
+        </div>
+        <div class="w-7 h-7 rounded-full bg-bg-input border border-line flex items-center justify-center text-xs flex-shrink-0">🧑</div>
+      </div>`;
+    }
+    return `<div class="flex gap-3" data-msg-idx="${i}">
+      <div class="w-7 h-7 rounded-full bg-bg-input border border-line flex items-center justify-center text-xs flex-shrink-0">🤖</div>
+      <div class="ai-msg-content flex-1 text-sm text-ink leading-relaxed min-w-0">${mdToHtml(m.content)}</div>
+    </div>`;
+  }).join("");
+  container.scrollTop = container.scrollHeight;
+}
+
+async function aiSendMessage(content) {
+  if (aiState.streaming) return;
+  const trimmed = (content || "").trim();
+  if (!trimmed) return;
+
+  aiState.messages.push({ role: "user", content: trimmed });
+  // Add an empty assistant message we'll fill via streaming
+  aiState.messages.push({ role: "assistant", content: "" });
+  aiRenderMessages();
+
+  aiState.streaming = true;
+  document.getElementById("ai-send-btn").disabled = true;
+  document.getElementById("ai-status").textContent = "Thinking…";
+
+  const payload = {
+    ticker: aiState.ticker || "",
+    model:  aiState.model,
+    messages: aiState.messages.slice(0, -1),  // drop the empty assistant slot
+  };
+
+  const controller = new AbortController();
+  aiState.abort = controller;
+
+  try {
+    const response = await fetch("/ai/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${response.status}`);
+    }
+    if (!response.body) throw new Error("No response body");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const lastIdx = aiState.messages.length - 1;
+    const msgEl = () => document.querySelector(`[data-msg-idx="${lastIdx}"] .ai-msg-content`);
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();  // keep partial last line
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (!data || data === "[DONE]") continue;
+        try {
+          const json = JSON.parse(data);
+          if (json.error) throw new Error(json.error);
+          const delta = json.choices?.[0]?.delta?.content;
+          if (delta) {
+            aiState.messages[lastIdx].content += delta;
+            const el = msgEl();
+            if (el) {
+              el.innerHTML = mdToHtml(aiState.messages[lastIdx].content);
+              const container = document.getElementById("ai-messages");
+              container.scrollTop = container.scrollHeight;
+            }
+          }
+        } catch (e) {
+          if (e instanceof SyntaxError) continue;  // partial JSON
+          throw e;
+        }
+      }
+    }
+    // If we got an empty assistant message, drop it
+    if (!aiState.messages[lastIdx].content) {
+      aiState.messages.pop();
+      aiRenderMessages();
+    }
+    document.getElementById("ai-status").textContent = "";
+  } catch (err) {
+    if (err.name === "AbortError") {
+      document.getElementById("ai-status").textContent = "Cancelled.";
+    } else {
+      document.getElementById("ai-status").innerHTML = `<span class="text-down">${escapeHTML(err.message)}</span>`;
+      // Surface the error in the assistant slot too
+      const lastIdx = aiState.messages.length - 1;
+      if (aiState.messages[lastIdx]?.role === "assistant" && !aiState.messages[lastIdx].content) {
+        aiState.messages[lastIdx].content = `_Error: ${err.message}_`;
+        aiRenderMessages();
+      }
+    }
+  } finally {
+    aiState.streaming = false;
+    aiState.abort = null;
+    document.getElementById("ai-send-btn").disabled = false;
+  }
+}
+
+function aiResetChat() {
+  if (aiState.abort) { aiState.abort.abort(); }
+  aiState.messages = [];
+  aiRenderMessages();
+  document.getElementById("ai-status").textContent = "";
+}
+
+// Pre-load model list
+async function aiLoadModels() {
+  try {
+    const r = await fetch("/ai/models");
+    const data = await r.json();
+    const sel = document.getElementById("ai-model");
+    const models = data.models || [];
+    sel.innerHTML = models.map(m =>
+      `<option value="${escapeHTML(m)}" ${m === data.default ? "selected" : ""}>${escapeHTML(MODEL_LABELS[m] || m)}</option>`
+    ).join("");
+    aiState.model = data.default;
+    if (!data.enabled) {
+      document.getElementById("ai-status").innerHTML = `<span class="text-down">AI requires OPENROUTER_API_KEY env var on Render.</span>`;
+    }
+  } catch (e) {
+    document.getElementById("ai-status").innerHTML = `<span class="text-down">Couldn't load models: ${escapeHTML(e.message)}</span>`;
+  }
+}
+
+// Wire ticker input ↔ shared state (and apply autocomplete)
+function aiSyncTicker() {
+  const newT = document.getElementById("ai-ticker").value.trim().toUpperCase();
+  if (newT && newT !== aiState.ticker) {
+    aiState.ticker = newT;
+    setActiveTicker(newT);
+    // Reset chat when ticker changes — otherwise old context bleeds in
+    aiResetChat();
+  }
+}
+
+document.getElementById("ai-ticker").addEventListener("change", aiSyncTicker);
+document.getElementById("ai-ticker").addEventListener("blur", aiSyncTicker);
+attachTickerSearch(document.getElementById("ai-ticker"), { onSubmit: aiSyncTicker });
+
+document.getElementById("ai-model").addEventListener("change", (e) => {
+  aiState.model = e.target.value;
+});
+
+document.getElementById("ai-reset-btn").addEventListener("click", aiResetChat);
+
+document.getElementById("ai-analyze-btn").addEventListener("click", () => {
+  aiSyncTicker();
+  if (!aiState.ticker) {
+    document.getElementById("ai-status").innerHTML = `<span class="text-down">Enter a ticker first.</span>`;
+    return;
+  }
+  aiSendMessage(`Give me a comprehensive read of ${aiState.ticker}'s current technical setup: what the indicators are saying, where the stock sits in its range, what the news and sentiment are pointing to, and what specifically I should watch for in the coming days. Be specific and cite the data.`);
+});
+
+document.getElementById("ai-input-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  aiSyncTicker();
+  const ta = document.getElementById("ai-input");
+  const content = ta.value;
+  ta.value = "";
+  ta.style.height = "auto";
+  aiSendMessage(content);
+});
+
+// Enter to send, Shift+Enter newline + auto-grow textarea
+const aiInput = document.getElementById("ai-input");
+aiInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById("ai-input-form").requestSubmit();
+  }
+});
+aiInput.addEventListener("input", () => {
+  aiInput.style.height = "auto";
+  aiInput.style.height = Math.min(140, aiInput.scrollHeight) + "px";
+});
+
+aiLoadModels();
+
 // ===================== Tab nav: extend setTab to load on demand =====================
 const _origSetTab = setTab;
 window.setTab = function(name) {
@@ -2309,6 +2603,14 @@ window.setTab = function(name) {
   if (name === "watchlist") refreshWatchlist();
   else if (name === "sectors") refreshSectors(false);
   else if (name === "movers") refreshMovers(false);
+  else if (name === "ai") {
+    // Sync ticker from app state
+    const aiTicker = document.getElementById("ai-ticker");
+    if (state.currentTicker && !aiTicker.value) {
+      aiTicker.value = state.currentTicker;
+      aiState.ticker = state.currentTicker;
+    }
+  }
 };
 // Re-bind tab buttons to the wrapped setTab
 document.querySelectorAll(".tab-btn").forEach(b => {

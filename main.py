@@ -19,8 +19,8 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -2180,6 +2180,273 @@ def sectors():
     result = {"sectors": sectors_out, "as_of": _now_iso()}
     _cache_set(cache_key, result, ttl=900)  # 15 min
     return result
+
+
+# ----------------------------- AI chat (OpenRouter) -----------------------------
+#
+# Lightweight proxy to openrouter.ai chat completions API with SSE streaming.
+# Builds a system prompt that grounds the LLM in everything we know about the
+# active ticker (technicals + fundamentals + news/reddit sentiment).
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_AI_MODEL = "anthropic/claude-sonnet-4"
+ALLOWED_AI_MODELS = {
+    "anthropic/claude-sonnet-4",
+    "anthropic/claude-3.5-sonnet",
+    "anthropic/claude-haiku-4",
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "google/gemini-2.0-flash-001",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "x-ai/grok-2-1212",
+}
+
+
+def _openrouter_enabled() -> bool:
+    return bool(OPENROUTER_API_KEY)
+
+
+def _build_ai_context_for_ticker(ticker: str) -> str:
+    """Build a markdown-style context block summarizing everything we know
+    about a ticker. Best-effort — each section degrades independently so a
+    failure in (say) Reddit doesn't blank out the rest of the context."""
+    ticker = ticker.strip().upper()
+    if not ticker:
+        return ""
+
+    lines: list[str] = [f"# Stock data: {ticker}\n"]
+
+    # Technical analysis (verdict + paragraph + bullets + key indicators)
+    try:
+        result = analyze(AnalyzeRequest(ticker=ticker, period="3mo"))
+        s = result["summary"]
+        ind = result["indicators"]
+        lines.append("## Technical analysis (3-month read)")
+        lines.append(f"- Verdict: **{s['verdict']}**")
+        lines.append(f"- Summary: {s['paragraph']}")
+        lines.append("- Indicators:")
+        ind_keys = [
+            ("price", "Price", "{:.2f}"),
+            ("SMA20", "SMA20", "{:.2f}"),
+            ("SMA50", "SMA50", "{:.2f}"),
+            ("SMA200", "SMA200", "{:.2f}"),
+            ("RSI", "RSI(14)", "{:.1f}"),
+            ("MACD", "MACD", "{:.3f}"),
+            ("MACD_signal", "MACD signal", "{:.3f}"),
+            ("BB_upper", "BB upper", "{:.2f}"),
+            ("BB_lower", "BB lower", "{:.2f}"),
+            ("support", "Support (period low)", "{:.2f}"),
+            ("resistance", "Resistance (period high)", "{:.2f}"),
+            ("SMA20_slope_pct", "SMA20 slope (% / bar)", "{:.3f}"),
+        ]
+        for k, label, fmt in ind_keys:
+            v = ind.get(k)
+            if v is not None:
+                try:
+                    lines.append(f"  - {label}: {fmt.format(v)}")
+                except (TypeError, ValueError):
+                    lines.append(f"  - {label}: {v}")
+        lines.append("- Signal bullets:")
+        for b in s.get("bullets", []):
+            lines.append(f"  - [{b.get('tone')}] {b.get('label')}: {b.get('text')}")
+        lines.append("")
+    except Exception as exc:  # noqa: BLE001
+        log.info("AI context: analyze failed for %s: %s", ticker, exc)
+
+    # Fundamentals
+    try:
+        result = widget_fundamentals(ticker)
+        data = result.get("data", {}) or {}
+        lines.append("## Fundamentals")
+        for key, label in [
+            ("longName", "Company"), ("sector", "Sector"), ("industry", "Industry"),
+            ("marketCap", "Market cap"), ("trailingPE", "P/E (TTM)"),
+            ("forwardPE", "Forward P/E"), ("trailingEps", "EPS (TTM)"),
+            ("dividendYield", "Dividend yield (%)"),
+            ("beta", "Beta"),
+            ("fiftyTwoWeekLow", "52w low"), ("fiftyTwoWeekHigh", "52w high"),
+            ("fiftyDayAverage", "50-day avg"), ("twoHundredDayAverage", "200-day avg"),
+            ("averageVolume", "Avg volume (20d)"),
+        ]:
+            v = data.get(key)
+            if v is not None:
+                lines.append(f"- {label}: {v}")
+        lines.append("")
+    except Exception as exc:  # noqa: BLE001
+        log.info("AI context: fundamentals failed for %s: %s", ticker, exc)
+
+    # News + sentiment
+    try:
+        result = widget_news(ticker)
+        agg = result.get("sentiment") or {}
+        items = result.get("items", []) or []
+        if items:
+            lines.append("## Recent news headlines")
+            if agg:
+                lines.append(
+                    f"- Aggregate sentiment: **{agg.get('label')}** "
+                    f"(mean compound score {agg.get('mean_compound', 0):+.2f}; "
+                    f"{agg.get('positive', 0)} pos / {agg.get('neutral', 0)} neu / "
+                    f"{agg.get('negative', 0)} neg across {agg.get('total', 0)} items)"
+                )
+            for it in items[:8]:
+                s = it.get("sentiment") or {}
+                lab = s.get("label", "neutral") if s else "neutral"
+                lines.append(f"- [{lab}] {it.get('title', '').strip()} ({it.get('source', '').strip()})")
+            lines.append("")
+    except Exception as exc:  # noqa: BLE001
+        log.info("AI context: news failed for %s: %s", ticker, exc)
+
+    # Reddit + sentiment (may be unavailable without OAuth — that's fine)
+    try:
+        result = widget_reddit(ticker)
+        agg = result.get("sentiment") or {}
+        posts = result.get("posts", []) or []
+        if posts:
+            lines.append("## Reddit chatter")
+            if agg:
+                lines.append(
+                    f"- Aggregate sentiment: **{agg.get('label')}** "
+                    f"({agg.get('positive', 0)} pos / {agg.get('neutral', 0)} neu / "
+                    f"{agg.get('negative', 0)} neg across {agg.get('total', 0)} posts)"
+                )
+            for p in posts[:8]:
+                s = p.get("sentiment") or {}
+                lab = s.get("label", "neutral") if s else "neutral"
+                lines.append(
+                    f"- [{lab}] r/{p.get('subreddit')}: {p.get('title')} "
+                    f"(▲{p.get('score', 0)}, 💬{p.get('num_comments', 0)})"
+                )
+            lines.append("")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return "\n".join(lines)
+
+
+_AI_SYSTEM_PREFIX = (
+    "You are a financial analyst helping a user understand a stock. Below "
+    "is the data we've gathered about the ticker they're asking about. "
+    "Use it to answer their questions clearly and specifically.\n\n"
+    "Guidelines:\n"
+    "- Be concrete: cite the actual indicator values, sentiment, and headlines from the data.\n"
+    "- If something isn't in the data, say so plainly — don't guess at recent news, "
+    "  earnings results, or analyst targets you weren't given.\n"
+    "- You are not giving investment advice. You're helping the user *interpret* signals.\n"
+    "- Keep responses concise and structured (markdown is fine).\n"
+    "- It's OK to disagree with the verdict label if the underlying signals tell a different story.\n\n"
+)
+
+
+@app.post("/ai/chat")
+async def ai_chat(req: Request):
+    """Proxy to OpenRouter chat completions with SSE streaming.
+
+    Body: { ticker?: str, model?: str, messages: [{role, content}, ...] }
+    """
+    if not _openrouter_enabled():
+        raise HTTPException(503, "AI chat requires OPENROUTER_API_KEY env var.")
+
+    try:
+        body = await req.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, f"Invalid JSON body: {exc}") from exc
+
+    ticker = (body.get("ticker") or "").strip().upper()
+    model = (body.get("model") or DEFAULT_AI_MODEL).strip()
+    user_messages = body.get("messages") or []
+
+    if model not in ALLOWED_AI_MODELS:
+        raise HTTPException(400, f"Model not allowed. Pick one of: {sorted(ALLOWED_AI_MODELS)}")
+    if not isinstance(user_messages, list) or not user_messages:
+        raise HTTPException(400, "messages must be a non-empty array")
+    if len(user_messages) > 30:
+        user_messages = user_messages[-30:]
+
+    # Validate / cap each message
+    cleaned: list[dict[str, Any]] = []
+    for m in user_messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        if len(content) > 8000:
+            content = content[:8000]
+        cleaned.append({"role": role, "content": content})
+    if not cleaned:
+        raise HTTPException(400, "no valid messages")
+
+    # Build system prompt with ticker context
+    context_block = _build_ai_context_for_ticker(ticker) if ticker else ""
+    system_content = _AI_SYSTEM_PREFIX + (context_block or "(No ticker selected — answer general questions only.)")
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": system_content}] + cleaned,
+        "stream": True,
+        "max_tokens": 2000,
+        "temperature": 0.4,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        # OpenRouter asks for these for analytics + per-app routing
+        "HTTP-Referer": "https://stock-ticker-analysis.onrender.com",
+        "X-Title": "Ticker Tracker",
+    }
+
+    def stream():
+        try:
+            with requests.post(
+                f"{OPENROUTER_BASE}/chat/completions",
+                headers=headers,
+                json=payload,
+                stream=True,
+                timeout=120,
+            ) as r:
+                if r.status_code != 200:
+                    try:
+                        body = r.json()
+                        err_msg = body.get("error", {}).get("message") or body.get("message") or r.text[:300]
+                    except Exception:  # noqa: BLE001
+                        err_msg = r.text[:300]
+                    err = json.dumps({"error": f"OpenRouter HTTP {r.status_code}: {err_msg}"})
+                    yield f"data: {err}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    return
+
+                for raw in r.iter_lines(decode_unicode=False):
+                    if raw is None:
+                        continue
+                    if not raw:
+                        # blank line — SSE event separator
+                        yield b"\n"
+                        continue
+                    # Pass the SSE line through verbatim, plus the required blank line
+                    yield raw + b"\n\n"
+        except Exception as exc:  # noqa: BLE001
+            err = json.dumps({"error": str(exc)})
+            yield f"data: {err}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",  # disable nginx buffering if any
+    })
+
+
+@app.get("/ai/models")
+def ai_models():
+    """Expose the curated allow-list so the frontend doesn't have to hardcode it."""
+    return {
+        "default": DEFAULT_AI_MODEL,
+        "models": sorted(ALLOWED_AI_MODELS),
+        "enabled": _openrouter_enabled(),
+    }
 
 
 # --- Static frontend ---
