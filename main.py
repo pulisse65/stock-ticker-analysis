@@ -2439,6 +2439,91 @@ async def ai_chat(req: Request):
     })
 
 
+@app.get("/debug/data")
+def debug_data(ticker: str = "AAPL"):
+    """One-shot diagnostic: probes FMP + yfinance and returns status + raw
+    error bodies so we can tell whether the issue is the API key, the
+    endpoint path, the plan tier, or yfinance being blocked from this IP."""
+    ticker = ticker.strip().upper() or "AAPL"
+    out: dict[str, Any] = {
+        "ticker": ticker,
+        "fmp_api_key_set": bool(FMP_API_KEY),
+        "fmp_api_key_length": len(FMP_API_KEY) if FMP_API_KEY else 0,
+        "openrouter_set": _openrouter_enabled(),
+    }
+
+    # FMP probe — hit /profile directly with raw HTTP to capture the body
+    if FMP_API_KEY:
+        try:
+            r = requests.get(
+                f"{FMP_BASE}/profile/{ticker}",
+                params={"apikey": FMP_API_KEY},
+                timeout=10,
+            )
+            body_preview = r.text[:500]
+            try:
+                parsed = r.json()
+                if isinstance(parsed, list) and parsed:
+                    parsed_summary = f"list of {len(parsed)} item(s); first={list(parsed[0].keys())[:5]}…"
+                elif isinstance(parsed, dict):
+                    parsed_summary = f"dict; keys={list(parsed.keys())[:8]}"
+                else:
+                    parsed_summary = str(type(parsed))
+            except Exception:  # noqa: BLE001
+                parsed_summary = "non-JSON response"
+            out["fmp"] = {
+                "endpoint":   f"/profile/{ticker}",
+                "http":       r.status_code,
+                "parsed":     parsed_summary,
+                "body":       body_preview,
+            }
+        except Exception as exc:  # noqa: BLE001
+            out["fmp"] = {"error": str(exc)}
+
+        # Also try /quote since that's where PE/EPS come from
+        try:
+            r = requests.get(
+                f"{FMP_BASE}/quote/{ticker}",
+                params={"apikey": FMP_API_KEY},
+                timeout=10,
+            )
+            out["fmp_quote"] = {
+                "http": r.status_code,
+                "body_preview": r.text[:300],
+            }
+        except Exception as exc:  # noqa: BLE001
+            out["fmp_quote"] = {"error": str(exc)}
+    else:
+        out["fmp"] = {"error": "FMP_API_KEY env var not set"}
+
+    # yfinance probe — .info often returns empty on Render's datacenter IP
+    try:
+        info = yf.Ticker(ticker).info or {}
+        out["yfinance_info"] = {
+            "keys_returned": len(info),
+            "has_PE":     info.get("trailingPE") is not None,
+            "has_EPS":    info.get("trailingEps") is not None,
+            "has_beta":   info.get("beta") is not None,
+            "has_divYield": info.get("dividendYield") is not None,
+            "name":       info.get("longName") or info.get("shortName"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["yfinance_info"] = {"error": str(exc)}
+
+    # fast_info as fallback indicator
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        out["yfinance_fast_info"] = {
+            "last_price":  getattr(fi, "last_price", None),
+            "market_cap":  getattr(fi, "market_cap", None),
+            "year_high":   getattr(fi, "year_high", None),
+        }
+    except Exception as exc:  # noqa: BLE001
+        out["yfinance_fast_info"] = {"error": str(exc)}
+
+    return out
+
+
 @app.get("/ai/models")
 def ai_models():
     """Expose the curated allow-list so the frontend doesn't have to hardcode it."""
