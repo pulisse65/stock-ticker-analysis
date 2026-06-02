@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import logging
 import math
@@ -937,6 +938,29 @@ def _cache_set(key: tuple, value: Any, ttl: int) -> None:
     _WIDGET_CACHE[key] = (time.time() + ttl, value)
 
 
+def _with_timeout(fn: Callable[[], Any], timeout: float, default: Any = None) -> Any:
+    """Run a sync callable with a hard wall-clock timeout. Useful for yfinance
+    calls which can hang for tens of seconds when Yahoo throttles datacenter
+    IPs — we'd rather return empty data than spin the widget forever.
+
+    NOTE: we can't actually kill the thread in Python — it keeps running in
+    the background until it finishes naturally. But we stop *waiting* for it,
+    so the request returns promptly. shutdown(wait=False) is critical: the
+    default `with ThreadPoolExecutor()` block blocks on exit until the thread
+    completes, which would defeat the timeout."""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(fn)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            return default
+        except Exception:  # noqa: BLE001
+            return default
+    finally:
+        pool.shutdown(wait=False)
+
+
 def _safe(call: Callable[[], Any], default: Any = None) -> Any:
     try:
         return call()
@@ -1296,6 +1320,10 @@ def widget_fundamentals(ticker: str):
 
 @app.get("/widgets/earnings")
 def widget_earnings(ticker: str):
+    """Per-ticker earnings — next date, estimate range, and recent history
+    with surprise %. Prefers FMP's per-ticker earning_calendar (clean shape,
+    works from datacenter IPs); falls back to yfinance with a hard timeout
+    so the widget can never spin forever."""
     ticker = ticker.strip().upper()
     if not ticker:
         raise HTTPException(400, "Missing ticker.")
@@ -1305,42 +1333,99 @@ def widget_earnings(ticker: str):
     if cached is not None:
         return cached
 
-    t = yf.Ticker(ticker)
-
-    # `calendar` shape varies by yfinance version: dict in newer, DataFrame in older.
     calendar: dict[str, Any] = {}
-    raw_cal = _safe(lambda: t.calendar)
-    if isinstance(raw_cal, dict):
-        for k, v in raw_cal.items():
-            if isinstance(v, list):
-                calendar[k] = [_ts_to_iso(x) for x in v]
-            else:
-                calendar[k] = _ts_to_iso(v) if hasattr(v, "isoformat") else v
-    elif isinstance(raw_cal, pd.DataFrame) and not raw_cal.empty:
-        for col in raw_cal.columns:
-            v = raw_cal[col].iloc[0]
-            calendar[col] = _ts_to_iso(v) if hasattr(v, "isoformat") else (None if pd.isna(v) else v)
-
     earnings_dates: list[dict[str, Any]] = []
-    raw_ed = _safe(lambda: t.earnings_dates)
-    if isinstance(raw_ed, pd.DataFrame) and not raw_ed.empty:
-        ed = raw_ed.head(8).reset_index()
-        date_col = "Earnings Date" if "Earnings Date" in ed.columns else ed.columns[0]
-        for _, row in ed.iterrows():
-            def _f(col: str) -> float | None:
-                v = row.get(col)
-                if v is None or (isinstance(v, float) and math.isnan(v)):
-                    return None
-                return float(v) if isinstance(v, (int, float, np.integer, np.floating)) else None
+    source = "empty"
 
-            earnings_dates.append({
-                "date": _ts_to_iso(row.get(date_col)),
-                "eps_estimate": _f("EPS Estimate"),
-                "eps_actual": _f("Reported EPS"),
-                "surprise_pct": _f("Surprise(%)"),
-            })
+    # --- FMP: /v3/historical/earning_calendar/{symbol} returns mixed past +
+    # upcoming earnings in a single call. eps/revenue are populated for past
+    # entries; epsEstimated/revenueEstimated for upcoming.
+    if _fmp_enabled():
+        try:
+            rows = _fmp_get(f"/historical/earning_calendar/{ticker}", {"limit": 40}) or []
+            if isinstance(rows, list) and rows:
+                today = datetime.now(timezone.utc).date().isoformat()
+                # Sort ascending by date
+                rows.sort(key=lambda r: (r.get("date") or ""))
+                upcoming = [r for r in rows if (r.get("date") or "") >= today]
+                past = [r for r in rows if (r.get("date") or "") < today]
 
-    result = {"ticker": ticker, "calendar": calendar, "earnings_dates": earnings_dates}
+                # Build the calendar shape the frontend expects from the
+                # nearest upcoming entry.
+                if upcoming:
+                    nxt = upcoming[0]
+                    calendar = {
+                        "Earnings Date":      nxt.get("date"),
+                        "Earnings Average":   nxt.get("epsEstimated"),
+                        "Earnings High":      nxt.get("epsEstimated"),
+                        "Earnings Low":       nxt.get("epsEstimated"),
+                        "Revenue Average":    nxt.get("revenueEstimated"),
+                        "Revenue High":       nxt.get("revenueEstimated"),
+                        "Revenue Low":        nxt.get("revenueEstimated"),
+                    }
+
+                # Past earnings, newest first, with surprise %
+                for r in reversed(past[-8:]):
+                    eps_actual = r.get("eps")
+                    eps_est = r.get("epsEstimated")
+                    surprise = None
+                    if isinstance(eps_actual, (int, float)) and isinstance(eps_est, (int, float)) and eps_est:
+                        surprise = (eps_actual - eps_est) / abs(eps_est) * 100
+                    earnings_dates.append({
+                        "date":         r.get("date"),
+                        "eps_estimate": eps_est,
+                        "eps_actual":   eps_actual,
+                        "surprise_pct": surprise,
+                    })
+                source = "fmp"
+        except FMPError as exc:
+            log.info("FMP earnings unavailable for %s (%s); falling back to yfinance", ticker, exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("FMP earnings errored for %s: %s; falling back to yfinance", ticker, exc)
+
+    # --- Fallback: yfinance. Wrapped in a hard timeout because .calendar and
+    # .earnings_dates can hang for 30s+ from Render's datacenter IP.
+    if source == "empty":
+        t = yf.Ticker(ticker)
+
+        raw_cal = _with_timeout(lambda: t.calendar, timeout=6.0)
+        if isinstance(raw_cal, dict):
+            for k, v in raw_cal.items():
+                if isinstance(v, list):
+                    calendar[k] = [_ts_to_iso(x) for x in v]
+                else:
+                    calendar[k] = _ts_to_iso(v) if hasattr(v, "isoformat") else v
+        elif isinstance(raw_cal, pd.DataFrame) and not raw_cal.empty:
+            for col in raw_cal.columns:
+                v = raw_cal[col].iloc[0]
+                calendar[col] = _ts_to_iso(v) if hasattr(v, "isoformat") else (None if pd.isna(v) else v)
+
+        raw_ed = _with_timeout(lambda: t.earnings_dates, timeout=6.0)
+        if isinstance(raw_ed, pd.DataFrame) and not raw_ed.empty:
+            ed = raw_ed.head(8).reset_index()
+            date_col = "Earnings Date" if "Earnings Date" in ed.columns else ed.columns[0]
+            for _, row in ed.iterrows():
+                def _f(col: str) -> float | None:
+                    v = row.get(col)
+                    if v is None or (isinstance(v, float) and math.isnan(v)):
+                        return None
+                    return float(v) if isinstance(v, (int, float, np.integer, np.floating)) else None
+
+                earnings_dates.append({
+                    "date":         _ts_to_iso(row.get(date_col)),
+                    "eps_estimate": _f("EPS Estimate"),
+                    "eps_actual":   _f("Reported EPS"),
+                    "surprise_pct": _f("Surprise(%)"),
+                })
+        if calendar or earnings_dates:
+            source = "yfinance"
+
+    result = {
+        "ticker": ticker,
+        "calendar": calendar,
+        "earnings_dates": earnings_dates,
+        "source": source,
+    }
     _cache_set(cache_key, result, ttl=900)  # 15 min
     return result
 
