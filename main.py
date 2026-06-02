@@ -764,6 +764,113 @@ def clear_history():
     return {"ok": True}
 
 
+# ----------------------------- Sentiment analysis -----------------------------
+#
+# VADER (Valence Aware Dictionary and sEntiment Reasoner) — lightweight,
+# no API key, ~4MB lexicon. Designed for short social-media-style text,
+# which is what news headlines and Reddit titles are. The base lexicon
+# misses finance jargon (it scores "bullish" and "bearish" as 0), so we
+# extend it with a curated finance vocabulary below.
+
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # noqa: E402
+
+_VADER = SentimentIntensityAnalyzer()
+_VADER.lexicon.update({
+    # Direction
+    "bullish": 2.5, "bearish": -2.5,
+    # Big moves up
+    "moon": 3.0, "mooning": 3.0, "rally": 2.0, "rallies": 2.0,
+    "surge": 2.0, "surges": 2.0, "soar": 2.5, "soars": 2.5,
+    "skyrocket": 3.0, "rip": 2.0, "ripping": 2.0, "rips": 2.0,
+    "pump": 1.5, "pumping": 1.5, "pumps": 1.5,
+    "spike": 1.5, "spikes": 1.5, "breakout": 2.0, "breakouts": 2.0,
+    # Big moves down
+    "crash": -3.0, "crashes": -3.0, "crashing": -3.0,
+    "tank": -2.5, "tanking": -2.5, "tanks": -2.5,
+    "plunge": -2.5, "plunges": -2.5, "plummet": -3.0, "plummets": -3.0,
+    "dump": -2.0, "dumping": -2.0, "dumps": -2.0,
+    "selloff": -2.0, "bloodbath": -3.5, "rout": -2.5,
+    # Earnings / fundamentals
+    "beat": 2.0, "beats": 2.0, "exceeded": 2.0, "outperformed": 2.0,
+    "miss": -2.0, "misses": -2.0, "missed": -2.0,
+    "disappoint": -2.0, "disappointed": -2.0, "disappointing": -2.0,
+    "buyback": 1.5, "buybacks": 1.5,
+    # Analyst actions
+    "upgrade": 2.0, "upgrades": 2.0, "upgraded": 2.0,
+    "downgrade": -2.0, "downgrades": -2.0, "downgraded": -2.0,
+    # Reddit / WSB jargon
+    "yolo": 1.0, "hodl": 1.5, "moonshot": 2.5,
+    "bagholder": -2.5, "bagholders": -2.5,
+    "tendies": 2.5, "rugpull": -3.0,
+    # Trouble
+    "lawsuit": -2.0, "fined": -1.5, "investigation": -2.0,
+    "subpoena": -2.5, "halt": -2.0, "halted": -2.0,
+    "bankrupt": -3.5, "bankruptcy": -3.5, "delisted": -3.0, "fraud": -3.5,
+    # Soften words that VADER over-weights in business-news context
+    # ("chip war", "price war", "battle for market share" aren't really
+    # negative sentiment — they're competitive framing).
+    "war": -0.5, "battle": -0.3, "fight": -0.3,
+    "weapon": -0.5, "weapons": -0.5,
+})
+
+
+def _strip_news_source(title: str) -> str:
+    """Strip Google News' ' - Publisher' suffix before sentiment scoring.
+    The publisher name carries no headline sentiment and frequently injects
+    irrelevant words into the score."""
+    if " - " not in title:
+        return title
+    # Only strip if what comes after " - " is short (looks like a publisher
+    # name) — don't lop off content from headlines that legitimately use
+    # dashes mid-sentence.
+    head, _, tail = title.rpartition(" - ")
+    if len(tail) < 40 and len(head) > 15:
+        return head.strip()
+    return title
+
+
+def _score_sentiment(text: str) -> dict[str, Any] | None:
+    """Score a single piece of short text. Returns None for empty input."""
+    if not text or not text.strip():
+        return None
+    s = _VADER.polarity_scores(text)
+    compound = float(s.get("compound", 0.0))
+    return {
+        "compound": compound,
+        "pos":      float(s.get("pos", 0.0)),
+        "neg":      float(s.get("neg", 0.0)),
+        "neu":      float(s.get("neu", 0.0)),
+        "label":    _sentiment_label(compound),
+    }
+
+
+def _sentiment_label(compound: float) -> str:
+    """VADER convention: compound >= 0.05 positive, <= -0.05 negative."""
+    if compound >= 0.05:
+        return "positive"
+    if compound <= -0.05:
+        return "negative"
+    return "neutral"
+
+
+def _aggregate_sentiment(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Compute mean compound + label tallies across a list of items each
+    carrying a `sentiment` dict from _score_sentiment."""
+    scored = [it["sentiment"] for it in items if isinstance(it.get("sentiment"), dict)]
+    if not scored:
+        return None
+    mean_compound = sum(s["compound"] for s in scored) / len(scored)
+    labels = [s["label"] for s in scored]
+    return {
+        "mean_compound": mean_compound,
+        "label":         _sentiment_label(mean_compound),
+        "positive":      labels.count("positive"),
+        "negative":      labels.count("negative"),
+        "neutral":       labels.count("neutral"),
+        "total":         len(scored),
+    }
+
+
 # ----------------------------- Dashboard widgets -----------------------------
 #
 # Server-fed widget endpoints. The TradingView mini-chart is fully client-side
@@ -987,9 +1094,14 @@ def widget_reddit(ticker: str):
     posts = []
     for c in candidates[:15]:
         c.pop("_strength", None)
+        c["sentiment"] = _score_sentiment(c.get("title") or "")
         posts.append(c)
 
-    result = {"ticker": ticker, "posts": posts}
+    result = {
+        "ticker": ticker,
+        "posts": posts,
+        "sentiment": _aggregate_sentiment(posts),
+    }
     _cache_set(cache_key, result, ttl=300)  # 5 min
     return result
 
@@ -1018,14 +1130,20 @@ def widget_news(ticker: str):
 
     items = []
     for it in root.findall(".//item")[:20]:
+        title = (it.findtext("title") or "").strip()
         items.append({
-            "title": (it.findtext("title") or "").strip(),
-            "link": (it.findtext("link") or "").strip(),
-            "pub_date": (it.findtext("pubDate") or "").strip(),
-            "source": (it.findtext("source") or "").strip(),
+            "title":     title,
+            "link":      (it.findtext("link") or "").strip(),
+            "pub_date":  (it.findtext("pubDate") or "").strip(),
+            "source":    (it.findtext("source") or "").strip(),
+            "sentiment": _score_sentiment(_strip_news_source(title)),
         })
 
-    result = {"ticker": ticker, "items": items}
+    result = {
+        "ticker": ticker,
+        "items": items,
+        "sentiment": _aggregate_sentiment(items),
+    }
     _cache_set(cache_key, result, ttl=300)  # 5 min
     return result
 
@@ -1092,11 +1210,9 @@ def widget_fundamentals(ticker: str):
         except Exception as exc:  # noqa: BLE001
             log.warning("FMP fundamentals errored for %s: %s; falling back to yfinance", ticker, exc)
 
-    # Fallback: yfinance .info
+    # Fallback 1: yfinance .info (works from residential IPs, often blocked
+    # on datacenter IPs like Render)
     info = _safe(lambda: yf.Ticker(ticker).info, default={}) or {}
-    if not info:
-        raise HTTPException(404, f"No fundamentals available for '{ticker}'.")
-
     fields = [
         "longName", "shortName", "sector", "industry", "country", "currency", "exchange",
         "marketCap", "enterpriseValue",
@@ -1112,15 +1228,69 @@ def widget_fundamentals(ticker: str):
         "volume", "averageVolume", "averageVolume10days",
         "sharesOutstanding", "floatShares",
     ]
-    data: dict[str, Any] = {}
-    for k in fields:
-        v = info.get(k)
-        if isinstance(v, float) and math.isnan(v):
-            v = None
-        data[k] = v
+    if info:
+        data: dict[str, Any] = {}
+        for k in fields:
+            v = info.get(k)
+            if isinstance(v, float) and math.isnan(v):
+                v = None
+            data[k] = v
+        result = {"ticker": ticker, "data": data, "source": "yfinance"}
+        _cache_set(cache_key, result, ttl=600)
+        return result
 
-    result = {"ticker": ticker, "data": data, "source": "yfinance"}
-    _cache_set(cache_key, result, ttl=600)  # 10 min
+    # Fallback 2: yfinance .fast_info — uses Yahoo's chart API instead of
+    # the .info scrape, so it works from Render's datacenter IPs. Fewer
+    # fields available (no PE/EPS/dividend yield/sector via this path) so
+    # we backfill sector from our SECTORS mapping and accept the rest as —.
+    fi = _safe(lambda: yf.Ticker(ticker).fast_info)
+    if fi is None:
+        raise HTTPException(404, f"No fundamentals available for '{ticker}'.")
+
+    def _fi(name: str) -> Any:
+        try:
+            v = getattr(fi, name)
+        except Exception:  # noqa: BLE001
+            return None
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        return v
+
+    last_price = _fi("last_price")
+    prev_close = _fi("previous_close")
+    change_abs = (last_price - prev_close) if (last_price is not None and prev_close is not None) else None
+    change_pct = (change_abs / prev_close * 100) if (change_abs is not None and prev_close) else None
+
+    # Backfill sector from our hardcoded SECTORS map (covers ~165 large caps)
+    sector = next((sec["name"] for sec in SECTORS if ticker in sec["components"] or ticker == sec["etf"]), None)
+
+    data = {k: None for k in fields}
+    data.update({
+        "currentPrice":           last_price,
+        "regularMarketPrice":     last_price,
+        "previousClose":          prev_close,
+        "regularMarketChange":    change_abs,
+        "regularMarketChangePercent": change_pct,
+        "marketCap":              _fi("market_cap"),
+        "fiftyTwoWeekHigh":       _fi("year_high"),
+        "fiftyTwoWeekLow":        _fi("year_low"),
+        "fiftyDayAverage":        _fi("fifty_day_average"),
+        "twoHundredDayAverage":   _fi("two_hundred_day_average"),
+        "currency":               _fi("currency"),
+        "exchange":               _fi("exchange"),
+        "volume":                 _fi("last_volume"),
+        "averageVolume":          _fi("three_month_average_volume"),
+        "sharesOutstanding":      _fi("shares"),
+        "longName":               ticker,  # we don't have the company name on this path
+        "sector":                 sector,
+    })
+
+    # If we don't even have a last price, fail honestly rather than render an empty widget.
+    if data["currentPrice"] is None and data["marketCap"] is None:
+        raise HTTPException(404, f"No fundamentals available for '{ticker}'.")
+
+    result = {"ticker": ticker, "data": data, "source": "yfinance-fast"}
+    _cache_set(cache_key, result, ttl=600)
     return result
 
 

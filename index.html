@@ -1443,23 +1443,59 @@ async function renderAnalysts(ticker) {
   } catch (e) { widgetError("analysts", e.message); }
 }
 
+// ----- Sentiment rendering helpers -----
+const SENTIMENT_DOT = {
+  positive: "background: var(--up);   box-shadow: 0 0 0 3px rgba(34,197,94,0.18);",
+  negative: "background: var(--down); box-shadow: 0 0 0 3px rgba(239,68,68,0.18);",
+  neutral:  "background: var(--ink-faint);",
+};
+const SENTIMENT_TEXT = { positive: "val-up", negative: "val-down", neutral: "text-ink-dim" };
+
+function sentimentDot(sentiment) {
+  const label = sentiment?.label || "neutral";
+  const compound = sentiment?.compound;
+  const tip = sentiment ? `${label} (score ${compound >= 0 ? "+" : ""}${compound.toFixed(2)})` : "no sentiment";
+  return `<span class="inline-block w-1.5 h-1.5 rounded-full flex-shrink-0 mt-1.5" style="${SENTIMENT_DOT[label] || SENTIMENT_DOT.neutral}" title="${tip}"></span>`;
+}
+
+function sentimentBadge(agg) {
+  if (!agg || !agg.total) return "";
+  const label = agg.label || "neutral";
+  const cls = SENTIMENT_TEXT[label] || SENTIMENT_TEXT.neutral;
+  const arrow = label === "positive" ? "↑" : label === "negative" ? "↓" : "·";
+  const compoundStr = `${agg.mean_compound >= 0 ? "+" : ""}${agg.mean_compound.toFixed(2)}`;
+  return `<div class="flex items-center justify-between gap-2 mb-3 pb-2.5 border-b border-line">
+    <div class="text-xs text-ink-faint">
+      <span class="val-up font-semibold">${agg.positive}</span> pos ·
+      <span class="text-ink-dim font-semibold">${agg.neutral}</span> neu ·
+      <span class="val-down font-semibold">${agg.negative}</span> neg
+    </div>
+    <div class="text-xs ${cls} font-semibold mono">${arrow} ${compoundStr}</div>
+  </div>`;
+}
+
 async function renderNews(ticker) {
   try {
     const r = await fetch(`/widgets/news?ticker=${encodeURIComponent(ticker)}`);
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
-    const { items } = await r.json();
+    const data = await r.json();
+    const items = data.items || [];
     const body = document.getElementById("widget-news-body");
     if (!items.length) { body.innerHTML = `<div class="text-ink-faint text-sm">No news found.</div>`; return; }
-    body.innerHTML = items.slice(0, 12).map(it => {
+    body.innerHTML = sentimentBadge(data.sentiment) + items.slice(0, 12).map(it => {
       const date = it.pub_date ? new Date(it.pub_date) : null;
       const ago = date && !isNaN(date) ? timeAgo(date.toISOString()) : "";
       return `
-        <a href="${escapeHTML(it.link)}" target="_blank" rel="noopener noreferrer" class="feed-item block">
-          <div class="feed-title text-sm">${escapeHTML(it.title)}</div>
-          <div class="feed-meta">${escapeHTML(it.source || "")} ${ago ? "· " + ago : ""}</div>
+        <a href="${escapeHTML(it.link)}" target="_blank" rel="noopener noreferrer" class="feed-item flex gap-2.5">
+          ${sentimentDot(it.sentiment)}
+          <div class="flex-1 min-w-0">
+            <div class="feed-title text-sm">${escapeHTML(it.title)}</div>
+            <div class="feed-meta">${escapeHTML(it.source || "")} ${ago ? "· " + ago : ""}</div>
+          </div>
         </a>`;
     }).join("");
-    widgetSetStatus("news", `${items.length} items`);
+    const tone = data.sentiment?.label || "neutral";
+    widgetSetStatus("news", `${items.length} · ${tone}`);
   } catch (e) { widgetError("news", e.message); }
 }
 
@@ -1467,18 +1503,23 @@ async function renderReddit(ticker) {
   try {
     const r = await fetch(`/widgets/reddit?ticker=${encodeURIComponent(ticker)}`);
     if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
-    const { posts } = await r.json();
+    const data = await r.json();
+    const posts = data.posts || [];
     const body = document.getElementById("widget-reddit-body");
     if (!posts.length) { body.innerHTML = `<div class="text-ink-faint text-sm">No recent posts found.</div>`; return; }
-    body.innerHTML = posts.slice(0, 12).map(p => `
-      <a href="${escapeHTML(p.permalink)}" target="_blank" rel="noopener noreferrer" class="feed-item block">
-        <div class="feed-title text-sm">${escapeHTML(p.title)}</div>
-        <div class="feed-meta">
-          <span class="text-brand">r/${escapeHTML(p.subreddit)}</span>
-          · ▲ ${p.score} · 💬 ${p.num_comments} · ${timeAgoFromUnix(p.created_utc)}
+    body.innerHTML = sentimentBadge(data.sentiment) + posts.slice(0, 12).map(p => `
+      <a href="${escapeHTML(p.permalink)}" target="_blank" rel="noopener noreferrer" class="feed-item flex gap-2.5">
+        ${sentimentDot(p.sentiment)}
+        <div class="flex-1 min-w-0">
+          <div class="feed-title text-sm">${escapeHTML(p.title)}</div>
+          <div class="feed-meta">
+            <span class="text-brand">r/${escapeHTML(p.subreddit)}</span>
+            · ▲ ${p.score} · 💬 ${p.num_comments} · ${timeAgoFromUnix(p.created_utc)}
+          </div>
         </div>
       </a>`).join("");
-    widgetSetStatus("reddit", `${posts.length} posts`);
+    const tone = data.sentiment?.label || "neutral";
+    widgetSetStatus("reddit", `${posts.length} · ${tone}`);
   } catch (e) { widgetError("reddit", e.message); }
 }
 
