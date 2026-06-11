@@ -2534,6 +2534,314 @@ def ai_models():
     }
 
 
+# ----------------------------- Purgatory Method alerts -----------------------------
+#
+# Intraday 4-minute strategy from Reddit:
+#   CALL = 5 EMA above 9 EMA AND both above VWAP AND both above 30 EMA
+#   PUT  = inverse
+# Fires only on a *fresh* cross — the previous closed bar did NOT meet the
+# condition, the current closed bar does. Stops repeated alerts during sustained
+# trends.
+#
+# Data: Alpaca IEX feed (free real-time for one major exchange).
+# Notify: Slack incoming webhook.
+# Schedule: external cron pings /purgatory/scan every 4 min during market hours.
+
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "").strip()
+ALPACA_API_SECRET = os.environ.get("ALPACA_API_SECRET", "").strip()
+ALPACA_DATA_BASE = "https://data.alpaca.markets/v2"
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+
+PURGATORY_FILE = Path(__file__).parent / "purgatory_state.json"
+_purgatory_lock = threading.Lock()
+_purgatory_signals: list[dict[str, Any]] = []   # last ~100 signals (in-memory)
+_purgatory_alerted: dict[tuple, float] = {}      # (ticker, signal, bar_ts) → fired_at
+_PURGATORY_MAX_SIGNALS = 100
+
+
+def _alpaca_enabled() -> bool:
+    return bool(ALPACA_API_KEY and ALPACA_API_SECRET)
+
+
+def _slack_enabled() -> bool:
+    return bool(SLACK_WEBHOOK_URL)
+
+
+def _load_purgatory_state() -> set[str]:
+    if not PURGATORY_FILE.exists():
+        return set()
+    try:
+        data = json.loads(PURGATORY_FILE.read_text())
+        return set(x for x in data.get("watchlist", []) if isinstance(x, str))
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def _save_purgatory_state(watchlist: set[str]) -> None:
+    PURGATORY_FILE.write_text(json.dumps({"watchlist": sorted(watchlist)}, indent=2))
+
+
+def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hours: int = 12) -> dict[str, list[dict]]:
+    """Fetch recent bars for multiple symbols in one request. Returns
+    {ticker: [bar, ...]} where each bar has t, o, h, l, c, v, vw.
+
+    Uses IEX feed which is free on Alpaca's basic plan and gives real-time
+    data (one exchange, not SIP, but enough for liquid names like SPY/AVGO/TSLA)."""
+    if not _alpaca_enabled():
+        raise RuntimeError("ALPACA_API_KEY / ALPACA_API_SECRET not set")
+    if not symbols:
+        return {}
+
+    start = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+    headers = {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+    }
+    params = {
+        "symbols": ",".join(symbols),
+        "timeframe": timeframe,
+        "start": start,
+        "feed": "iex",
+        "limit": "10000",
+    }
+
+    r = requests.get(f"{ALPACA_DATA_BASE}/stocks/bars", headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    body = r.json() or {}
+    bars_by_sym = body.get("bars") or {}
+    out: dict[str, list[dict]] = {}
+    for sym in symbols:
+        out[sym] = bars_by_sym.get(sym) or []
+    return out
+
+
+def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | None:
+    """Detect a fresh Purgatory CALL or PUT signal on the latest closed bar.
+
+    Conditions (CALL):
+      ema5 > ema9 AND ema5 > vwap AND ema5 > ema30
+                  AND ema9 > vwap AND ema9 > ema30
+    PUT is the inverse. "Fresh" = previous bar did NOT satisfy the condition.
+
+    VWAP is computed intraday only (resets each day). EMAs are computed across
+    all bars in the input window so they're well-converged."""
+    if not bars or len(bars) < 31:
+        return None
+
+    df = pd.DataFrame(bars)
+    if df.empty:
+        return None
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df = df.sort_values("t").reset_index(drop=True)
+    df["c"] = df["c"].astype(float)
+    df["h"] = df["h"].astype(float)
+    df["l"] = df["l"].astype(float)
+    df["v"] = df["v"].astype(float)
+
+    # EMAs across the whole window — gives stable values
+    df["ema5"]  = df["c"].ewm(span=5,  adjust=False).mean()
+    df["ema9"]  = df["c"].ewm(span=9,  adjust=False).mean()
+    df["ema30"] = df["c"].ewm(span=30, adjust=False).mean()
+
+    # Intraday VWAP — group by trading day, cumulative sum within each day.
+    # Uses ET to define the day so a 9:30 ET open isn't split across UTC days.
+    et_t = df["t"].dt.tz_convert("America/New_York")
+    df["date"] = et_t.dt.date
+    typ_price = (df["h"] + df["l"] + df["c"]) / 3
+    df["tpv"] = typ_price * df["v"]
+    df["cum_tpv"] = df.groupby("date")["tpv"].cumsum()
+    df["cum_v"] = df.groupby("date")["v"].cumsum()
+    df["vwap"] = df["cum_tpv"] / df["cum_v"].replace(0, np.nan)
+
+    today_date = df["date"].iloc[-1]
+    today_bars = df[df["date"] == today_date].reset_index(drop=True)
+    if len(today_bars) < 2:
+        return None
+
+    prev = today_bars.iloc[-2]
+    cur = today_bars.iloc[-1]
+
+    def is_call(b: pd.Series) -> bool:
+        try:
+            return bool(
+                b["ema5"] > b["ema9"]
+                and b["ema5"] > b["vwap"] and b["ema5"] > b["ema30"]
+                and b["ema9"] > b["vwap"] and b["ema9"] > b["ema30"]
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def is_put(b: pd.Series) -> bool:
+        try:
+            return bool(
+                b["ema5"] < b["ema9"]
+                and b["ema5"] < b["vwap"] and b["ema5"] < b["ema30"]
+                and b["ema9"] < b["vwap"] and b["ema9"] < b["ema30"]
+            )
+        except (TypeError, ValueError):
+            return False
+
+    signal_type: str | None = None
+    if is_call(cur) and not is_call(prev):
+        signal_type = "call"
+    elif is_put(cur) and not is_put(prev):
+        signal_type = "put"
+    if not signal_type:
+        return None
+
+    return {
+        "ticker":    ticker,
+        "signal":    signal_type,
+        "bar_time":  cur["t"].isoformat(),
+        "price":     float(cur["c"]),
+        "ema5":      float(cur["ema5"]),
+        "ema9":      float(cur["ema9"]),
+        "ema30":     float(cur["ema30"]),
+        "vwap":      float(cur["vwap"]),
+    }
+
+
+def _send_slack_alert(signal: dict[str, Any]) -> bool:
+    """POST the signal to the configured Slack incoming webhook. Returns
+    True on success, False otherwise (does not raise)."""
+    if not _slack_enabled():
+        return False
+    emoji = "🟢" if signal["signal"] == "call" else "🔴"
+    direction = "BUY CALLS" if signal["signal"] == "call" else "BUY PUTS"
+    ticker = signal["ticker"]
+    price = signal["price"]
+    payload = {
+        "text": f"{emoji} {ticker} — Purgatory {direction} @ ${price:.2f}",
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn",
+                "text": f"{emoji} *{ticker}* — Purgatory signal: *{direction}*  @  *${price:.2f}*"}},
+            {"type": "section", "fields": [
+                {"type": "mrkdwn", "text": f"*EMA 5/9/30*\n{signal['ema5']:.2f} / {signal['ema9']:.2f} / {signal['ema30']:.2f}"},
+                {"type": "mrkdwn", "text": f"*VWAP*\n{signal['vwap']:.2f}"},
+                {"type": "mrkdwn", "text": f"*Bar time*\n{signal['bar_time']}"},
+            ]},
+            {"type": "context", "elements": [
+                {"type": "mrkdwn", "text": "Take the first two 4-min candles. Not investment advice."}
+            ]},
+        ],
+    }
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        return 200 <= r.status_code < 300
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Slack alert post failed: %s", exc)
+        return False
+
+
+# Initialize from disk
+with _purgatory_lock:
+    _purgatory_watchlist = _load_purgatory_state()
+
+
+@app.get("/purgatory/watchlist")
+def purgatory_watchlist_get():
+    return {
+        "watchlist": sorted(_purgatory_watchlist),
+        "alpaca_enabled": _alpaca_enabled(),
+        "slack_enabled": _slack_enabled(),
+    }
+
+
+class _PurgatoryAddRequest(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=10)
+
+
+@app.post("/purgatory/watchlist")
+def purgatory_watchlist_add(req: _PurgatoryAddRequest):
+    t = req.ticker.strip().upper()
+    if not t:
+        raise HTTPException(400, "ticker required")
+    with _purgatory_lock:
+        _purgatory_watchlist.add(t)
+        _save_purgatory_state(_purgatory_watchlist)
+    return {"watchlist": sorted(_purgatory_watchlist)}
+
+
+@app.delete("/purgatory/watchlist/{ticker}")
+def purgatory_watchlist_remove(ticker: str):
+    t = ticker.strip().upper()
+    with _purgatory_lock:
+        _purgatory_watchlist.discard(t)
+        _save_purgatory_state(_purgatory_watchlist)
+    return {"watchlist": sorted(_purgatory_watchlist)}
+
+
+@app.post("/purgatory/scan")
+def purgatory_scan():
+    """Run one scan pass for every watched ticker. Called by external cron
+    every 4 min during market hours."""
+    if not _alpaca_enabled():
+        raise HTTPException(503, "Purgatory scan requires ALPACA_API_KEY and ALPACA_API_SECRET env vars.")
+
+    tickers = sorted(_purgatory_watchlist)
+    if not tickers:
+        return {"scanned": 0, "signals": [], "ts": _now_iso()}
+
+    # One batched API call for all watched symbols
+    try:
+        bars_by_sym = _fetch_alpaca_bars(tickers, timeframe="4Min", lookback_hours=24)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Alpaca fetch failed: {exc}") from exc
+
+    new_signals: list[dict[str, Any]] = []
+    for t in tickers:
+        bars = bars_by_sym.get(t) or []
+        sig = _check_purgatory_signal(t, bars)
+        if not sig:
+            continue
+        # Dedupe by (ticker, signal-type, bar_time)
+        key = (t, sig["signal"], sig["bar_time"])
+        if key in _purgatory_alerted:
+            continue
+        _purgatory_alerted[key] = time.time()
+        sig["alerted_at"] = _now_iso()
+        sig["slack_sent"] = _send_slack_alert(sig)
+        new_signals.append(sig)
+        _purgatory_signals.append(sig)
+        # Trim history
+        if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
+            del _purgatory_signals[:-_PURGATORY_MAX_SIGNALS]
+
+    # Garbage-collect old dedupe entries (anything older than 24h)
+    cutoff = time.time() - 86400
+    for k, fired_at in list(_purgatory_alerted.items()):
+        if fired_at < cutoff:
+            del _purgatory_alerted[k]
+
+    return {
+        "scanned": len(tickers),
+        "tickers": tickers,
+        "signals": new_signals,
+        "ts": _now_iso(),
+    }
+
+
+@app.get("/purgatory/signals")
+def purgatory_signals_get(limit: int = 50):
+    limit = max(1, min(int(limit), _PURGATORY_MAX_SIGNALS))
+    return {
+        "signals": list(reversed(_purgatory_signals[-limit:])),
+        "total_today_so_far": len(_purgatory_signals),
+    }
+
+
+@app.get("/purgatory/status")
+def purgatory_status():
+    return {
+        "alpaca_enabled":  _alpaca_enabled(),
+        "slack_enabled":   _slack_enabled(),
+        "watchlist_count": len(_purgatory_watchlist),
+        "watchlist":       sorted(_purgatory_watchlist),
+        "signals_logged":  len(_purgatory_signals),
+        "ts":              _now_iso(),
+    }
+
+
 # --- Static frontend ---
 ROOT = Path(__file__).parent
 INDEX = ROOT / "index.html"

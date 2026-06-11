@@ -394,6 +394,7 @@
         <button class="tab-btn" data-tab="sectors">Sectors</button>
         <button class="tab-btn" data-tab="movers">Movers</button>
         <button class="tab-btn" data-tab="ai">AI</button>
+        <button class="tab-btn" data-tab="alerts">Alerts</button>
         <button class="tab-btn" data-tab="learn">Learn</button>
       </nav>
 
@@ -720,6 +721,56 @@
           <button id="ai-send-btn" type="submit" class="btn-primary px-4 py-2 text-sm">Send</button>
         </form>
         <div id="ai-status" class="text-xs text-ink-faint mt-2"></div>
+      </section>
+    </section>
+
+    <!-- ============================== ALERTS TAB ============================== -->
+    <section id="tab-alerts" class="tab-panel space-y-5">
+      <section class="card p-4">
+        <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
+          <div>
+            <h2 class="font-semibold text-ink">🔔 Purgatory Method alerts</h2>
+            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">4-minute intraday strategy: fires when 5 EMA / 9 EMA cross above (or below) both VWAP and 30 EMA — the "Purgatory" breakout. Sends a Slack message on every fresh signal. Educational, not investment advice.</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <button id="alerts-scan-btn" type="button" class="btn-primary px-3 py-1.5 text-sm">Scan now</button>
+            <button id="alerts-refresh-btn" type="button" class="btn-ghost px-3 py-1.5 text-sm">Refresh log</button>
+          </div>
+        </div>
+
+        <!-- Status pills -->
+        <div class="flex flex-wrap gap-2 text-xs">
+          <span id="alerts-alpaca-pill"  class="px-2.5 py-1 rounded-full v-neutral">Alpaca: —</span>
+          <span id="alerts-slack-pill"   class="px-2.5 py-1 rounded-full v-neutral">Slack: —</span>
+          <span id="alerts-count-pill"   class="px-2.5 py-1 rounded-full v-neutral">Watchlist: —</span>
+          <span id="alerts-signals-pill" class="px-2.5 py-1 rounded-full v-neutral">Signals logged: —</span>
+        </div>
+      </section>
+
+      <!-- Watchlist -->
+      <section class="card p-4">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Watched tickers</h3>
+        <form id="alerts-add-form" class="flex items-center gap-2 mb-3">
+          <input id="alerts-input" type="text" maxlength="10" placeholder="e.g. SPY, AVGO, TSLA"
+            class="input uppercase px-3 py-1.5 font-medium mono w-40" />
+          <button type="submit" class="btn-primary px-4 py-1.5 text-sm">Add</button>
+        </form>
+        <div id="alerts-watchlist" class="text-sm text-ink-dim">—</div>
+      </section>
+
+      <!-- Recent signals log -->
+      <section class="card p-4">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Recent signals</h3>
+        <div id="alerts-log" class="text-sm text-ink-dim">No signals yet.</div>
+      </section>
+
+      <!-- Setup help -->
+      <section class="card p-4 text-xs text-ink-dim space-y-2">
+        <div class="text-ink font-semibold">Setup checklist</div>
+        <div>1. <span class="text-ink">Alpaca</span> — sign up at <a href="https://alpaca.markets" target="_blank" class="text-brand hover:underline">alpaca.markets</a>, create a paper-trading API key. Set <code class="mono bg-bg-input px-1 rounded">ALPACA_API_KEY</code> and <code class="mono bg-bg-input px-1 rounded">ALPACA_API_SECRET</code> on Render.</div>
+        <div>2. <span class="text-ink">Slack</span> — create an Incoming Webhook in the channel you want alerts in (<a href="https://api.slack.com/messaging/webhooks" target="_blank" class="text-brand hover:underline">slack.com/incoming-webhooks</a>). Set <code class="mono bg-bg-input px-1 rounded">SLACK_WEBHOOK_URL</code> on Render.</div>
+        <div>3. <span class="text-ink">Scheduler</span> — register at <a href="https://cron-job.org" target="_blank" class="text-brand hover:underline">cron-job.org</a> (free) and add a job that POSTs to <code class="mono bg-bg-input px-1 rounded">https://stock-ticker-analysis.onrender.com/purgatory/scan</code> every 4 minutes, weekdays 9:30 AM–4:00 PM ET.</div>
+        <div>4. Add tickers above (SPY/AVGO/TSLA are good starters), and the bot scans every 4 min from then on.</div>
       </section>
     </section>
 
@@ -2596,6 +2647,146 @@ aiInput.addEventListener("input", () => {
 
 aiLoadModels();
 
+// ===================== Purgatory alerts =====================
+async function refreshAlertsStatus() {
+  try {
+    const r = await fetch("/purgatory/status");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+
+    const setPill = (id, label, ok) => {
+      const el = document.getElementById(id);
+      el.textContent = label;
+      el.className = "px-2.5 py-1 rounded-full " + (ok ? "v-bullish" : "v-bearish");
+    };
+    setPill("alerts-alpaca-pill",  `Alpaca: ${data.alpaca_enabled ? "connected" : "missing key"}`, data.alpaca_enabled);
+    setPill("alerts-slack-pill",   `Slack: ${data.slack_enabled ? "wired" : "no webhook"}`, data.slack_enabled);
+    document.getElementById("alerts-count-pill").textContent   = `Watchlist: ${data.watchlist_count}`;
+    document.getElementById("alerts-count-pill").className     = "px-2.5 py-1 rounded-full v-neutral";
+    document.getElementById("alerts-signals-pill").textContent = `Signals logged: ${data.signals_logged}`;
+    document.getElementById("alerts-signals-pill").className   = "px-2.5 py-1 rounded-full v-neutral";
+
+    renderAlertsWatchlist(data.watchlist || []);
+  } catch (e) {
+    // leave pills as-is
+  }
+}
+
+function renderAlertsWatchlist(tickers) {
+  const el = document.getElementById("alerts-watchlist");
+  if (!tickers.length) {
+    el.innerHTML = `<span class="text-ink-faint">No tickers watched yet. Add SPY, AVGO, or TSLA above to get started.</span>`;
+    return;
+  }
+  el.innerHTML = `<div class="flex flex-wrap gap-2">${
+    tickers.map(t => `
+      <span class="chip rounded-full inline-flex items-center gap-2 px-3 py-1 text-xs">
+        <span class="mono font-semibold text-ink">${escapeHTML(t)}</span>
+        <button class="alerts-remove text-ink-faint hover:text-down ml-1" data-ticker="${escapeHTML(t)}" title="Remove">✕</button>
+      </span>`).join("")
+  }</div>`;
+  el.querySelectorAll(".alerts-remove").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      await fetch(`/purgatory/watchlist/${encodeURIComponent(btn.dataset.ticker)}`, { method: "DELETE" });
+      refreshAlertsStatus();
+    });
+  });
+}
+
+async function refreshAlertsLog() {
+  try {
+    const r = await fetch("/purgatory/signals?limit=50");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    const el = document.getElementById("alerts-log");
+    const signals = data.signals || [];
+    if (!signals.length) {
+      el.innerHTML = `<span class="text-ink-faint">No signals yet. The scheduler will fire these in real time once your watchlist is set + the cron is pinging /purgatory/scan.</span>`;
+      return;
+    }
+    el.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead class="text-ink-faint uppercase tracking-wider">
+        <tr>
+          <th class="text-left pb-2 pr-3">Time</th>
+          <th class="text-left pb-2 pr-3">Ticker</th>
+          <th class="text-center pb-2 pr-3">Signal</th>
+          <th class="text-right pb-2 pr-3">Price</th>
+          <th class="text-right pb-2 pr-3">EMA 5 / 9 / 30</th>
+          <th class="text-right pb-2 pr-3">VWAP</th>
+          <th class="text-center pb-2 pl-3">Slack</th>
+        </tr>
+      </thead>
+      <tbody>${signals.map(s => {
+        const dt = s.bar_time ? new Date(s.bar_time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
+        const sigCls = s.signal === "call" ? "val-up" : "val-down";
+        const sigTxt = s.signal === "call" ? "🟢 CALL" : "🔴 PUT";
+        return `<tr class="border-t border-line">
+          <td class="py-1.5 pr-3 mono text-ink-dim">${escapeHTML(dt)}</td>
+          <td class="py-1.5 pr-3 mono font-semibold text-ink">${escapeHTML(s.ticker)}</td>
+          <td class="py-1.5 pr-3 text-center font-bold ${sigCls}">${sigTxt}</td>
+          <td class="py-1.5 pr-3 text-right mono">$${s.price.toFixed(2)}</td>
+          <td class="py-1.5 pr-3 text-right mono text-ink-dim">${s.ema5.toFixed(2)} / ${s.ema9.toFixed(2)} / ${s.ema30.toFixed(2)}</td>
+          <td class="py-1.5 pr-3 text-right mono text-ink-dim">${s.vwap.toFixed(2)}</td>
+          <td class="py-1.5 pl-3 text-center">${s.slack_sent ? "✓" : "—"}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table></div>`;
+  } catch (e) {
+    document.getElementById("alerts-log").innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
+  }
+}
+
+async function refreshAlerts() {
+  await Promise.all([refreshAlertsStatus(), refreshAlertsLog()]);
+}
+
+document.getElementById("alerts-add-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const inp = document.getElementById("alerts-input");
+  const t = inp.value.trim().toUpperCase();
+  if (!t) return;
+  try {
+    const r = await fetch("/purgatory/watchlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticker: t }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
+    inp.value = "";
+    refreshAlertsStatus();
+  } catch (err) {
+    alert(err.message);
+  }
+});
+
+document.getElementById("alerts-scan-btn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true; btn.textContent = "Scanning…";
+  try {
+    const r = await fetch("/purgatory/scan", { method: "POST" });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    if (data.signals?.length) {
+      btn.textContent = `Found ${data.signals.length} signal${data.signals.length === 1 ? "" : "s"}!`;
+    } else {
+      btn.textContent = `No signals (${data.scanned} scanned)`;
+    }
+    setTimeout(() => { btn.textContent = "Scan now"; btn.disabled = false; }, 2500);
+    refreshAlerts();
+  } catch (err) {
+    btn.textContent = "Failed";
+    setTimeout(() => { btn.textContent = "Scan now"; btn.disabled = false; }, 3000);
+    alert(err.message);
+  }
+});
+
+document.getElementById("alerts-refresh-btn").addEventListener("click", refreshAlerts);
+
+attachTickerSearch(document.getElementById("alerts-input"));
+
 // ===================== Tab nav: extend setTab to load on demand =====================
 const _origSetTab = setTab;
 window.setTab = function(name) {
@@ -2603,6 +2794,7 @@ window.setTab = function(name) {
   if (name === "watchlist") refreshWatchlist();
   else if (name === "sectors") refreshSectors(false);
   else if (name === "movers") refreshMovers(false);
+  else if (name === "alerts") refreshAlerts();
   else if (name === "ai") {
     // Sync ticker from app state
     const aiTicker = document.getElementById("ai-ticker");
