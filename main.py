@@ -2842,6 +2842,54 @@ def purgatory_status():
     }
 
 
+@app.post("/purgatory/test")
+def purgatory_test():
+    """Send a synthetic 'TEST' alert to the configured Slack webhook so
+    the user can verify the channel routing and message format without
+    waiting for a real market signal. The message is clearly marked as
+    a test and the values are placeholder."""
+    if not _slack_enabled():
+        raise HTTPException(503, "SLACK_WEBHOOK_URL not set — nothing to test.")
+
+    test_signal = {
+        "ticker":   "TEST",
+        "signal":   "call",
+        "bar_time": _now_iso(),
+        "price":    100.00,
+        "ema5":     100.05,
+        "ema9":     99.95,
+        "ema30":    99.50,
+        "vwap":     99.80,
+    }
+
+    # Use a slightly different message body for the test so it's unmistakable
+    if not _slack_enabled():
+        return {"ok": False, "error": "slack disabled"}
+    payload = {
+        "text": "🧪 Ticker Tracker test — if you can see this, Slack is wired up correctly.",
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "🧪 Test alert (not a real signal)"}},
+            {"type": "section", "text": {"type": "mrkdwn",
+                "text": "This is a one-off connectivity test from the Ticker Tracker app. The example below is a *mock* signal — do **not** act on it."}},
+            {"type": "section", "fields": [
+                {"type": "mrkdwn", "text": f"*Ticker:* TEST (placeholder)"},
+                {"type": "mrkdwn", "text": f"*Direction:* CALL"},
+                {"type": "mrkdwn", "text": f"*EMA 5/9/30:* 100.05 / 99.95 / 99.50"},
+                {"type": "mrkdwn", "text": f"*VWAP:* 99.80"},
+            ]},
+            {"type": "context", "elements": [
+                {"type": "mrkdwn", "text": "If the formatting and channel look right, real Purgatory signals will use the same template during market hours."}
+            ]},
+        ],
+    }
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        ok = 200 <= r.status_code < 300
+        return {"ok": ok, "http_status": r.status_code, "body_preview": r.text[:200], "echo_signal": test_signal}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Slack POST failed: {exc}") from exc
+
+
 # --- Static frontend ---
 ROOT = Path(__file__).parent
 INDEX = ROOT / "index.html"
