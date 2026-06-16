@@ -1440,44 +1440,91 @@ async function renderFundamentals(ticker) {
 }
 
 async function renderEarnings(ticker) {
+  // Defensive: grab the body element up front so every code path can
+  // unconditionally replace its content. Previously, an error mid-render
+  // could leave the "Loading…" spinner stuck in place.
+  const body = document.getElementById("widget-earnings-body");
+  if (!body) return;
+
+  const setEmpty = (msg) => {
+    body.innerHTML = `<div class="text-ink-faint text-sm">${escapeHTML(msg)}</div>`;
+    widgetSetStatus("earnings", "empty");
+  };
+  const setError = (msg) => {
+    body.innerHTML = `<div class="text-down text-sm">${escapeHTML(msg)}</div>`;
+    widgetSetStatus("earnings", "error");
+  };
+
   try {
     const r = await fetch(`/widgets/earnings?ticker=${encodeURIComponent(ticker)}`);
-    if (!r.ok) throw new Error((await r.json()).detail || `HTTP ${r.status}`);
-    const { calendar, earnings_dates } = await r.json();
-    const body = document.getElementById("widget-earnings-body");
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      return setError(err.detail || `HTTP ${r.status}`);
+    }
+    const data = await r.json();
+    const calendar = (data && data.calendar) || {};
+    const earnings_dates = (data && data.earnings_dates) || [];
+    const source = data && data.source;
 
     const calRows = [];
+    const fmtDate = (s) => {
+      try {
+        if (!s) return null;
+        const d = new Date(s);
+        if (isNaN(d)) return null;
+        return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+      } catch { return null; }
+    };
+
     if (calendar["Earnings Date"]) {
-      const dates = Array.isArray(calendar["Earnings Date"]) ? calendar["Earnings Date"] : [calendar["Earnings Date"]];
-      const formatted = dates.map(d => d ? new Date(d).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "—").join(" – ");
-      calRows.push(["Next earnings", formatted]);
+      const raw = Array.isArray(calendar["Earnings Date"]) ? calendar["Earnings Date"] : [calendar["Earnings Date"]];
+      const formatted = raw.map(d => fmtDate(d) || "—").join(" – ");
+      if (formatted) calRows.push(["Next earnings", formatted]);
     }
-    if (calendar["Earnings Average"] != null) calRows.push(["Estimate (avg)", fmt(calendar["Earnings Average"])]);
-    if (calendar["Earnings Low"] != null && calendar["Earnings High"] != null) calRows.push(["Estimate range", `${fmt(calendar["Earnings Low"])} – ${fmt(calendar["Earnings High"])}`]);
-    if (calendar["Revenue Average"] != null) calRows.push(["Revenue est.", fmtMarketCap(calendar["Revenue Average"])]);
-    if (calendar["Ex-Dividend Date"]) calRows.push(["Ex-dividend", new Date(calendar["Ex-Dividend Date"]).toLocaleDateString()]);
-    if (calendar["Dividend Date"]) calRows.push(["Dividend pay", new Date(calendar["Dividend Date"]).toLocaleDateString()]);
+    if (typeof calendar["Earnings Average"] === "number")
+      calRows.push(["Estimate (avg)", fmt(calendar["Earnings Average"])]);
+    if (typeof calendar["Earnings Low"] === "number" && typeof calendar["Earnings High"] === "number")
+      calRows.push(["Estimate range", `${fmt(calendar["Earnings Low"])} – ${fmt(calendar["Earnings High"])}`]);
+    if (typeof calendar["Revenue Average"] === "number")
+      calRows.push(["Revenue est.", fmtMarketCap(calendar["Revenue Average"])]);
+    const exDiv = fmtDate(calendar["Ex-Dividend Date"]);
+    if (exDiv) calRows.push(["Ex-dividend", exDiv]);
+    const divPay = fmtDate(calendar["Dividend Date"]);
+    if (divPay) calRows.push(["Dividend pay", divPay]);
 
     const recentBlock = (earnings_dates && earnings_dates.length) ? `
       <div class="mt-4">
         <div class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-2">Recent earnings</div>
         <div class="text-sm space-y-1.5">
           ${earnings_dates.slice(0, 5).map(e => {
-            const date = e.date ? new Date(e.date).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "—";
-            const surp = e.surprise_pct;
+            const date = fmtDate(e.date) || "—";
+            const surp = (typeof e.surprise_pct === "number") ? e.surprise_pct : null;
             const surpClass = surp == null ? "" : (surp >= 0 ? "val-up" : "val-down");
             const surpStr = surp == null ? "" : `<span class="${surpClass}">${surp >= 0 ? "+" : ""}${surp.toFixed(1)}%</span>`;
-            return `<div class="flex justify-between mono text-xs"><span class="text-ink-dim">${date}</span><span>${e.eps_actual != null ? `EPS ${e.eps_actual.toFixed(2)}` : ""} ${surpStr}</span></div>`;
+            const epsStr = (typeof e.eps_actual === "number") ? `EPS ${e.eps_actual.toFixed(2)}` : "";
+            return `<div class="flex justify-between mono text-xs"><span class="text-ink-dim">${escapeHTML(date)}</span><span>${epsStr} ${surpStr}</span></div>`;
           }).join("")}
         </div>
       </div>` : "";
 
-    body.innerHTML = calRows.length ? `
+    if (!calRows.length && !earnings_dates.length) {
+      // No data at all — usually an ETF (no earnings reported) or a symbol
+      // without analyst coverage. Be explicit so the user doesn't think it's hung.
+      const hint = source === "empty"
+        ? "No earnings data — this is usually an ETF, an index, or a symbol without analyst coverage."
+        : "No upcoming earnings or calendar data available for this ticker.";
+      return setEmpty(hint);
+    }
+
+    body.innerHTML = `
       <dl class="text-sm">
-        ${calRows.map(([k,v]) => `<div class="ind-row flex items-center justify-between py-2"><dt class="text-ink-dim">${k}</dt><dd class="mono font-semibold text-ink">${escapeHTML(String(v))}</dd></div>`).join("")}
-      </dl>${recentBlock}` : `<div class="text-ink-faint text-sm">No upcoming earnings or calendar data available.</div>`;
+        ${calRows.map(([k,v]) => `<div class="ind-row flex items-center justify-between py-2"><dt class="text-ink-dim">${escapeHTML(k)}</dt><dd class="mono font-semibold text-ink">${escapeHTML(String(v))}</dd></div>`).join("")}
+      </dl>${recentBlock}`;
     widgetSetStatus("earnings", "ok");
-  } catch (e) { widgetError("earnings", e.message); }
+  } catch (e) {
+    console.error("renderEarnings failed:", e);
+    setError(e.message || "Unknown error");
+  }
 }
 
 async function renderAnalysts(ticker) {
