@@ -2567,7 +2567,30 @@ def _slack_enabled() -> bool:
     return bool(SLACK_WEBHOOK_URL)
 
 
+_PURGATORY_TABLE = "purgatory_watchlist"
+
+
 def _load_purgatory_state() -> set[str]:
+    """Load the persisted watchlist. Tries Supabase first (survives Render
+    redeploys); falls back to JSON file on disk (lost on redeploy)."""
+    if _supabase_client is not None:
+        try:
+            res = (
+                _supabase_client.table(_PURGATORY_TABLE)
+                .select("ticker")
+                .execute()
+            )
+            tickers = {
+                row["ticker"]
+                for row in (res.data or [])
+                if isinstance(row, dict) and isinstance(row.get("ticker"), str)
+            }
+            log.info("Purgatory watchlist: loaded %d tickers from Supabase", len(tickers))
+            return tickers
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Supabase purgatory load failed (%s); falling back to JSON", exc)
+
+    # Fallback: local JSON file
     if not PURGATORY_FILE.exists():
         return set()
     try:
@@ -2578,7 +2601,26 @@ def _load_purgatory_state() -> set[str]:
 
 
 def _save_purgatory_state(watchlist: set[str]) -> None:
-    PURGATORY_FILE.write_text(json.dumps({"watchlist": sorted(watchlist)}, indent=2))
+    """Persist the watchlist. Writes to Supabase when configured (the
+    durable path) and also to the JSON file as a local cache. Full
+    replace each time — the set is small (< ~50 tickers in practice)."""
+    if _supabase_client is not None:
+        try:
+            # Delete everything then re-insert. Supabase requires a filter
+            # on delete; the .neq trick matches every row.
+            _supabase_client.table(_PURGATORY_TABLE).delete().neq("ticker", "").execute()
+            if watchlist:
+                rows = [{"ticker": t} for t in sorted(watchlist)]
+                _supabase_client.table(_PURGATORY_TABLE).insert(rows).execute()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Supabase purgatory save failed (%s); JSON fallback only", exc)
+
+    # Always also write to JSON — cheap and gives a local cache that
+    # works even if Supabase is briefly unreachable on the next read.
+    try:
+        PURGATORY_FILE.write_text(json.dumps({"watchlist": sorted(watchlist)}, indent=2))
+    except OSError as exc:
+        log.warning("Local purgatory JSON write failed: %s", exc)
 
 
 def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hours: int = 12) -> dict[str, list[dict]]:
