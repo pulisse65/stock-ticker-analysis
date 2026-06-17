@@ -3040,9 +3040,22 @@ def _send_slack_alert(signal: dict[str, Any], stats: dict[str, Any] | None = Non
         return False
 
 
-# Initialize from disk
-with _purgatory_lock:
-    _purgatory_watchlist = _load_purgatory_state()
+# Initialize the watchlist. The load hits Supabase over the network, so run
+# it in a background thread — a slow or unreachable Supabase must never delay
+# app startup. A long boot makes Render's edge return 503 to the scan cron,
+# which then auto-disables the job (and silences notifications). The watchlist
+# is empty for at most a second or two after boot, until this completes.
+_purgatory_watchlist: set[str] = set()
+
+
+def _init_purgatory_state() -> None:
+    global _purgatory_watchlist
+    loaded = _load_purgatory_state()
+    with _purgatory_lock:
+        _purgatory_watchlist = loaded
+
+
+threading.Thread(target=_init_purgatory_state, name="purgatory-init", daemon=True).start()
 
 
 @app.get("/purgatory/watchlist")
@@ -3918,6 +3931,14 @@ def favicon():
     if f.exists():
         return FileResponse(f, media_type="image/x-icon")
     raise HTTPException(status_code=404)
+
+
+@app.get("/healthz")
+def healthz():
+    """Cheap liveness probe — no Supabase, Alpaca, or disk I/O. Use this as
+    the keep-warm / uptime-monitor target so the instance stays awake (and
+    cold boots report healthy fast) without hammering the heavy scan."""
+    return {"ok": True, "ts": _now_iso()}
 
 
 @app.get("/")
