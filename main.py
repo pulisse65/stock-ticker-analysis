@@ -3131,11 +3131,21 @@ def purgatory_scan():
         if fired_at < cutoff:
             del _purgatory_alerted[k]
 
+    # End-of-day retro: fires once at the first scan >= 16:05 ET on weekdays
+    # if today's retro hasn't been posted yet. Computes + Slack + AI analysis.
+    retro_fired = False
+    try:
+        retro = _run_daily_retro_if_due()
+        retro_fired = retro is not None
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Daily retro auto-trigger failed: %s", exc)
+
     return {
         "scanned":       len(tickers),
         "tickers":       tickers,
         "signals":       new_signals,
         "backfilled":    n_backfilled,
+        "retro_fired":   retro_fired,
         "ts":            _now_iso(),
     }
 
@@ -3238,6 +3248,445 @@ def purgatory_status():
         "supabase_signals":        _supabase_client is not None,
         "ts":                      _now_iso(),
     }
+
+
+# ----------------------------- Daily retro + AI analysis -----------------------------
+
+_PURGATORY_SUMMARIES_TABLE = "purgatory_daily_summaries"
+_ET = "America/New_York"
+
+
+def _now_et_date():
+    """Current date in ET — used to define a 'trading day'."""
+    return pd.Timestamp.now(tz=_ET).date()
+
+
+def _retro_already_posted(date_str: str) -> bool:
+    """Check if the daily retro for this date has already been pushed to Slack."""
+    if _supabase_client is None:
+        return False
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_SUMMARIES_TABLE)
+            .select("slack_posted")
+            .eq("date", date_str)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return bool(res.data[0].get("slack_posted"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Retro check query failed: %s", exc)
+    return False
+
+
+def _should_run_retro_now() -> bool:
+    """Run retro if it's >= 16:05 ET on a weekday and today hasn't posted yet."""
+    now_et = pd.Timestamp.now(tz=_ET)
+    if now_et.weekday() >= 5:  # Sat/Sun
+        return False
+    if (now_et.hour, now_et.minute) < (16, 5):
+        return False
+    return not _retro_already_posted(now_et.date().isoformat())
+
+
+def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
+    """Aggregate signals for one date. Returns a dict suitable for storing
+    in purgatory_daily_summaries + posting to Slack."""
+    if _supabase_client is None:
+        return None
+
+    start = f"{date_str}T00:00:00+00:00"
+    end = f"{date_str}T23:59:59+00:00"
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("*")
+            .gte("bar_time", start)
+            .lte("bar_time", end)
+            .order("bar_time", desc=False)
+            .execute()
+        )
+        signals = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Retro query failed: %s", exc)
+        return None
+
+    if not signals:
+        return {
+            "date": date_str, "total_signals": 0,
+            "wins": 0, "losses": 0, "flats": 0, "pending": 0,
+            "win_rate_pct": None, "avg_favorable_15m": None,
+            "best_signal": None, "worst_signal": None,
+            "per_ticker": {}, "per_direction": {},
+        }
+
+    def _best_favorable(s: dict) -> float | None:
+        vals = [s.get(k) for k in ("favorable_5m", "favorable_10m", "favorable_15m", "favorable_20m") if s.get(k) is not None]
+        vals = [float(v) for v in vals]
+        return max(vals) if vals else None
+
+    wins = sum(1 for s in signals if s.get("outcome") == "win")
+    losses = sum(1 for s in signals if s.get("outcome") == "loss")
+    flats = sum(1 for s in signals if s.get("outcome") == "flat")
+    pending = sum(1 for s in signals if not s.get("outcome"))
+    scored = wins + losses + flats
+
+    f15s = [float(s["favorable_15m"]) for s in signals if s.get("favorable_15m") is not None]
+
+    # Best and worst — based on peak favorable (best across horizons)
+    enriched = [(s, _best_favorable(s)) for s in signals]
+    enriched = [(s, b) for s, b in enriched if b is not None]
+    best = max(enriched, key=lambda x: x[1])[0] if enriched else None
+    worst = min(enriched, key=lambda x: x[1])[0] if enriched else None
+
+    def _slim(s: dict | None) -> dict | None:
+        if not s:
+            return None
+        return {
+            "ticker":          s.get("ticker"),
+            "signal":          s.get("signal"),
+            "bar_time":        s.get("bar_time"),
+            "entry_price":     float(s.get("entry_price")) if s.get("entry_price") is not None else None,
+            "favorable_5m":    float(s["favorable_5m"]) if s.get("favorable_5m") is not None else None,
+            "favorable_10m":   float(s["favorable_10m"]) if s.get("favorable_10m") is not None else None,
+            "favorable_15m":   float(s["favorable_15m"]) if s.get("favorable_15m") is not None else None,
+            "favorable_20m":   float(s["favorable_20m"]) if s.get("favorable_20m") is not None else None,
+            "outcome":         s.get("outcome"),
+        }
+
+    # Per-ticker breakdown
+    per_ticker: dict[str, dict] = {}
+    for s in signals:
+        t = s.get("ticker") or "—"
+        d = s.get("signal") or "—"
+        bucket = per_ticker.setdefault(t, {"call": {"n": 0, "wins": 0, "losses": 0, "flats": 0, "pending": 0},
+                                            "put":  {"n": 0, "wins": 0, "losses": 0, "flats": 0, "pending": 0}})
+        if d not in bucket:
+            continue
+        bucket[d]["n"] += 1
+        oc = s.get("outcome")
+        if oc == "win":
+            bucket[d]["wins"] += 1
+        elif oc == "loss":
+            bucket[d]["losses"] += 1
+        elif oc == "flat":
+            bucket[d]["flats"] += 1
+        else:
+            bucket[d]["pending"] += 1
+
+    # Per-direction summary
+    per_direction = {}
+    for direction in ("call", "put"):
+        rows = [s for s in signals if s.get("signal") == direction]
+        if not rows:
+            continue
+        d_wins = sum(1 for s in rows if s.get("outcome") == "win")
+        d_losses = sum(1 for s in rows if s.get("outcome") == "loss")
+        d_flats = sum(1 for s in rows if s.get("outcome") == "flat")
+        per_direction[direction] = {
+            "n":              len(rows),
+            "wins":           d_wins,
+            "losses":         d_losses,
+            "flats":          d_flats,
+            "pending":        len(rows) - d_wins - d_losses - d_flats,
+            "win_rate_pct":   (d_wins / max(d_wins + d_losses + d_flats, 1)) * 100.0,
+        }
+
+    return {
+        "date":              date_str,
+        "total_signals":     len(signals),
+        "wins":              wins,
+        "losses":            losses,
+        "flats":             flats,
+        "pending":           pending,
+        "win_rate_pct":      (wins / scored * 100.0) if scored else None,
+        "avg_favorable_15m": (sum(f15s) / len(f15s)) if f15s else None,
+        "best_signal":       _slim(best),
+        "worst_signal":      _slim(worst),
+        "per_ticker":        per_ticker,
+        "per_direction":     per_direction,
+    }
+
+
+def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
+    """Format and POST the daily retro to the Slack webhook."""
+    if not _slack_enabled():
+        return False
+    if summary["total_signals"] == 0:
+        # Skip — no point announcing a no-signal day
+        return False
+
+    date_pretty = summary["date"]
+    try:
+        date_pretty = pd.Timestamp(summary["date"]).strftime("%a %b %d")
+    except Exception:  # noqa: BLE001
+        pass
+
+    win_rate = f"{summary['win_rate_pct']:.0f}%" if summary.get("win_rate_pct") is not None else "—"
+    avg_fav = f"{summary['avg_favorable_15m']:+.2f}%" if summary.get("avg_favorable_15m") is not None else "—"
+
+    blocks: list[dict] = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"📊 Purgatory Daily Retro — {date_pretty}"}},
+        {"type": "section", "fields": [
+            {"type": "mrkdwn", "text": f"*Total signals*\n{summary['total_signals']}"},
+            {"type": "mrkdwn", "text": f"*Outcomes*\n🟢 {summary['wins']} W · 🔴 {summary['losses']} L · ⚫ {summary['flats']} flat" + (f" · ⏳ {summary['pending']}" if summary["pending"] else "")},
+            {"type": "mrkdwn", "text": f"*Win rate (scored)*\n{win_rate}"},
+            {"type": "mrkdwn", "text": f"*Avg favorable @ +15m*\n{avg_fav}"},
+        ]},
+    ]
+
+    if summary.get("best_signal"):
+        b = summary["best_signal"]
+        best_pct = b.get("favorable_15m") or b.get("favorable_10m") or b.get("favorable_20m") or 0
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": f"🏆 *Best*: `{b['ticker']}` *{b['signal'].upper()}* — peak +{best_pct:.2f}% favorable"}})
+    if summary.get("worst_signal"):
+        w = summary["worst_signal"]
+        worst_vals = [w.get(k) for k in ("favorable_5m", "favorable_10m", "favorable_15m", "favorable_20m") if w.get(k) is not None]
+        worst_low = min(worst_vals) if worst_vals else 0
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": f"💀 *Worst*: `{w['ticker']}` *{w['signal'].upper()}* — drawdown {worst_low:+.2f}% favorable"}})
+
+    # Per-ticker mini-table
+    if summary.get("per_ticker"):
+        lines = []
+        for t in sorted(summary["per_ticker"]):
+            buckets = summary["per_ticker"][t]
+            parts = []
+            for d in ("call", "put"):
+                b = buckets.get(d, {})
+                if b.get("n"):
+                    parts.append(f"{d.upper()} {b['wins']}/{b['n']}")
+            if parts:
+                lines.append(f"• `{t}`: " + " · ".join(parts))
+        if lines:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                "text": "*By ticker* (wins / total)\n" + "\n".join(lines)}})
+
+    # Per-direction
+    if summary.get("per_direction"):
+        pd_lines = []
+        for direction in ("call", "put"):
+            d = summary["per_direction"].get(direction)
+            if d:
+                pd_lines.append(f"• *{direction.upper()}*: {d['wins']}/{d['n']} ({d['win_rate_pct']:.0f}%)")
+        if pd_lines:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                "text": "*By direction*\n" + "\n".join(pd_lines)}})
+
+    blocks.append({"type": "context", "elements": [
+        {"type": "mrkdwn", "text": "🧠 AI analysis follows in the next message…"}
+    ]})
+
+    payload = {"text": f"📊 Purgatory Daily Retro — {date_pretty}", "blocks": blocks}
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        return 200 <= r.status_code < 300
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Daily retro Slack post failed: %s", exc)
+        return False
+
+
+def _save_daily_summary(summary: dict[str, Any], slack_posted: bool) -> None:
+    """Persist (upsert by date) the daily summary."""
+    if _supabase_client is None:
+        return
+    try:
+        _supabase_client.table(_PURGATORY_SUMMARIES_TABLE).upsert({
+            "date":              summary["date"],
+            "total_signals":     summary["total_signals"],
+            "wins":              summary["wins"],
+            "losses":            summary["losses"],
+            "flats":             summary["flats"],
+            "pending":           summary["pending"],
+            "win_rate_pct":      summary.get("win_rate_pct"),
+            "avg_favorable_15m": summary.get("avg_favorable_15m"),
+            "best_signal":       summary.get("best_signal"),
+            "worst_signal":      summary.get("worst_signal"),
+            "per_ticker":        summary.get("per_ticker"),
+            "per_direction":     summary.get("per_direction"),
+            "slack_posted":      slack_posted,
+        }, on_conflict="date").execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Save daily summary failed: %s", exc)
+
+
+def _ai_analyze_daily_summary(summary: dict[str, Any]) -> str | None:
+    """Send the daily summary to OpenRouter (Claude Sonnet 4) and get back
+    2-3 specific tuning suggestions. Returns the model's text response, or
+    None if disabled/failed."""
+    if not _openrouter_enabled():
+        return None
+    if summary["total_signals"] == 0 or summary["wins"] + summary["losses"] == 0:
+        return None  # not enough data to analyze
+
+    # Compact context so we don't waste tokens on full signal-by-signal data
+    compact = {
+        "date":                summary["date"],
+        "total":               summary["total_signals"],
+        "wins":                summary["wins"],
+        "losses":              summary["losses"],
+        "flats":               summary["flats"],
+        "pending":             summary["pending"],
+        "win_rate_pct":        summary.get("win_rate_pct"),
+        "avg_favorable_15m":   summary.get("avg_favorable_15m"),
+        "best":                summary.get("best_signal"),
+        "worst":               summary.get("worst_signal"),
+        "per_ticker":          summary.get("per_ticker"),
+        "per_direction":       summary.get("per_direction"),
+        "filters_in_use": {
+            "min_breakout_pct":  PURGATORY_MIN_BREAKOUT_PCT,
+            "trend_filter_pct":  PURGATORY_TREND_FILTER_PCT,
+        },
+    }
+
+    system_prompt = (
+        "You are tuning a 4-minute intraday options-signal generator called the "
+        "Purgatory Method. The signal fires when 5-EMA and 9-EMA cross above (CALL) "
+        "or below (PUT) both VWAP and 30-EMA, with two configurable filters: "
+        "(1) breakout-depth threshold — EMA5 must be at least N% beyond the nearest "
+        "purgatory line; (2) trend filter — skip CALL if day is down >X% (or PUT "
+        "if up). Outcomes are scored by 'favorable %' move at +5/+10/+15/+20 min "
+        "after the signal bar's close (positive favorable = trade direction was right).\n\n"
+        "The user wants concrete, specific tuning suggestions — not generic trading "
+        "advice. Be ruthless. Cite the actual numbers. Keep it under 200 words."
+    )
+
+    user_prompt = (
+        "Here's today's data:\n\n"
+        + json.dumps(compact, indent=2, default=str)
+        + "\n\nGive me 2–3 specific tweaks for tomorrow. Examples of the right shape:\n"
+        "• 'Raise min_breakout_pct from 0.05 to 0.08 — it would have killed N "
+        "noise signals that all ended flat.'\n"
+        "• 'Disable {TICKER} CALL signals — 0/N wins this week.'\n"
+        "• 'Hold target should be +12m not +8m — best favorable shifted further out.'\n\n"
+        "If today doesn't have enough signal to justify a change, say so. "
+        "Don't invent a recommendation just to have one."
+    )
+
+    try:
+        r = requests.post(
+            f"{OPENROUTER_BASE}/chat/completions",
+            headers={
+                "Authorization":   f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type":    "application/json",
+                "HTTP-Referer":    "https://stock-ticker-analysis.onrender.com",
+                "X-Title":         "Ticker Tracker — Daily Retro",
+            },
+            json={
+                "model": DEFAULT_AI_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                "max_tokens":  600,
+                "temperature": 0.3,
+            },
+            timeout=45,
+        )
+        if r.status_code != 200:
+            log.warning("OpenRouter analysis HTTP %d: %s", r.status_code, r.text[:300])
+            return None
+        body = r.json() or {}
+        choice = (body.get("choices") or [{}])[0]
+        return (choice.get("message") or {}).get("content")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("OpenRouter analysis call failed: %s", exc)
+        return None
+
+
+def _post_ai_analysis_to_slack(text: str) -> bool:
+    if not _slack_enabled() or not text:
+        return False
+    payload = {
+        "text": "🧠 AI analysis of today's signals",
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": "🧠 AI tuning suggestions"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": text[:2900]}},
+            {"type": "context", "elements": [
+                {"type": "mrkdwn",
+                 "text": f"Generated by {DEFAULT_AI_MODEL} from today's signal data. Apply at your discretion — set env vars in Render to change filters."}
+            ]},
+        ],
+    }
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        return 200 <= r.status_code < 300
+    except Exception as exc:  # noqa: BLE001
+        log.warning("AI analysis Slack post failed: %s", exc)
+        return False
+
+
+def _run_daily_retro_if_due(force_date: str | None = None) -> dict[str, Any] | None:
+    """Compute + post the daily retro + AI analysis. Returns the summary dict
+    (or None if skipped). When force_date is provided, runs unconditionally
+    for that date (used by the manual /purgatory/retro trigger)."""
+    if force_date is None:
+        if not _should_run_retro_now():
+            return None
+        date_str = pd.Timestamp.now(tz=_ET).date().isoformat()
+    else:
+        date_str = force_date
+
+    summary = _compute_daily_retro(date_str)
+    if summary is None:
+        return None
+
+    slack_ok = _post_daily_retro_to_slack(summary) if summary["total_signals"] > 0 else False
+    _save_daily_summary(summary, slack_ok)
+
+    # Phase 2: AI analysis. Only run if Slack post landed (otherwise no point).
+    ai_text = None
+    if slack_ok:
+        ai_text = _ai_analyze_daily_summary(summary)
+        if ai_text:
+            ai_posted = _post_ai_analysis_to_slack(ai_text)
+            if _supabase_client is not None:
+                try:
+                    _supabase_client.table(_PURGATORY_SUMMARIES_TABLE).update({
+                        "ai_analysis":  ai_text,
+                        "ai_posted_at": _now_iso() if ai_posted else None,
+                    }).eq("date", date_str).execute()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("AI analysis save failed: %s", exc)
+
+    summary["slack_posted"] = slack_ok
+    summary["ai_analysis"]  = ai_text
+    return summary
+
+
+@app.post("/purgatory/retro")
+def purgatory_retro(date: str | None = None):
+    """Manually trigger today's retro + AI analysis. Useful for testing and
+    for re-running if the auto-trigger missed (e.g., cron didn't run after
+    16:05 ET)."""
+    target = date or pd.Timestamp.now(tz=_ET).date().isoformat()
+    result = _run_daily_retro_if_due(force_date=target)
+    if result is None:
+        raise HTTPException(503, "Retro could not be computed (Supabase or Slack not configured?)")
+    return result
+
+
+@app.get("/purgatory/summaries")
+def purgatory_summaries(days: int = 30):
+    """Return the last N days of daily summaries. Used by the (next-week)
+    Retro tab in the UI."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Summaries require Supabase.")
+    days = max(1, min(int(days), 365))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_SUMMARIES_TABLE)
+            .select("*")
+            .gte("date", since)
+            .order("date", desc=True)
+            .execute()
+        )
+        return {"days": days, "summaries": list(res.data or [])}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Supabase query failed: {exc}") from exc
 
 
 class _ReplaySignal(BaseModel):
