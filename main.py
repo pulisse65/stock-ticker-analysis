@@ -2884,6 +2884,171 @@ def purgatory_status():
     }
 
 
+class _ReplaySignal(BaseModel):
+    ticker:   str
+    signal:   str  # "call" | "put"
+    bar_time: str  # ISO timestamp
+    price:    float
+
+
+class _PurgatoryReplayRequest(BaseModel):
+    signals: list[_ReplaySignal]
+    horizons_min: list[int] = Field(default_factory=lambda: [5, 10, 15, 20])
+
+
+@app.post("/purgatory/replay")
+def purgatory_replay(req: _PurgatoryReplayRequest):
+    """Given a list of past signals (ticker, side, bar_time, entry price),
+    pull 1-minute bars from Alpaca around each signal and compute the
+    realized % move + win/loss at each requested horizon. Used to measure
+    how much time you actually have before/after a signal goes stale."""
+    if not _alpaca_enabled():
+        raise HTTPException(503, "Replay requires ALPACA_API_KEY and ALPACA_API_SECRET")
+    if not req.signals:
+        return {"results": [], "aggregates": {}, "n_signals": 0}
+
+    horizons = sorted(set(int(h) for h in req.horizons_min if int(h) > 0))[:10]
+    if not horizons:
+        horizons = [5, 10, 15, 20]
+
+    # Parse + dedupe signals
+    cleaned: list[dict[str, Any]] = []
+    for s in req.signals:
+        side = s.signal.strip().lower()
+        if side not in ("call", "put"):
+            continue
+        try:
+            bt = datetime.fromisoformat(s.bar_time.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        cleaned.append({
+            "ticker":   s.ticker.strip().upper(),
+            "signal":   side,
+            "bar_time": bt,
+            "price":    float(s.price),
+        })
+    if not cleaned:
+        raise HTTPException(400, "No valid signals after parsing")
+
+    # Fetch 1-min bars for every ticker in one batched call covering the
+    # full range of signals + the max horizon + small buffer.
+    tickers = sorted({s["ticker"] for s in cleaned})
+    min_t = min(s["bar_time"] for s in cleaned)
+    max_t = max(s["bar_time"] for s in cleaned) + timedelta(minutes=max(horizons) + 5)
+    try:
+        r = requests.get(
+            f"{ALPACA_DATA_BASE}/stocks/bars",
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_API_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+            },
+            params={
+                "symbols":   ",".join(tickers),
+                "timeframe": "1Min",
+                "start":     min_t.isoformat(),
+                "end":       max_t.isoformat(),
+                "feed":      "iex",
+                "limit":     "10000",
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        body = r.json() or {}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Alpaca fetch failed: {exc}") from exc
+
+    bars_by_sym = body.get("bars") or {}
+    bars_index: dict[str, list[tuple[datetime, float]]] = {}
+    for t in tickers:
+        raw = bars_by_sym.get(t, []) or []
+        parsed: list[tuple[datetime, float]] = []
+        for b in raw:
+            try:
+                ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00"))
+                parsed.append((ts, float(b["c"])))
+            except (KeyError, ValueError, TypeError):
+                continue
+        parsed.sort(key=lambda x: x[0])
+        bars_index[t] = parsed
+
+    def price_at_or_after(ticker: str, target: datetime) -> tuple[float | None, datetime | None]:
+        """First bar close at or after target. Returns (price, actual_ts)."""
+        for ts, c in bars_index.get(ticker, []):
+            if ts >= target:
+                return c, ts
+        return None, None
+
+    results: list[dict[str, Any]] = []
+    for s in cleaned:
+        horizons_out: dict[str, Any] = {}
+        for h in horizons:
+            target = s["bar_time"] + timedelta(minutes=h)
+            price, actual_ts = price_at_or_after(s["ticker"], target)
+            if price is None:
+                horizons_out[f"+{h}m"] = {"price": None, "move_pct": None, "outcome": None}
+                continue
+            move_abs = price - s["price"]
+            move_pct = (move_abs / s["price"] * 100.0) if s["price"] else 0.0
+            # For CALL: profit = price up. For PUT: profit = price down.
+            favorable_pct = move_pct if s["signal"] == "call" else -move_pct
+            if favorable_pct > 0.05:
+                outcome = "win"
+            elif favorable_pct < -0.05:
+                outcome = "loss"
+            else:
+                outcome = "flat"
+            horizons_out[f"+{h}m"] = {
+                "price":         price,
+                "move_pct":      move_pct,
+                "favorable_pct": favorable_pct,
+                "outcome":       outcome,
+                "actual_ts":     actual_ts.isoformat() if actual_ts else None,
+            }
+        results.append({
+            "ticker":      s["ticker"],
+            "signal":      s["signal"],
+            "bar_time":    s["bar_time"].isoformat(),
+            "entry_price": s["price"],
+            "horizons":    horizons_out,
+        })
+
+    # Aggregates per horizon
+    aggregates: dict[str, Any] = {}
+    for h in horizons:
+        key = f"+{h}m"
+        vals = [
+            r["horizons"][key]
+            for r in results
+            if r["horizons"].get(key) and r["horizons"][key]["move_pct"] is not None
+        ]
+        if not vals:
+            aggregates[key] = {"n": 0}
+            continue
+        favorable = [v["favorable_pct"] for v in vals]
+        wins = sum(1 for v in vals if v["outcome"] == "win")
+        losses = sum(1 for v in vals if v["outcome"] == "loss")
+        flats = sum(1 for v in vals if v["outcome"] == "flat")
+        aggregates[key] = {
+            "n":              len(vals),
+            "wins":           wins,
+            "losses":         losses,
+            "flats":          flats,
+            "win_rate_pct":   wins / len(vals) * 100.0,
+            "avg_favorable":  sum(favorable) / len(favorable),
+            "max_favorable":  max(favorable),
+            "min_favorable":  min(favorable),
+            "median_favorable": sorted(favorable)[len(favorable) // 2],
+        }
+
+    return {
+        "n_signals":  len(cleaned),
+        "horizons":   horizons,
+        "tickers":    tickers,
+        "results":    results,
+        "aggregates": aggregates,
+    }
+
+
 @app.post("/purgatory/test")
 def purgatory_test():
     """Send a synthetic 'TEST' alert to the configured Slack webhook so
