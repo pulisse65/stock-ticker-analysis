@@ -2657,6 +2657,11 @@ def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hou
     return out
 
 
+# Filter thresholds (env-overridable so we can tighten/loosen without redeploy)
+PURGATORY_MIN_BREAKOUT_PCT = float(os.environ.get("PURGATORY_MIN_BREAKOUT_PCT", "0.05"))   # %
+PURGATORY_TREND_FILTER_PCT = float(os.environ.get("PURGATORY_TREND_FILTER_PCT", "0.5"))    # %
+
+
 def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | None:
     """Detect a fresh Purgatory CALL or PUT signal on the latest closed bar.
 
@@ -2665,8 +2670,19 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
                   AND ema9 > vwap AND ema9 > ema30
     PUT is the inverse. "Fresh" = previous bar did NOT satisfy the condition.
 
-    VWAP is computed intraday only (resets each day). EMAs are computed across
-    all bars in the input window so they're well-converged."""
+    Two extra filters applied on top of the raw condition (added after day-1
+    retro showed ~44% of signals were noise during chop):
+
+      • Breakout-depth filter: require |EMA5 − nearest opposing line
+        (VWAP / EMA30)| / price >= PURGATORY_MIN_BREAKOUT_PCT. Kills signals
+        where all four lines are clustered within a few cents.
+
+      • Trend filter: skip CALL if the day's net move (open → current close)
+        is below −PURGATORY_TREND_FILTER_PCT. Skip PUT if above
+        +PURGATORY_TREND_FILTER_PCT. Don't fade strong one-way days.
+
+    VWAP is intraday-only (resets each day). EMAs use the whole window so
+    they're well-converged."""
     if not bars or len(bars) < 31:
         return None
 
@@ -2731,42 +2747,291 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
     if not signal_type:
         return None
 
+    cur_price = float(cur["c"])
+    cur_ema5  = float(cur["ema5"])
+    cur_ema30 = float(cur["ema30"])
+    cur_vwap  = float(cur["vwap"])
+
+    # --- Filter B: breakout depth ---
+    # For CALL: how far is EMA5 above the highest "purgatory line" (VWAP/EMA30)?
+    # For PUT: how far below the lowest? Express as % of current price.
+    if signal_type == "call":
+        opposing = max(cur_vwap, cur_ema30)
+        depth_pct = (cur_ema5 - opposing) / cur_price * 100.0
+    else:  # put
+        opposing = min(cur_vwap, cur_ema30)
+        depth_pct = (opposing - cur_ema5) / cur_price * 100.0
+
+    if depth_pct < PURGATORY_MIN_BREAKOUT_PCT:
+        log.info("Purgatory filter (%s): breakout depth %.3f%% < %.3f%% threshold — skipping",
+                 ticker, depth_pct, PURGATORY_MIN_BREAKOUT_PCT)
+        return None
+
+    # --- Filter E: trend filter ---
+    # Skip CALL if day is clearly down; skip PUT if day is clearly up.
+    day_open = float(today_bars.iloc[0]["o"])
+    day_move_pct = (cur_price - day_open) / day_open * 100.0 if day_open else 0.0
+    if signal_type == "call" and day_move_pct < -PURGATORY_TREND_FILTER_PCT:
+        log.info("Purgatory filter (%s CALL): day move %.2f%% too bearish — skipping",
+                 ticker, day_move_pct)
+        return None
+    if signal_type == "put" and day_move_pct > PURGATORY_TREND_FILTER_PCT:
+        log.info("Purgatory filter (%s PUT): day move %.2f%% too bullish — skipping",
+                 ticker, day_move_pct)
+        return None
+
     return {
-        "ticker":    ticker,
-        "signal":    signal_type,
-        "bar_time":  cur["t"].isoformat(),
-        "price":     float(cur["c"]),
-        "ema5":      float(cur["ema5"]),
-        "ema9":      float(cur["ema9"]),
-        "ema30":     float(cur["ema30"]),
-        "vwap":      float(cur["vwap"]),
+        "ticker":       ticker,
+        "signal":       signal_type,
+        "bar_time":     cur["t"].isoformat(),
+        "price":        cur_price,
+        "ema5":         cur_ema5,
+        "ema9":         float(cur["ema9"]),
+        "ema30":        cur_ema30,
+        "vwap":         cur_vwap,
+        "depth_pct":    depth_pct,
+        "day_move_pct": day_move_pct,
     }
 
 
-def _send_slack_alert(signal: dict[str, Any]) -> bool:
+# --- Signal persistence + outcome back-fill (Supabase) ---
+
+_PURGATORY_SIGNALS_TABLE = "purgatory_signals"
+
+
+def _persist_signal(signal: dict[str, Any]) -> str | None:
+    """Insert a signal into Supabase. Returns the new row id (or None if
+    Supabase unavailable / insert failed). Idempotent via the unique
+    (ticker, signal, bar_time) constraint — re-inserts return existing row."""
+    if _supabase_client is None:
+        return None
+    try:
+        res = _supabase_client.table(_PURGATORY_SIGNALS_TABLE).upsert({
+            "ticker":      signal["ticker"],
+            "signal":      signal["signal"],
+            "bar_time":    signal["bar_time"],
+            "entry_price": signal["price"],
+            "ema5":        signal.get("ema5"),
+            "ema9":        signal.get("ema9"),
+            "ema30":       signal.get("ema30"),
+            "vwap":        signal.get("vwap"),
+            "slack_sent":  signal.get("slack_sent", False),
+        }, on_conflict="ticker,signal,bar_time").execute()
+        if res.data and isinstance(res.data, list) and res.data:
+            return res.data[0].get("id")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Supabase signal persist failed: %s", exc)
+    return None
+
+
+def _fetch_persisted_signals(limit: int = 100) -> list[dict[str, Any]]:
+    """Pull recent signals from Supabase. Returns newest first."""
+    if _supabase_client is None:
+        return []
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("*")
+            .order("alerted_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Supabase signal fetch failed: %s", exc)
+        return []
+
+
+def _backfill_outcomes_for_matured_signals() -> int:
+    """Find signals that are >= 25 min old, have null outcome, and have
+    enough bars available to score. Compute their favorable_5m/10m/15m/20m
+    and overall outcome, then update the row.
+
+    Returns the number of signals back-filled in this pass."""
+    if _supabase_client is None or not _alpaca_enabled():
+        return 0
+
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=25)).isoformat()
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("*")
+            .is_("outcome", "null")
+            .lt("bar_time", cutoff)
+            .order("bar_time", desc=False)
+            .limit(50)
+            .execute()
+        )
+        pending = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Outcome backfill query failed: %s", exc)
+        return 0
+
+    if not pending:
+        return 0
+
+    # Batch one Alpaca call covering all tickers + time range needed
+    tickers = sorted({s["ticker"] for s in pending})
+    bar_times = [datetime.fromisoformat(s["bar_time"].replace("Z", "+00:00")) for s in pending]
+    earliest = min(bar_times)
+    latest = max(bar_times) + timedelta(minutes=22)
+    try:
+        r = requests.get(
+            f"{ALPACA_DATA_BASE}/stocks/bars",
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_API_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+            },
+            params={
+                "symbols":   ",".join(tickers),
+                "timeframe": "1Min",
+                "start":     earliest.isoformat(),
+                "end":       latest.isoformat(),
+                "feed":      "iex",
+                "limit":     "10000",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        body = r.json() or {}
+        bars_by_sym = body.get("bars") or {}
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Outcome backfill Alpaca fetch failed: %s", exc)
+        return 0
+
+    # Index parsed bars per ticker for fast lookup
+    indexed: dict[str, list[tuple[datetime, float]]] = {}
+    for t in tickers:
+        rows = []
+        for b in (bars_by_sym.get(t) or []):
+            try:
+                ts = datetime.fromisoformat(b["t"].replace("Z", "+00:00"))
+                rows.append((ts, float(b["c"])))
+            except (KeyError, ValueError, TypeError):
+                continue
+        rows.sort(key=lambda x: x[0])
+        indexed[t] = rows
+
+    def close_at_or_after(ticker: str, target: datetime) -> float | None:
+        for ts, c in indexed.get(ticker, []):
+            if ts >= target:
+                return c
+        return None
+
+    n_backfilled = 0
+    for s in pending:
+        try:
+            bt = datetime.fromisoformat(s["bar_time"].replace("Z", "+00:00"))
+            entry = float(s["entry_price"])
+            side = s["signal"]
+        except (KeyError, ValueError, TypeError):
+            continue
+
+        favorables: dict[str, float | None] = {}
+        for h in (5, 10, 15, 20):
+            price = close_at_or_after(s["ticker"], bt + timedelta(minutes=h))
+            if price is None:
+                favorables[f"favorable_{h}m"] = None
+            else:
+                move_pct = (price - entry) / entry * 100.0
+                fav = move_pct if side == "call" else -move_pct
+                favorables[f"favorable_{h}m"] = fav
+
+        # Overall outcome based on best favorable across horizons
+        valid = [v for v in favorables.values() if v is not None]
+        if not valid:
+            # Not enough data yet — leave outcome null, try again next scan
+            continue
+        best = max(valid)
+        outcome = "win" if best > 0.10 else ("flat" if best > -0.10 else "loss")
+
+        try:
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE).update({
+                **favorables,
+                "outcome": outcome,
+            }).eq("id", s["id"]).execute()
+            n_backfilled += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Outcome update failed for signal %s: %s", s.get("id"), exc)
+
+    return n_backfilled
+
+
+def _recent_stats_for_ticker_direction(ticker: str, direction: str, n: int = 10) -> dict[str, Any] | None:
+    """Return win-rate + average favorable for the last N signals on
+    (ticker, direction). Only counts signals where outcome has been scored
+    (i.e., not the brand-new one we're currently firing)."""
+    if _supabase_client is None:
+        return None
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("outcome, favorable_10m, favorable_15m")
+            .eq("ticker", ticker)
+            .eq("signal", direction)
+            .not_.is_("outcome", "null")
+            .order("bar_time", desc=True)
+            .limit(n)
+            .execute()
+        )
+        rows = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Recent-stats query failed: %s", exc)
+        return None
+
+    if not rows:
+        return None
+    wins = sum(1 for r in rows if r.get("outcome") == "win")
+    avg_15 = [float(r["favorable_15m"]) for r in rows if r.get("favorable_15m") is not None]
+    return {
+        "n":             len(rows),
+        "wins":          wins,
+        "win_rate_pct":  wins / len(rows) * 100.0,
+        "avg_favorable_15m": (sum(avg_15) / len(avg_15)) if avg_15 else None,
+    }
+
+
+def _send_slack_alert(signal: dict[str, Any], stats: dict[str, Any] | None = None) -> bool:
     """POST the signal to the configured Slack incoming webhook. Returns
-    True on success, False otherwise (does not raise)."""
+    True on success, False otherwise (does not raise). Optionally appends
+    a 'last N {ticker} {direction}: X wins / Y losses, avg favorable Z%'
+    context line so the user can gauge confidence at a glance."""
     if not _slack_enabled():
         return False
     emoji = "🟢" if signal["signal"] == "call" else "🔴"
     direction = "BUY CALLS" if signal["signal"] == "call" else "BUY PUTS"
     ticker = signal["ticker"]
     price = signal["price"]
-    payload = {
-        "text": f"{emoji} {ticker} — Purgatory {direction} @ ${price:.2f}",
-        "blocks": [
-            {"type": "section", "text": {"type": "mrkdwn",
-                "text": f"{emoji} *{ticker}* — Purgatory signal: *{direction}*  @  *${price:.2f}*"}},
-            {"type": "section", "fields": [
-                {"type": "mrkdwn", "text": f"*EMA 5/9/30*\n{signal['ema5']:.2f} / {signal['ema9']:.2f} / {signal['ema30']:.2f}"},
-                {"type": "mrkdwn", "text": f"*VWAP*\n{signal['vwap']:.2f}"},
-                {"type": "mrkdwn", "text": f"*Bar time*\n{signal['bar_time']}"},
-            ]},
-            {"type": "context", "elements": [
-                {"type": "mrkdwn", "text": "Take the first two 4-min candles. Not investment advice."}
-            ]},
-        ],
-    }
+
+    fields = [
+        {"type": "mrkdwn", "text": f"*EMA 5/9/30*\n{signal['ema5']:.2f} / {signal['ema9']:.2f} / {signal['ema30']:.2f}"},
+        {"type": "mrkdwn", "text": f"*VWAP*\n{signal['vwap']:.2f}"},
+        {"type": "mrkdwn", "text": f"*Bar time*\n{signal['bar_time']}"},
+    ]
+    if "depth_pct" in signal and "day_move_pct" in signal:
+        fields.append({"type": "mrkdwn",
+            "text": f"*Breakout depth*\n{signal['depth_pct']:.3f}% · day {signal['day_move_pct']:+.2f}%"})
+
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": f"{emoji} *{ticker}* — Purgatory signal: *{direction}*  @  *${price:.2f}*"}},
+        {"type": "section", "fields": fields},
+    ]
+
+    if stats and stats.get("n"):
+        avg_str = f"avg +0.00%" if stats.get("avg_favorable_15m") is None else f"avg {stats['avg_favorable_15m']:+.2f}%"
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn",
+                "text": (f"📊 *Last {stats['n']} {ticker} {signal['signal'].upper()}s*: "
+                         f"{stats['wins']}/{stats['n']} wins ({stats['win_rate_pct']:.0f}%) · "
+                         f"{avg_str} favorable @ +15m")}
+        ]})
+
+    blocks.append({"type": "context", "elements": [
+        {"type": "mrkdwn", "text": "Hold target: ~10–15 min from signal close. Not investment advice."}
+    ]})
+
+    payload = {"text": f"{emoji} {ticker} — Purgatory {direction} @ ${price:.2f}", "blocks": blocks}
     try:
         r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
         return 200 <= r.status_code < 300
@@ -2815,72 +3080,163 @@ def purgatory_watchlist_remove(ticker: str):
 
 @app.post("/purgatory/scan")
 def purgatory_scan():
-    """Run one scan pass for every watched ticker. Called by external cron
-    every 4 min during market hours."""
+    """Run one scan pass for every watched ticker, then back-fill outcomes
+    on any matured signals. Called by external cron every 1-4 min during
+    market hours."""
     if not _alpaca_enabled():
         raise HTTPException(503, "Purgatory scan requires ALPACA_API_KEY and ALPACA_API_SECRET env vars.")
 
     tickers = sorted(_purgatory_watchlist)
-    if not tickers:
-        return {"scanned": 0, "signals": [], "ts": _now_iso()}
-
-    # One batched API call for all watched symbols
-    try:
-        bars_by_sym = _fetch_alpaca_bars(tickers, timeframe="4Min", lookback_hours=24)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"Alpaca fetch failed: {exc}") from exc
-
     new_signals: list[dict[str, Any]] = []
-    for t in tickers:
-        bars = bars_by_sym.get(t) or []
-        sig = _check_purgatory_signal(t, bars)
-        if not sig:
-            continue
-        # Dedupe by (ticker, signal-type, bar_time)
-        key = (t, sig["signal"], sig["bar_time"])
-        if key in _purgatory_alerted:
-            continue
-        _purgatory_alerted[key] = time.time()
-        sig["alerted_at"] = _now_iso()
-        sig["slack_sent"] = _send_slack_alert(sig)
-        new_signals.append(sig)
-        _purgatory_signals.append(sig)
-        # Trim history
-        if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
-            del _purgatory_signals[:-_PURGATORY_MAX_SIGNALS]
 
-    # Garbage-collect old dedupe entries (anything older than 24h)
+    if tickers:
+        # One batched API call for all watched symbols
+        try:
+            bars_by_sym = _fetch_alpaca_bars(tickers, timeframe="4Min", lookback_hours=24)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(502, f"Alpaca fetch failed: {exc}") from exc
+
+        for t in tickers:
+            bars = bars_by_sym.get(t) or []
+            sig = _check_purgatory_signal(t, bars)
+            if not sig:
+                continue
+            # Dedupe by (ticker, signal-type, bar_time)
+            key = (t, sig["signal"], sig["bar_time"])
+            if key in _purgatory_alerted:
+                continue
+            _purgatory_alerted[key] = time.time()
+            sig["alerted_at"] = _now_iso()
+
+            # Look up recent stats for this ticker+direction to enrich the alert (C)
+            stats = _recent_stats_for_ticker_direction(t, sig["signal"], n=10)
+            sig["recent_stats"] = stats
+
+            sig["slack_sent"] = _send_slack_alert(sig, stats=stats)
+            new_signals.append(sig)
+            _purgatory_signals.append(sig)
+            if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
+                del _purgatory_signals[:-_PURGATORY_MAX_SIGNALS]
+
+            # Persist to Supabase
+            _persist_signal(sig)
+
+    # Back-fill outcomes for matured signals (>= 25 min old, no outcome yet).
+    # Runs every scan so the data piles up over the trading day.
+    n_backfilled = _backfill_outcomes_for_matured_signals()
+
+    # Garbage-collect dedupe entries older than 24h
     cutoff = time.time() - 86400
     for k, fired_at in list(_purgatory_alerted.items()):
         if fired_at < cutoff:
             del _purgatory_alerted[k]
 
     return {
-        "scanned": len(tickers),
-        "tickers": tickers,
-        "signals": new_signals,
-        "ts": _now_iso(),
+        "scanned":       len(tickers),
+        "tickers":       tickers,
+        "signals":       new_signals,
+        "backfilled":    n_backfilled,
+        "ts":            _now_iso(),
     }
 
 
 @app.get("/purgatory/signals")
 def purgatory_signals_get(limit: int = 50):
+    """Recent signals. Prefers Supabase (survives redeploys, includes
+    back-filled outcomes); falls back to in-memory list."""
     limit = max(1, min(int(limit), _PURGATORY_MAX_SIGNALS))
+    persisted = _fetch_persisted_signals(limit=limit)
+    if persisted:
+        # Normalize keys to match the frontend's expectations
+        normalized = []
+        for s in persisted:
+            normalized.append({
+                "ticker":        s.get("ticker"),
+                "signal":        s.get("signal"),
+                "bar_time":      s.get("bar_time"),
+                "price":         s.get("entry_price"),
+                "ema5":          s.get("ema5"),
+                "ema9":          s.get("ema9"),
+                "ema30":         s.get("ema30"),
+                "vwap":          s.get("vwap"),
+                "alerted_at":    s.get("alerted_at"),
+                "slack_sent":    s.get("slack_sent"),
+                "outcome":       s.get("outcome"),
+                "favorable_5m":  s.get("favorable_5m"),
+                "favorable_10m": s.get("favorable_10m"),
+                "favorable_15m": s.get("favorable_15m"),
+                "favorable_20m": s.get("favorable_20m"),
+            })
+        return {"signals": normalized, "source": "supabase"}
     return {
         "signals": list(reversed(_purgatory_signals[-limit:])),
-        "total_today_so_far": len(_purgatory_signals),
+        "source": "memory",
+    }
+
+
+@app.get("/purgatory/stats")
+def purgatory_stats(days: int = 30):
+    """Per-(ticker, direction) win rate + average favorable move at +15m
+    over the last `days` days of signals with computed outcomes."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Stats require Supabase (SUPABASE_URL / SUPABASE_KEY env vars).")
+
+    days = max(1, min(int(days), 365))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("ticker, signal, outcome, favorable_10m, favorable_15m, favorable_20m")
+            .gte("bar_time", since)
+            .not_.is_("outcome", "null")
+            .execute()
+        )
+        rows = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Supabase stats query failed: {exc}") from exc
+
+    # Bucket by (ticker, direction)
+    buckets: dict[tuple, list[dict]] = {}
+    for r in rows:
+        k = (r.get("ticker"), r.get("signal"))
+        buckets.setdefault(k, []).append(r)
+
+    out = []
+    for (ticker, direction), bucket in sorted(buckets.items()):
+        wins = sum(1 for r in bucket if r.get("outcome") == "win")
+        losses = sum(1 for r in bucket if r.get("outcome") == "loss")
+        flats = sum(1 for r in bucket if r.get("outcome") == "flat")
+        f15 = [float(r["favorable_15m"]) for r in bucket if r.get("favorable_15m") is not None]
+        out.append({
+            "ticker":              ticker,
+            "direction":           direction,
+            "n":                   len(bucket),
+            "wins":                wins,
+            "losses":              losses,
+            "flats":               flats,
+            "win_rate_pct":        wins / len(bucket) * 100.0 if bucket else 0.0,
+            "avg_favorable_15m":   (sum(f15) / len(f15)) if f15 else None,
+        })
+    return {
+        "days":     days,
+        "n_total":  len(rows),
+        "buckets":  out,
+        "ts":       _now_iso(),
     }
 
 
 @app.get("/purgatory/status")
 def purgatory_status():
     return {
-        "alpaca_enabled":  _alpaca_enabled(),
-        "slack_enabled":   _slack_enabled(),
-        "watchlist_count": len(_purgatory_watchlist),
-        "watchlist":       sorted(_purgatory_watchlist),
-        "signals_logged":  len(_purgatory_signals),
-        "ts":              _now_iso(),
+        "alpaca_enabled":          _alpaca_enabled(),
+        "slack_enabled":           _slack_enabled(),
+        "watchlist_count":         len(_purgatory_watchlist),
+        "watchlist":               sorted(_purgatory_watchlist),
+        "signals_logged":          len(_purgatory_signals),
+        "min_breakout_pct":        PURGATORY_MIN_BREAKOUT_PCT,
+        "trend_filter_pct":        PURGATORY_TREND_FILTER_PCT,
+        "supabase_signals":        _supabase_client is not None,
+        "ts":                      _now_iso(),
     }
 
 

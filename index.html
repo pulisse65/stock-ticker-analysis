@@ -758,19 +758,19 @@
         <div id="alerts-watchlist" class="text-sm text-ink-dim">—</div>
       </section>
 
+      <!-- Per-ticker / per-direction stats -->
+      <section class="card p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Performance by ticker (last 30 days)</h3>
+          <span id="alerts-stats-meta" class="text-xs text-ink-faint"></span>
+        </div>
+        <div id="alerts-stats" class="text-sm text-ink-dim">No outcome data yet — signals get scored ~25 min after they fire.</div>
+      </section>
+
       <!-- Recent signals log -->
       <section class="card p-4">
         <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Recent signals</h3>
         <div id="alerts-log" class="text-sm text-ink-dim">No signals yet.</div>
-      </section>
-
-      <!-- Setup help -->
-      <section class="card p-4 text-xs text-ink-dim space-y-2">
-        <div class="text-ink font-semibold">Setup checklist</div>
-        <div>1. <span class="text-ink">Alpaca</span> — sign up at <a href="https://alpaca.markets" target="_blank" class="text-brand hover:underline">alpaca.markets</a>, create a paper-trading API key. Set <code class="mono bg-bg-input px-1 rounded">ALPACA_API_KEY</code> and <code class="mono bg-bg-input px-1 rounded">ALPACA_API_SECRET</code> on Render.</div>
-        <div>2. <span class="text-ink">Slack</span> — create an Incoming Webhook in the channel you want alerts in (<a href="https://api.slack.com/messaging/webhooks" target="_blank" class="text-brand hover:underline">slack.com/incoming-webhooks</a>). Set <code class="mono bg-bg-input px-1 rounded">SLACK_WEBHOOK_URL</code> on Render.</div>
-        <div>3. <span class="text-ink">Scheduler</span> — register at <a href="https://cron-job.org" target="_blank" class="text-brand hover:underline">cron-job.org</a> (free) and add a job that POSTs to <code class="mono bg-bg-input px-1 rounded">https://stock-ticker-analysis.onrender.com/purgatory/scan</code> every 4 minutes, weekdays 9:30 AM–4:00 PM ET.</div>
-        <div>4. Add tickers above (SPY/AVGO/TSLA are good starters), and the bot scans every 4 min from then on.</div>
       </section>
     </section>
 
@@ -2740,12 +2740,21 @@ function renderAlertsWatchlist(tickers) {
   });
 }
 
+function _fmtNum(v, d = 2) {
+  return (v === null || v === undefined || Number.isNaN(Number(v))) ? "—" : Number(v).toFixed(d);
+}
+function _fmtPctSigned(v, d = 2) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
+  const n = Number(v);
+  return `${n >= 0 ? "+" : ""}${n.toFixed(d)}%`;
+}
+
 async function refreshAlertsLog() {
+  const el = document.getElementById("alerts-log");
   try {
     const r = await fetch("/purgatory/signals?limit=50");
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    const el = document.getElementById("alerts-log");
     const signals = data.signals || [];
     if (!signals.length) {
       el.innerHTML = `<span class="text-ink-faint">No signals yet. The scheduler will fire these in real time once your watchlist is set + the cron is pinging /purgatory/scan.</span>`;
@@ -2758,8 +2767,11 @@ async function refreshAlertsLog() {
           <th class="text-left pb-2 pr-3">Ticker</th>
           <th class="text-center pb-2 pr-3">Signal</th>
           <th class="text-right pb-2 pr-3">Price</th>
-          <th class="text-right pb-2 pr-3">EMA 5 / 9 / 30</th>
-          <th class="text-right pb-2 pr-3">VWAP</th>
+          <th class="text-right pb-2 pr-3">+5m</th>
+          <th class="text-right pb-2 pr-3">+10m</th>
+          <th class="text-right pb-2 pr-3">+15m</th>
+          <th class="text-right pb-2 pr-3">+20m</th>
+          <th class="text-center pb-2 pr-3">Outcome</th>
           <th class="text-center pb-2 pl-3">Slack</th>
         </tr>
       </thead>
@@ -2767,24 +2779,91 @@ async function refreshAlertsLog() {
         const dt = s.bar_time ? new Date(s.bar_time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
         const sigCls = s.signal === "call" ? "val-up" : "val-down";
         const sigTxt = s.signal === "call" ? "🟢 CALL" : "🔴 PUT";
+        const favCell = (v) => {
+          if (v === null || v === undefined) return `<td class="py-1.5 pr-3 text-right mono text-ink-faint">—</td>`;
+          const n = Number(v);
+          const cls = n > 0.05 ? "val-up" : (n < -0.05 ? "val-down" : "text-ink-dim");
+          return `<td class="py-1.5 pr-3 text-right mono ${cls}">${_fmtPctSigned(n)}</td>`;
+        };
+        const outcomeBadge = (() => {
+          if (!s.outcome) return `<span class="text-[10px] text-ink-faint">pending</span>`;
+          const cls = s.outcome === "win" ? "v-bullish" : (s.outcome === "loss" ? "v-bearish" : "v-neutral");
+          return `<span class="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full ${cls}">${s.outcome}</span>`;
+        })();
+        const price = (s.price !== null && s.price !== undefined) ? `$${Number(s.price).toFixed(2)}` : "—";
         return `<tr class="border-t border-line">
           <td class="py-1.5 pr-3 mono text-ink-dim">${escapeHTML(dt)}</td>
-          <td class="py-1.5 pr-3 mono font-semibold text-ink">${escapeHTML(s.ticker)}</td>
+          <td class="py-1.5 pr-3 mono font-semibold text-ink">${escapeHTML(s.ticker || "")}</td>
           <td class="py-1.5 pr-3 text-center font-bold ${sigCls}">${sigTxt}</td>
-          <td class="py-1.5 pr-3 text-right mono">$${s.price.toFixed(2)}</td>
-          <td class="py-1.5 pr-3 text-right mono text-ink-dim">${s.ema5.toFixed(2)} / ${s.ema9.toFixed(2)} / ${s.ema30.toFixed(2)}</td>
-          <td class="py-1.5 pr-3 text-right mono text-ink-dim">${s.vwap.toFixed(2)}</td>
+          <td class="py-1.5 pr-3 text-right mono">${price}</td>
+          ${favCell(s.favorable_5m)}
+          ${favCell(s.favorable_10m)}
+          ${favCell(s.favorable_15m)}
+          ${favCell(s.favorable_20m)}
+          <td class="py-1.5 pr-3 text-center">${outcomeBadge}</td>
           <td class="py-1.5 pl-3 text-center">${s.slack_sent ? "✓" : "—"}</td>
         </tr>`;
       }).join("")}</tbody>
     </table></div>`;
   } catch (e) {
-    document.getElementById("alerts-log").innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
+    el.innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
+  }
+}
+
+async function refreshAlertsStats() {
+  const el = document.getElementById("alerts-stats");
+  const meta = document.getElementById("alerts-stats-meta");
+  try {
+    const r = await fetch("/purgatory/stats?days=30");
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      el.innerHTML = `<span class="text-ink-faint">${escapeHTML(err.detail || "Stats unavailable")}</span>`;
+      return;
+    }
+    const data = await r.json();
+    meta.textContent = `${data.n_total} scored signals · over ${data.days}d`;
+    const buckets = (data.buckets || []).sort((a, b) => b.n - a.n);
+    if (!buckets.length) {
+      el.innerHTML = `<span class="text-ink-faint">No outcome data yet — signals get scored ~25 min after they fire. Come back tomorrow.</span>`;
+      return;
+    }
+    el.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead class="text-ink-faint uppercase tracking-wider">
+        <tr>
+          <th class="text-left pb-2 pr-3">Ticker</th>
+          <th class="text-left pb-2 pr-3">Side</th>
+          <th class="text-right pb-2 pr-3">N</th>
+          <th class="text-right pb-2 pr-3">Wins</th>
+          <th class="text-right pb-2 pr-3">Losses</th>
+          <th class="text-right pb-2 pr-3">Flat</th>
+          <th class="text-right pb-2 pr-3">Win rate</th>
+          <th class="text-right pb-2 pl-3">Avg favorable @ +15m</th>
+        </tr>
+      </thead>
+      <tbody>${buckets.map(b => {
+        const dirCls = b.direction === "call" ? "val-up" : "val-down";
+        const dirTxt = b.direction === "call" ? "CALL" : "PUT";
+        const wrCls = b.win_rate_pct >= 60 ? "val-up" : (b.win_rate_pct <= 30 ? "val-down" : "text-ink");
+        const favCls = b.avg_favorable_15m == null ? "text-ink-dim" : (b.avg_favorable_15m > 0.05 ? "val-up" : (b.avg_favorable_15m < -0.05 ? "val-down" : "text-ink-dim"));
+        return `<tr class="border-t border-line">
+          <td class="py-1.5 pr-3 mono font-semibold text-ink">${escapeHTML(b.ticker || "")}</td>
+          <td class="py-1.5 pr-3 font-bold ${dirCls}">${dirTxt}</td>
+          <td class="py-1.5 pr-3 mono text-right">${b.n}</td>
+          <td class="py-1.5 pr-3 mono text-right val-up">${b.wins}</td>
+          <td class="py-1.5 pr-3 mono text-right val-down">${b.losses}</td>
+          <td class="py-1.5 pr-3 mono text-right text-ink-dim">${b.flats}</td>
+          <td class="py-1.5 pr-3 mono text-right font-semibold ${wrCls}">${b.win_rate_pct.toFixed(0)}%</td>
+          <td class="py-1.5 pl-3 mono text-right ${favCls}">${_fmtPctSigned(b.avg_favorable_15m)}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table></div>`;
+  } catch (e) {
+    el.innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
   }
 }
 
 async function refreshAlerts() {
-  await Promise.all([refreshAlertsStatus(), refreshAlertsLog()]);
+  await Promise.all([refreshAlertsStatus(), refreshAlertsLog(), refreshAlertsStats()]);
 }
 
 document.getElementById("alerts-add-form").addEventListener("submit", async (e) => {
