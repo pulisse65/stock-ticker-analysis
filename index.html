@@ -2771,6 +2771,8 @@ async function refreshAlertsLog() {
           <th class="text-right pb-2 pr-3">+10m</th>
           <th class="text-right pb-2 pr-3">+15m</th>
           <th class="text-right pb-2 pr-3">+20m</th>
+          <th class="text-right pb-2 pr-3">+25m</th>
+          <th class="text-right pb-2 pr-3">+30m</th>
           <th class="text-center pb-2 pr-3">Outcome</th>
           <th class="text-center pb-2 pl-3">Slack</th>
         </tr>
@@ -2800,6 +2802,8 @@ async function refreshAlertsLog() {
           ${favCell(s.favorable_10m)}
           ${favCell(s.favorable_15m)}
           ${favCell(s.favorable_20m)}
+          ${favCell(s.favorable_25m)}
+          ${favCell(s.favorable_30m)}
           <td class="py-1.5 pr-3 text-center">${outcomeBadge}</td>
           <td class="py-1.5 pl-3 text-center">${s.slack_sent ? "✓" : "—"}</td>
         </tr>`;

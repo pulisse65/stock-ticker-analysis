@@ -2658,8 +2658,117 @@ def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hou
 
 
 # Filter thresholds (env-overridable so we can tighten/loosen without redeploy)
-PURGATORY_MIN_BREAKOUT_PCT = float(os.environ.get("PURGATORY_MIN_BREAKOUT_PCT", "0.05"))   # %
+# Default raised 0.05 → 0.10 after one week of data showed signals with
+# breakout depth < 0.10% had only 32% win rate vs 49% for 0.10-0.20%.
+PURGATORY_MIN_BREAKOUT_PCT = float(os.environ.get("PURGATORY_MIN_BREAKOUT_PCT", "0.10"))   # %
 PURGATORY_TREND_FILTER_PCT = float(os.environ.get("PURGATORY_TREND_FILTER_PCT", "0.5"))    # %
+
+# Time-of-day windows in ET. Three windows showed consistently bad outcomes
+# in the data (open-noise, lunch-chop, end-of-day-chaos) so we skip them.
+_CHOP_WINDOWS = {"open_first_15", "lunch_chop", "close_chop"}
+
+# Auto-disable thresholds for (ticker, direction) pairs
+_AUTO_DISABLE_MIN_N = 10
+_AUTO_DISABLE_MAX_WIN_RATE = 30.0     # %
+_AUTO_DISABLE_MIN_AVG_FAV = -0.20     # %  (any pair worse than this avg is disabled)
+
+
+def _bar_window_category(bar_time_iso: str) -> str:
+    """Classify a bar close time into a session window. Used both to filter
+    out chop-zone signals and to annotate Slack alerts with the context."""
+    try:
+        bt = pd.Timestamp(bar_time_iso).tz_convert("America/New_York")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    mins = bt.hour * 60 + bt.minute
+    if mins < 570:        return "pre_market"          # before 9:30 ET
+    if mins < 585:        return "open_first_15"       # 9:30 - 9:45 (chop)
+    if mins < 600:        return "open_settle"         # 9:45 - 10:00
+    if mins < 660:        return "prime_morning"       # 10:00 - 11:00 ⭐ 76% wr in data
+    if mins < 690:        return "pre_lunch"           # 11:00 - 11:30
+    if mins < 750:        return "lunch_chop"          # 11:30 - 12:30 (chop, 18% wr)
+    if mins < 840:        return "post_lunch"          # 12:30 - 14:00
+    if mins < 900:        return "prime_afternoon"     # 14:00 - 15:00 ⭐ 67% wr
+    if mins < 915:        return "pre_close"           # 15:00 - 15:15
+    if mins < 960:        return "close_chop"          # 15:15 - 16:00 (chop, 25% wr)
+    return "after_hours"
+
+
+_PRIME_WINDOWS = {"prime_morning", "prime_afternoon"}
+
+_WINDOW_LABELS = {
+    "pre_market":       "pre-market",
+    "open_first_15":    "9:30–9:45 ET open",
+    "open_settle":      "9:45–10:00 ET settle",
+    "prime_morning":    "10:00–11:00 ET",
+    "pre_lunch":        "11:00–11:30 ET",
+    "lunch_chop":       "11:30–12:30 ET lunch",
+    "post_lunch":       "12:30–14:00 ET",
+    "prime_afternoon":  "14:00–15:00 ET",
+    "pre_close":        "15:00–15:15 ET",
+    "close_chop":       "15:15–16:00 ET close",
+    "after_hours":      "after hours",
+    "unknown":          "unknown",
+}
+
+
+def _window_label(w: str) -> str:
+    return _WINDOW_LABELS.get(w, w)
+
+
+# Disabled-pairs cache. Recomputed every N minutes (cheap query).
+_disabled_pairs_cache: tuple[float, set[tuple[str, str]]] = (0.0, set())
+_DISABLED_CACHE_TTL = 600  # 10 min
+
+
+def _get_disabled_pairs() -> set[tuple[str, str]]:
+    """Return (ticker, direction) pairs that consistently underperform over
+    the last 30 days. Cached for 10 min so we don't re-query Supabase on
+    every scan. Pairs are disabled when N >= 10 scored signals AND
+    (win_rate <= 30% OR avg_favorable_15m < -0.20%)."""
+    global _disabled_pairs_cache
+    now = time.time()
+    last_ts, last_val = _disabled_pairs_cache
+    if now - last_ts < _DISABLED_CACHE_TTL:
+        return last_val
+    if _supabase_client is None:
+        _disabled_pairs_cache = (now, set())
+        return set()
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("ticker, signal, outcome, favorable_15m")
+            .gte("bar_time", since)
+            .not_.is_("outcome", "null")
+            .execute()
+        )
+        rows = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Disabled-pairs query failed: %s", exc)
+        _disabled_pairs_cache = (now, set())
+        return set()
+
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        k = (r.get("ticker"), r.get("signal"))
+        if not all(k):
+            continue
+        buckets.setdefault(k, []).append(r)
+
+    disabled: set[tuple[str, str]] = set()
+    for key, group in buckets.items():
+        if len(group) < _AUTO_DISABLE_MIN_N:
+            continue
+        wins = sum(1 for r in group if r.get("outcome") == "win")
+        win_rate = wins / len(group) * 100.0
+        f15s = [float(r["favorable_15m"]) for r in group if r.get("favorable_15m") is not None]
+        avg_fav = sum(f15s) / len(f15s) if f15s else 0.0
+        if win_rate <= _AUTO_DISABLE_MAX_WIN_RATE or avg_fav < _AUTO_DISABLE_MIN_AVG_FAV:
+            disabled.add(key)
+
+    _disabled_pairs_cache = (now, disabled)
+    return disabled
 
 
 def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | None:
@@ -2780,10 +2889,25 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
                  ticker, day_move_pct)
         return None
 
+    bar_time_iso = cur["t"].isoformat()
+
+    # --- Filter: time-of-day chop windows ---
+    window = _bar_window_category(bar_time_iso)
+    if window in _CHOP_WINDOWS:
+        log.info("Purgatory filter (%s %s): bar in chop window '%s' — skipping",
+                 ticker, signal_type, window)
+        return None
+
+    # --- Filter: auto-disabled (ticker, direction) pairs ---
+    if (ticker, signal_type) in _get_disabled_pairs():
+        log.info("Purgatory filter (%s %s): pair auto-disabled (poor 30d record) — skipping",
+                 ticker, signal_type)
+        return None
+
     return {
         "ticker":       ticker,
         "signal":       signal_type,
-        "bar_time":     cur["t"].isoformat(),
+        "bar_time":     bar_time_iso,
         "price":        cur_price,
         "ema5":         cur_ema5,
         "ema9":         float(cur["ema9"]),
@@ -2791,6 +2915,7 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
         "vwap":         cur_vwap,
         "depth_pct":    depth_pct,
         "day_move_pct": day_move_pct,
+        "window":       window,
     }
 
 
@@ -2843,16 +2968,16 @@ def _fetch_persisted_signals(limit: int = 100) -> list[dict[str, Any]]:
 
 
 def _backfill_outcomes_for_matured_signals() -> int:
-    """Find signals that are >= 25 min old, have null outcome, and have
-    enough bars available to score. Compute their favorable_5m/10m/15m/20m
-    and overall outcome, then update the row.
+    """Find signals that are >= 35 min old, have null outcome, and have
+    enough bars available to score. Compute their favorable at +5/+10/+15/
+    +20/+25/+30m and an overall outcome, then update the row.
 
     Returns the number of signals back-filled in this pass."""
     if _supabase_client is None or not _alpaca_enabled():
         return 0
 
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=25)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=35)).isoformat()
         res = (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("*")
@@ -2874,7 +2999,7 @@ def _backfill_outcomes_for_matured_signals() -> int:
     tickers = sorted({s["ticker"] for s in pending})
     bar_times = [datetime.fromisoformat(s["bar_time"].replace("Z", "+00:00")) for s in pending]
     earliest = min(bar_times)
-    latest = max(bar_times) + timedelta(minutes=22)
+    latest = max(bar_times) + timedelta(minutes=32)
     try:
         r = requests.get(
             f"{ALPACA_DATA_BASE}/stocks/bars",
@@ -2928,7 +3053,7 @@ def _backfill_outcomes_for_matured_signals() -> int:
             continue
 
         favorables: dict[str, float | None] = {}
-        for h in (5, 10, 15, 20):
+        for h in (5, 10, 15, 20, 25, 30):
             price = close_at_or_after(s["ticker"], bt + timedelta(minutes=h))
             if price is None:
                 favorables[f"favorable_{h}m"] = None
@@ -3003,6 +3128,15 @@ def _send_slack_alert(signal: dict[str, Any], stats: dict[str, Any] | None = Non
     ticker = signal["ticker"]
     price = signal["price"]
 
+    # Time-of-day context (lights up vs. cautions on the alert)
+    window = signal.get("window") or "unknown"
+    if window in _PRIME_WINDOWS:
+        window_note = f"🟢 *Prime window* ({_window_label(window)}) — strongest historical win rate"
+    elif window in {"open_settle", "pre_lunch", "post_lunch", "pre_close"}:
+        window_note = f"⚪ *Mid-range window* ({_window_label(window)}) — mediocre historical performance"
+    else:
+        window_note = f"⚠️ *Soft window* ({_window_label(window)}) — outside the strongest windows"
+
     fields = [
         {"type": "mrkdwn", "text": f"*EMA 5/9/30*\n{signal['ema5']:.2f} / {signal['ema9']:.2f} / {signal['ema30']:.2f}"},
         {"type": "mrkdwn", "text": f"*VWAP*\n{signal['vwap']:.2f}"},
@@ -3015,6 +3149,7 @@ def _send_slack_alert(signal: dict[str, Any], stats: dict[str, Any] | None = Non
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
             "text": f"{emoji} *{ticker}* — Purgatory signal: *{direction}*  @  *${price:.2f}*"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": window_note}]},
         {"type": "section", "fields": fields},
     ]
 
@@ -3028,7 +3163,7 @@ def _send_slack_alert(signal: dict[str, Any], stats: dict[str, Any] | None = Non
         ]})
 
     blocks.append({"type": "context", "elements": [
-        {"type": "mrkdwn", "text": "Hold target: ~10–15 min from signal close. Not investment advice."}
+        {"type": "mrkdwn", "text": "Hold target: ~20–25 min from signal close (42% of winners peak at +20m). Not investment advice."}
     ]})
 
     payload = {"text": f"{emoji} {ticker} — Purgatory {direction} @ ${price:.2f}", "blocks": blocks}
@@ -3189,6 +3324,8 @@ def purgatory_signals_get(limit: int = 50):
                 "favorable_10m": s.get("favorable_10m"),
                 "favorable_15m": s.get("favorable_15m"),
                 "favorable_20m": s.get("favorable_20m"),
+                "favorable_25m": s.get("favorable_25m"),
+                "favorable_30m": s.get("favorable_30m"),
             })
         return {"signals": normalized, "source": "supabase"}
     return {
@@ -3250,6 +3387,7 @@ def purgatory_stats(days: int = 30):
 
 @app.get("/purgatory/status")
 def purgatory_status():
+    disabled = sorted(_get_disabled_pairs())
     return {
         "alpaca_enabled":          _alpaca_enabled(),
         "slack_enabled":           _slack_enabled(),
@@ -3258,6 +3396,7 @@ def purgatory_status():
         "signals_logged":          len(_purgatory_signals),
         "min_breakout_pct":        PURGATORY_MIN_BREAKOUT_PCT,
         "trend_filter_pct":        PURGATORY_TREND_FILTER_PCT,
+        "auto_disabled_pairs":     [{"ticker": t, "direction": d} for t, d in disabled],
         "supabase_signals":        _supabase_client is not None,
         "ts":                      _now_iso(),
     }
@@ -3406,6 +3545,12 @@ def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
             "win_rate_pct":   (d_wins / max(d_wins + d_losses + d_flats, 1)) * 100.0,
         }
 
+    # Daily P&L estimate — sum of favorables (in %), summed over scored
+    # signals. A positive sum means hypothetical net-positive day if you
+    # took every signal at uniform size and exited at +15m. Doesn't account
+    # for option premium decay or slippage, so the real number is worse.
+    sum_favorable_15m = sum(f15s) if f15s else None
+
     return {
         "date":              date_str,
         "total_signals":     len(signals),
@@ -3415,6 +3560,7 @@ def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
         "pending":           pending,
         "win_rate_pct":      (wins / scored * 100.0) if scored else None,
         "avg_favorable_15m": (sum(f15s) / len(f15s)) if f15s else None,
+        "sum_favorable_15m": sum_favorable_15m,
         "best_signal":       _slim(best),
         "worst_signal":      _slim(worst),
         "per_ticker":        per_ticker,
@@ -3438,6 +3584,9 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
 
     win_rate = f"{summary['win_rate_pct']:.0f}%" if summary.get("win_rate_pct") is not None else "—"
     avg_fav = f"{summary['avg_favorable_15m']:+.2f}%" if summary.get("avg_favorable_15m") is not None else "—"
+    sum_fav = summary.get("sum_favorable_15m")
+    pnl_str = "—" if sum_fav is None else f"{sum_fav:+.2f}%"
+    pnl_emoji = "⚪" if sum_fav is None else ("🟢" if sum_fav > 0 else "🔴")
 
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": f"📊 Purgatory Daily Retro — {date_pretty}"}},
@@ -3446,8 +3595,16 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
             {"type": "mrkdwn", "text": f"*Outcomes*\n🟢 {summary['wins']} W · 🔴 {summary['losses']} L · ⚫ {summary['flats']} flat" + (f" · ⏳ {summary['pending']}" if summary["pending"] else "")},
             {"type": "mrkdwn", "text": f"*Win rate (scored)*\n{win_rate}"},
             {"type": "mrkdwn", "text": f"*Avg favorable @ +15m*\n{avg_fav}"},
+            {"type": "mrkdwn", "text": f"*Expected total move*\n{pnl_emoji} {pnl_str} sum @ +15m"},
         ]},
     ]
+
+    # Surface what's currently auto-disabled
+    disabled = _get_disabled_pairs()
+    if disabled:
+        d_str = ", ".join(f"{t} {d.upper()}" for t, d in sorted(disabled))
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"🚫 Auto-disabled (≥10 scored signals, ≤30% wr or ≤−0.20% avg): `{d_str}`"}]})
 
     if summary.get("best_signal"):
         b = summary["best_signal"]
