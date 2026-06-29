@@ -900,6 +900,14 @@ def _fmp_enabled() -> bool:
     return bool(FMP_API_KEY)
 
 
+def _redact_fmp_key(text: str) -> str:
+    """Strip the FMP API key from any string before it leaves the server."""
+    if FMP_API_KEY and FMP_API_KEY in text:
+        text = text.replace(FMP_API_KEY, "<redacted>")
+    # Also catch the bare apikey query param in case it leaks via other paths
+    return re.sub(r"apikey=[^&\s]+", "apikey=<redacted>", text)
+
+
 def _fmp_get(endpoint: str, params: dict[str, Any] | None = None, timeout: int = 10) -> Any:
     """Hit an FMP endpoint. Raises FMPError on auth/plan/rate problems so
     callers can decide whether to fall back."""
@@ -907,16 +915,26 @@ def _fmp_get(endpoint: str, params: dict[str, Any] | None = None, timeout: int =
         raise FMPError("FMP_API_KEY not configured")
     p = dict(params or {})
     p["apikey"] = FMP_API_KEY
-    r = requests.get(f"{FMP_BASE}{endpoint}", params=p, timeout=timeout)
-    if r.status_code in (401, 403):
-        raise FMPError(f"FMP auth/plan rejected ({r.status_code}) — endpoint may require paid tier")
+    try:
+        r = requests.get(f"{FMP_BASE}{endpoint}", params=p, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        raise FMPError(_redact_fmp_key(f"FMP request failed: {exc}")) from exc
+
+    # 401 = unauthorized, 402 = payment required, 403 = forbidden.
+    # All three mean "this endpoint isn't available on your plan" for our purposes.
+    if r.status_code in (401, 402, 403):
+        raise FMPError(f"FMP rejected ({r.status_code}) for {endpoint} — endpoint/limit likely requires paid tier")
     if r.status_code == 429:
         raise FMPError("FMP rate limit reached (free tier = 250 req/day)")
-    r.raise_for_status()
+
+    if r.status_code >= 400:
+        # Catch all other HTTP errors here so we can redact before raising.
+        raise FMPError(_redact_fmp_key(f"FMP HTTP {r.status_code} for {endpoint}: {r.text[:200]}"))
+
     try:
         data = r.json()
     except ValueError as exc:
-        raise FMPError(f"FMP returned non-JSON: {exc}") from exc
+        raise FMPError(_redact_fmp_key(f"FMP returned non-JSON: {exc}")) from exc
     # FMP returns {"Error Message": "..."} for some plan-restricted endpoints with HTTP 200
     if isinstance(data, dict) and "Error Message" in data:
         raise FMPError(f"FMP error: {data['Error Message']}")
@@ -1375,7 +1393,9 @@ def widget_earnings(ticker: str):
     fmp_debug: str | None = None
     if _fmp_enabled():
         try:
-            rows = _fmp_get("/earnings", {"symbol": ticker, "limit": 40}) or []
+            # Free tier caps payload size on /stable/earnings — limit=40
+            # returns 402 Payment Required; limit=5 works.
+            rows = _fmp_get("/earnings", {"symbol": ticker, "limit": 5}) or []
             if not isinstance(rows, list):
                 fmp_debug = f"non-list response: {type(rows).__name__}"
             elif not rows:
@@ -1466,7 +1486,7 @@ def widget_earnings(ticker: str):
         "calendar": calendar,
         "earnings_dates": earnings_dates,
         "source": source,
-        "fmp_debug": fmp_debug,
+        "fmp_debug": _redact_fmp_key(fmp_debug) if fmp_debug else None,
     }
     _cache_set(cache_key, result, ttl=900)  # 15 min
     return result
