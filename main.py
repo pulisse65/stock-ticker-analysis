@@ -1039,6 +1039,75 @@ def _get_reddit_token() -> str | None:
     return token
 
 
+def _fetch_reddit_rss_entries(ticker: str) -> list[dict[str, Any]]:
+    """Fetch recent posts about the ticker from Reddit's RSS feed.
+
+    Reddit's `.rss` endpoint is treated more leniently than `.json` and
+    doesn't require OAuth. The trade-off is that score and comment count
+    aren't included in the Atom feed — those will be None in the response.
+    Returned shape matches the old JSON-derived shape so the frontend
+    doesn't need to change."""
+    subs = "wallstreetbets+stocks+investing+StockMarket"
+    params = {
+        "q":          f'"${ticker}" OR title:{ticker}',
+        "restrict_sr": "on",
+        "sort":       "new",
+        "limit":      "30",
+        "t":          "month",
+    }
+    url = f"https://www.reddit.com/r/{subs}/search.rss?{urlencode(params)}"
+    headers = {
+        # Reddit checks UA on .rss too; a descriptive UA is required.
+        "User-Agent": REDDIT_USER_AGENT,
+        "Accept":     "application/atom+xml, application/xml;q=0.9, */*;q=0.8",
+    }
+
+    r = requests.get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    entries: list[dict[str, Any]] = []
+    for entry in root.findall("atom:entry", ns):
+        title = (entry.findtext("atom:title", default="", namespaces=ns) or "").strip()
+        author_elem = entry.find("atom:author/atom:name", ns)
+        author = author_elem.text.strip() if author_elem is not None and author_elem.text else None
+        # Strip leading "/u/" that Reddit prepends
+        if author and author.startswith("/u/"):
+            author = author[3:]
+
+        link_elem = entry.find("atom:link", ns)
+        permalink = link_elem.get("href") if link_elem is not None else None
+
+        # Subreddit from the <category term="..."> attribute
+        category_elem = entry.find("atom:category", ns)
+        subreddit = None
+        if category_elem is not None:
+            label = category_elem.get("label") or category_elem.get("term") or ""
+            subreddit = label[2:] if label.startswith("r/") else label
+
+        updated = (entry.findtext("atom:updated", default="", namespaces=ns) or "").strip()
+        created_utc: float | None = None
+        try:
+            if updated:
+                dt = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                created_utc = dt.timestamp()
+        except ValueError:
+            pass
+
+        entries.append({
+            "title":        title,
+            "subreddit":    subreddit,
+            "author":       author,
+            "score":        None,    # not exposed by RSS
+            "num_comments": None,    # not exposed by RSS
+            "created_utc":  created_utc,
+            "permalink":    permalink,
+            "flair":        None,
+        })
+    return entries
+
+
 @app.get("/widgets/reddit")
 def widget_reddit(ticker: str):
     ticker = ticker.strip().upper()
@@ -1050,79 +1119,31 @@ def widget_reddit(ticker: str):
     if cached is not None:
         return cached
 
-    token, reason = _get_reddit_token_with_reason()
-    if not token:
-        raise HTTPException(
-            503,
-            f"Reddit auth failed: {reason}. "
-            "(Reddit blocked unauthenticated access in 2023, so OAuth is required.)",
-        )
-
-    subs = "wallstreetbets+stocks+investing+StockMarket"
-
-    # Two-pronged query so we cover both conventions:
-    #   "$TICKER"     — the cashtag, used on r/wallstreetbets etc.
-    #   title:TICKER  — posts that mention the ticker in the title, even
-    #                   without a $ prefix (common on r/stocks, r/investing)
-    # We over-fetch and post-filter so that posts which only mention the
-    # ticker incidentally (e.g. listed in a portfolio screenshot) get dropped.
-    params = {
-        "q": f'"${ticker}" OR title:{ticker}',
-        "restrict_sr": "on",
-        "sort": "relevance",
-        "limit": "30",
-        "t": "month",
-    }
-    url = f"https://oauth.reddit.com/r/{subs}/search.json?{urlencode(params)}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "User-Agent": REDDIT_USER_AGENT,
-    }
-
     try:
-        r = requests.get(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json()
+        entries = _fetch_reddit_rss_entries(ticker)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"Reddit fetch failed: {exc}") from exc
+        raise HTTPException(502, f"Reddit RSS fetch failed: {exc}") from exc
 
+    # Same relevance filtering as before. RSS doesn't include selftext, so
+    # we can only match against the title.
     cashtag_re = re.compile(rf"\${re.escape(ticker)}\b", re.IGNORECASE)
     word_re = re.compile(rf"\b{re.escape(ticker)}\b", re.IGNORECASE)
-    # Single- and two-letter tickers (F, T, M, GE, BP, ...) collide with
-    # English words too easily. Require the explicit cashtag for those.
     cashtag_only = len(ticker) <= 2
 
     candidates: list[dict[str, Any]] = []
-    for child in (data.get("data") or {}).get("children", []):
-        d = child.get("data") or {}
-        title = d.get("title") or ""
-        selftext = d.get("selftext") or ""
-
-        # Match strength:
-        #   2 = cashtag in title or body (strongest signal)
-        #   1 = ticker as a whole word in the title (skipped for short tickers)
-        #   0 = no real match (drop it)
-        if cashtag_re.search(title) or cashtag_re.search(selftext):
+    for e in entries:
+        title = e.get("title") or ""
+        if cashtag_re.search(title):
             strength = 2
         elif not cashtag_only and word_re.search(title):
             strength = 1
         else:
             continue
+        e["_strength"] = strength
+        candidates.append(e)
 
-        candidates.append({
-            "title": title,
-            "subreddit": d.get("subreddit"),
-            "score": int(d.get("score") or 0),
-            "num_comments": int(d.get("num_comments") or 0),
-            "created_utc": d.get("created_utc"),
-            "permalink": f"https://www.reddit.com{d.get('permalink', '')}",
-            "author": d.get("author"),
-            "flair": d.get("link_flair_text"),
-            "_strength": strength,
-        })
-
-    # Re-rank: stronger matches first, then by Reddit upvotes
-    candidates.sort(key=lambda x: (x["_strength"], x.get("score", 0)), reverse=True)
+    # Re-rank: stronger matches first, then by recency
+    candidates.sort(key=lambda x: (x["_strength"], x.get("created_utc") or 0), reverse=True)
 
     posts = []
     for c in candidates[:15]:
@@ -1131,9 +1152,10 @@ def widget_reddit(ticker: str):
         posts.append(c)
 
     result = {
-        "ticker": ticker,
-        "posts": posts,
+        "ticker":    ticker,
+        "posts":     posts,
         "sentiment": _aggregate_sentiment(posts),
+        "source":    "reddit-rss",
     }
     _cache_set(cache_key, result, ttl=300)  # 5 min
     return result

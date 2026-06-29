@@ -1645,17 +1645,20 @@ async function renderReddit(ticker) {
     const posts = data.posts || [];
     const body = document.getElementById("widget-reddit-body");
     if (!posts.length) { body.innerHTML = `<div class="text-ink-faint text-sm">No recent posts found.</div>`; return; }
-    body.innerHTML = sentimentBadge(data.sentiment) + posts.slice(0, 12).map(p => `
-      <a href="${escapeHTML(p.permalink)}" target="_blank" rel="noopener noreferrer" class="feed-item flex gap-2.5">
+    body.innerHTML = sentimentBadge(data.sentiment) + posts.slice(0, 12).map(p => {
+      const metaParts = [`<span class="text-brand">r/${escapeHTML(p.subreddit || "—")}</span>`];
+      if (p.score != null)        metaParts.push(`▲ ${p.score}`);
+      if (p.num_comments != null) metaParts.push(`💬 ${p.num_comments}`);
+      if (p.created_utc != null)  metaParts.push(timeAgoFromUnix(p.created_utc));
+      return `
+      <a href="${escapeHTML(p.permalink || "#")}" target="_blank" rel="noopener noreferrer" class="feed-item flex gap-2.5">
         ${sentimentDot(p.sentiment)}
         <div class="flex-1 min-w-0">
           <div class="feed-title text-sm">${escapeHTML(p.title)}</div>
-          <div class="feed-meta">
-            <span class="text-brand">r/${escapeHTML(p.subreddit)}</span>
-            · ▲ ${p.score} · 💬 ${p.num_comments} · ${timeAgoFromUnix(p.created_utc)}
-          </div>
+          <div class="feed-meta">${metaParts.join(" · ")}</div>
         </div>
-      </a>`).join("");
+      </a>`;
+    }).join("");
     const tone = data.sentiment?.label || "neutral";
     widgetSetStatus("reddit", `${posts.length} · ${tone}`);
   } catch (e) { widgetError("reddit", e.message); }
