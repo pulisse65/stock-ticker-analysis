@@ -886,7 +886,10 @@ def _aggregate_sentiment(items: list[dict[str, Any]]) -> dict[str, Any] | None:
 # All endpoints are wrapped in a tiny in-memory TTL cache.
 
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "").strip()
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+# FMP retired /api/v3/* for accounts created after Aug 31 2025. The /stable/
+# replacement uses a different base, path names, and query-param convention
+# (ticker is ?symbol=AAPL, not a path segment).
+FMP_BASE = "https://financialmodelingprep.com/stable"
 
 
 class FMPError(Exception):
@@ -987,23 +990,22 @@ REDDIT_USER_AGENT = os.environ.get(
 )
 
 
-def _get_reddit_token() -> str | None:
-    """Get a Reddit OAuth client-credentials token, cached ~23h.
-
-    Returns None when REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET aren't set or
-    when Reddit refuses the auth — caller should surface a 503 in that case.
-    Reddit started blocking unauthenticated server-side hits to
-    www.reddit.com in 2023; OAuth + oauth.reddit.com is the supported path.
-    """
+def _get_reddit_token_with_reason() -> tuple[str | None, str | None]:
+    """Get a Reddit OAuth client-credentials token, cached ~23h. Returns
+    (token, reason). When token is None, `reason` is a short string
+    explaining what went wrong (so the caller can surface it instead of
+    blaming env vars for every failure)."""
     cid = os.environ.get("REDDIT_CLIENT_ID", "").strip()
     cs = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
-    if not cid or not cs:
-        return None
+    if not cid:
+        return None, "REDDIT_CLIENT_ID env var not set or empty"
+    if not cs:
+        return None, "REDDIT_CLIENT_SECRET env var not set or empty"
 
     cache_key = ("reddit_token",)
     cached = _cache_get(cache_key)
     if cached:
-        return cached
+        return cached, None
 
     try:
         auth = base64.b64encode(f"{cid}:{cs}".encode()).decode()
@@ -1016,17 +1018,25 @@ def _get_reddit_token() -> str | None:
             },
             timeout=10,
         )
-        r.raise_for_status()
-        token = (r.json() or {}).get("access_token")
+        if r.status_code != 200:
+            # Surface what Reddit actually said — 401 (bad creds) vs 429 (rate limit)
+            # vs 403 (blocked user-agent) all need different fixes.
+            body_preview = r.text[:200].replace("\n", " ")
+            return None, f"Reddit OAuth HTTP {r.status_code}: {body_preview}"
+        data = r.json() or {}
+        token = data.get("access_token")
         if not token:
-            log.warning("Reddit token response missing access_token")
-            return None
-        # Tokens last 24h; cache for 23h so we refresh before expiry.
+            return None, f"Reddit OAuth response missing access_token: {str(data)[:200]}"
         _cache_set(cache_key, token, ttl=23 * 3600)
-        return token
+        return token, None
     except Exception as exc:  # noqa: BLE001
-        log.warning("Reddit OAuth token fetch failed: %s", exc)
-        return None
+        return None, f"Reddit OAuth exception: {exc}"
+
+
+def _get_reddit_token() -> str | None:
+    """Compatibility shim — returns the token without the reason."""
+    token, _ = _get_reddit_token_with_reason()
+    return token
 
 
 @app.get("/widgets/reddit")
@@ -1040,13 +1050,12 @@ def widget_reddit(ticker: str):
     if cached is not None:
         return cached
 
-    token = _get_reddit_token()
+    token, reason = _get_reddit_token_with_reason()
     if not token:
         raise HTTPException(
             503,
-            "Reddit widget requires REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET "
-            "env vars (Reddit blocked unauthenticated access in 2023). "
-            "Register a free app at https://www.reddit.com/prefs/apps.",
+            f"Reddit auth failed: {reason}. "
+            "(Reddit blocked unauthenticated access in 2023, so OAuth is required.)",
         )
 
     subs = "wallstreetbets+stocks+investing+StockMarket"
@@ -1186,8 +1195,8 @@ def widget_fundamentals(ticker: str):
     # Prefer FMP — cleaner structured data than yfinance .info
     if _fmp_enabled():
         try:
-            profile_arr = _fmp_get(f"/profile/{ticker}")
-            quote_arr = _fmp_get(f"/quote/{ticker}")
+            profile_arr = _fmp_get("/profile", {"symbol": ticker})
+            quote_arr = _fmp_get("/quote", {"symbol": ticker})
             profile = (profile_arr[0] if profile_arr else {}) or {}
             quote = (quote_arr[0] if quote_arr else {}) or {}
 
@@ -1342,7 +1351,8 @@ def widget_earnings(ticker: str):
     # entries; epsEstimated/revenueEstimated for upcoming.
     if _fmp_enabled():
         try:
-            rows = _fmp_get(f"/historical/earning_calendar/{ticker}", {"limit": 40}) or []
+            # /stable/ renamed this — try the new path with symbol query param.
+            rows = _fmp_get("/earnings", {"symbol": ticker, "limit": 40}) or []
             if isinstance(rows, list) and rows:
                 today = datetime.now(timezone.utc).date().isoformat()
                 # Sort ascending by date
@@ -1447,7 +1457,7 @@ def widget_analysts(ticker: str):
         try:
             tgt_arr = _fmp_get("/price-target-consensus", {"symbol": ticker})
             rec_arr = _fmp_get("/upgrades-downgrades-consensus", {"symbol": ticker})
-            quote_arr = _fmp_get(f"/quote/{ticker}")
+            quote_arr = _fmp_get("/quote", {"symbol": ticker})
             tgt = (tgt_arr[0] if tgt_arr else {}) or {}
             rec = (rec_arr[0] if rec_arr else {}) or {}
             quote = (quote_arr[0] if quote_arr else {}) or {}
@@ -1654,7 +1664,7 @@ def widget_insider(ticker: str):
     # Prefer FMP when available
     if _fmp_enabled():
         try:
-            rows = _fmp_get("/insider-trading", {"symbol": ticker, "limit": 25}) or []
+            rows = _fmp_get("/insider-trading-search", {"symbol": ticker, "limit": 25}) or []
             items: list[dict[str, Any]] = []
             for row in rows[:25]:
                 if not isinstance(row, dict):
@@ -1901,7 +1911,7 @@ def search(q: str, limit: int = 8):
         return {"results": [], "source": "none", "message": "Search requires FMP_API_KEY"}
 
     try:
-        rows = _fmp_get("/search", {"query": q, "limit": limit}) or []
+        rows = _fmp_get("/search-symbol", {"query": q, "limit": limit}) or []
     except FMPError as exc:
         return {"results": [], "source": "none", "message": str(exc)}
 
@@ -1936,9 +1946,9 @@ def movers():
     actives: list[dict[str, Any]] = []
 
     if _fmp_enabled():
-        for target, endpoint in [(gainers, "/stock_market/gainers"),
-                                  (losers,  "/stock_market/losers"),
-                                  (actives, "/stock_market/actives")]:
+        for target, endpoint in [(gainers, "/biggest-gainers"),
+                                  (losers,  "/biggest-losers"),
+                                  (actives, "/most-actives")]:
             try:
                 rows = _fmp_get(endpoint) or []
                 for row in rows[:10]:
@@ -2007,7 +2017,7 @@ def movers():
         today = datetime.now(timezone.utc).date()
         next_week = today + timedelta(days=7)
         try:
-            rows = _fmp_get("/earning_calendar", {
+            rows = _fmp_get("/earnings-calendar", {
                 "from": today.isoformat(),
                 "to":   next_week.isoformat(),
             }) or []
@@ -2124,7 +2134,7 @@ def sectors():
     fmp_sector_pct: dict[str, float] = {}
     if _fmp_enabled():
         try:
-            rows = _fmp_get("/sectors-performance") or []
+            rows = _fmp_get("/sector-performance-snapshot") or []
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -2437,6 +2447,44 @@ async def ai_chat(req: Request):
         "Cache-Control": "no-cache, no-transform",
         "X-Accel-Buffering": "no",  # disable nginx buffering if any
     })
+
+
+@app.get("/debug/fmp-stable")
+def debug_fmp_stable(ticker: str = "AAPL"):
+    """Probe every /stable/ FMP path we use and report HTTP status + first
+    200 chars of the body. Lets us verify the migration worked for the
+    user's account, since stable-tier coverage varies by plan."""
+    if not FMP_API_KEY:
+        return {"error": "FMP_API_KEY not set"}
+
+    ticker = ticker.strip().upper() or "AAPL"
+    today = datetime.now(timezone.utc).date()
+    week_ahead = today + timedelta(days=7)
+    probes = [
+        ("profile",                f"{FMP_BASE}/profile",                    {"symbol": ticker}),
+        ("quote",                  f"{FMP_BASE}/quote",                      {"symbol": ticker}),
+        ("search-symbol",          f"{FMP_BASE}/search-symbol",              {"query": "apple", "limit": 5}),
+        ("price-target-consensus", f"{FMP_BASE}/price-target-consensus",     {"symbol": ticker}),
+        ("upgrades-downgrades",    f"{FMP_BASE}/upgrades-downgrades-consensus", {"symbol": ticker}),
+        ("earnings",               f"{FMP_BASE}/earnings",                   {"symbol": ticker, "limit": 5}),
+        ("earnings-calendar",      f"{FMP_BASE}/earnings-calendar",          {"from": today.isoformat(), "to": week_ahead.isoformat()}),
+        ("insider-trading-search", f"{FMP_BASE}/insider-trading-search",     {"symbol": ticker, "limit": 5}),
+        ("biggest-gainers",        f"{FMP_BASE}/biggest-gainers",            None),
+        ("biggest-losers",         f"{FMP_BASE}/biggest-losers",             None),
+        ("most-actives",           f"{FMP_BASE}/most-actives",               None),
+        ("sector-performance-snapshot", f"{FMP_BASE}/sector-performance-snapshot", {"date": today.isoformat()}),
+    ]
+    results = []
+    for label, url, params in probes:
+        p = dict(params or {})
+        p["apikey"] = FMP_API_KEY
+        try:
+            r = requests.get(url, params=p, timeout=10)
+            body = r.text[:200].replace("\n", " ")
+            results.append({"endpoint": label, "http": r.status_code, "body": body})
+        except Exception as exc:  # noqa: BLE001
+            results.append({"endpoint": label, "error": str(exc)})
+    return {"ticker": ticker, "base": FMP_BASE, "results": results}
 
 
 @app.get("/debug/data")
