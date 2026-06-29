@@ -1478,7 +1478,7 @@ def widget_analysts(ticker: str):
     if _fmp_enabled():
         try:
             tgt_arr = _fmp_get("/price-target-consensus", {"symbol": ticker})
-            rec_arr = _fmp_get("/upgrades-downgrades-consensus", {"symbol": ticker})
+            rec_arr = _fmp_get("/grades-consensus", {"symbol": ticker})
             quote_arr = _fmp_get("/quote", {"symbol": ticker})
             tgt = (tgt_arr[0] if tgt_arr else {}) or {}
             rec = (rec_arr[0] if rec_arr else {}) or {}
@@ -1686,7 +1686,7 @@ def widget_insider(ticker: str):
     # Prefer FMP when available
     if _fmp_enabled():
         try:
-            rows = _fmp_get("/insider-trading-search", {"symbol": ticker, "limit": 25}) or []
+            rows = _fmp_get("/insider-trading", {"symbol": ticker, "limit": 25}) or []
             items: list[dict[str, Any]] = []
             for row in rows[:25]:
                 if not isinstance(row, dict):
@@ -1933,7 +1933,9 @@ def search(q: str, limit: int = 8):
         return {"results": [], "source": "none", "message": "Search requires FMP_API_KEY"}
 
     try:
-        rows = _fmp_get("/search-symbol", {"query": q, "limit": limit}) or []
+        # /search-symbol is ticker-prefix only; for free-text company-name
+        # search (typeahead), /search-name is the right endpoint.
+        rows = _fmp_get("/search-name", {"query": q, "limit": limit}) or []
     except FMPError as exc:
         return {"results": [], "source": "none", "message": str(exc)}
 
@@ -2485,12 +2487,13 @@ def debug_fmp_stable(ticker: str = "AAPL"):
     probes = [
         ("profile",                f"{FMP_BASE}/profile",                    {"symbol": ticker}),
         ("quote",                  f"{FMP_BASE}/quote",                      {"symbol": ticker}),
-        ("search-symbol",          f"{FMP_BASE}/search-symbol",              {"query": "apple", "limit": 5}),
+        ("search-name",            f"{FMP_BASE}/search-name",                {"query": "apple", "limit": 5}),
+        ("search-symbol",          f"{FMP_BASE}/search-symbol",              {"query": ticker, "limit": 5}),
         ("price-target-consensus", f"{FMP_BASE}/price-target-consensus",     {"symbol": ticker}),
-        ("upgrades-downgrades",    f"{FMP_BASE}/upgrades-downgrades-consensus", {"symbol": ticker}),
+        ("grades-consensus",       f"{FMP_BASE}/grades-consensus",           {"symbol": ticker}),
         ("earnings",               f"{FMP_BASE}/earnings",                   {"symbol": ticker, "limit": 5}),
         ("earnings-calendar",      f"{FMP_BASE}/earnings-calendar",          {"from": today.isoformat(), "to": week_ahead.isoformat()}),
-        ("insider-trading-search", f"{FMP_BASE}/insider-trading-search",     {"symbol": ticker, "limit": 5}),
+        ("insider-trading",        f"{FMP_BASE}/insider-trading",            {"symbol": ticker, "limit": 5}),
         ("biggest-gainers",        f"{FMP_BASE}/biggest-gainers",            None),
         ("biggest-losers",         f"{FMP_BASE}/biggest-losers",             None),
         ("most-actives",           f"{FMP_BASE}/most-actives",               None),
