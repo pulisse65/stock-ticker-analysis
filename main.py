@@ -1368,22 +1368,24 @@ def widget_earnings(ticker: str):
     earnings_dates: list[dict[str, Any]] = []
     source = "empty"
 
-    # --- FMP: /v3/historical/earning_calendar/{symbol} returns mixed past +
-    # upcoming earnings in a single call. eps/revenue are populated for past
-    # entries; epsEstimated/revenueEstimated for upcoming.
+    # --- FMP /stable/earnings: returns earnings entries for the symbol.
+    # New shape uses epsActual/revenueActual instead of eps/revenue.
+    # We surface any FMP failure on the response (fmp_debug field) so we
+    # can diagnose silent fallbacks without needing log access.
+    fmp_debug: str | None = None
     if _fmp_enabled():
         try:
-            # /stable/ renamed this — try the new path with symbol query param.
             rows = _fmp_get("/earnings", {"symbol": ticker, "limit": 40}) or []
-            if isinstance(rows, list) and rows:
+            if not isinstance(rows, list):
+                fmp_debug = f"non-list response: {type(rows).__name__}"
+            elif not rows:
+                fmp_debug = "empty list"
+            else:
                 today = datetime.now(timezone.utc).date().isoformat()
-                # Sort ascending by date
                 rows.sort(key=lambda r: (r.get("date") or ""))
                 upcoming = [r for r in rows if (r.get("date") or "") >= today]
                 past = [r for r in rows if (r.get("date") or "") < today]
 
-                # Build the calendar shape the frontend expects from the
-                # nearest upcoming entry.
                 if upcoming:
                     nxt = upcoming[0]
                     calendar = {
@@ -1396,9 +1398,13 @@ def widget_earnings(ticker: str):
                         "Revenue Low":        nxt.get("revenueEstimated"),
                     }
 
-                # Past earnings, newest first, with surprise %
+                # Past earnings, newest first, with surprise %. New FMP
+                # shape uses epsActual (not eps); fall back to old name in
+                # case different endpoints expose either.
                 for r in reversed(past[-8:]):
-                    eps_actual = r.get("eps")
+                    eps_actual = r.get("epsActual")
+                    if eps_actual is None:
+                        eps_actual = r.get("eps")
                     eps_est = r.get("epsEstimated")
                     surprise = None
                     if isinstance(eps_actual, (int, float)) and isinstance(eps_est, (int, float)) and eps_est:
@@ -1410,10 +1416,13 @@ def widget_earnings(ticker: str):
                         "surprise_pct": surprise,
                     })
                 source = "fmp"
+                fmp_debug = f"rows={len(rows)} upcoming={len(upcoming)} past={len(past)}"
         except FMPError as exc:
             log.info("FMP earnings unavailable for %s (%s); falling back to yfinance", ticker, exc)
+            fmp_debug = f"FMPError: {exc}"
         except Exception as exc:  # noqa: BLE001
             log.warning("FMP earnings errored for %s: %s; falling back to yfinance", ticker, exc)
+            fmp_debug = f"exception: {type(exc).__name__}: {exc}"
 
     # --- Fallback: yfinance. Wrapped in a hard timeout because .calendar and
     # .earnings_dates can hang for 30s+ from Render's datacenter IP.
@@ -1457,6 +1466,7 @@ def widget_earnings(ticker: str):
         "calendar": calendar,
         "earnings_dates": earnings_dates,
         "source": source,
+        "fmp_debug": fmp_debug,
     }
     _cache_set(cache_key, result, ttl=900)  # 15 min
     return result
