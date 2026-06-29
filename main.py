@@ -3341,9 +3341,15 @@ def purgatory_scan():
     new_signals: list[dict[str, Any]] = []
 
     if tickers:
-        # One batched API call for all watched symbols
+        # One batched API call for all watched symbols.
+        # 96h (not 24h) so the prior trading session is always in-window: a
+        # 24h lookback on a Monday morning sees only the weekend gap + today,
+        # which is < 31 bars until ~2h after the open — so signals couldn't
+        # fire before ~11:30 ET on Mondays (and post-holiday days). 96h spans
+        # the weekend (and a 3-day holiday weekend) back to the prior session,
+        # so EMAs are pre-warmed and signals can fire from the open.
         try:
-            bars_by_sym = _fetch_alpaca_bars(tickers, timeframe="4Min", lookback_hours=24)
+            bars_by_sym = _fetch_alpaca_bars(tickers, timeframe="4Min", lookback_hours=96)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(502, f"Alpaca fetch failed: {exc}") from exc
 
