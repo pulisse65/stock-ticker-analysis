@@ -2355,7 +2355,7 @@ function renderSignalsTabContent() {
   attachMoversGoLinks();
 }
 
-function renderEarnings() {
+function renderMoversEarnings() {
   const container = document.getElementById("earnings-list");
   if (!moversData) return;
   const earnings = moversData.earnings || [];
@@ -2419,7 +2419,7 @@ async function refreshMovers(force = false) {
     document.getElementById("movers-as-of").textContent = moversData.as_of ? `as of ${timeAgo(moversData.as_of)} · ${moversData.universe_size} scanned` : "";
     renderMoversTabContent();
     renderSignalsTabContent();
-    renderEarnings();
+    renderMoversEarnings();
     loading.classList.add("hidden");
     content.classList.remove("hidden");
   } catch (err) {
