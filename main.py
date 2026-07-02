@@ -2760,6 +2760,459 @@ def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hou
     return out
 
 
+# ----------------------------- Purgatory auto-trader (Alpaca options) -----------------------------
+#
+# When ALPACA_TRADING_ENABLED=1, every fresh Purgatory signal fires a real
+# market order against Alpaca. Paper account by default.
+#
+#   Entry:  ATM call (or put) — earliest listed expiration ≥ today.
+#           Sized so premium × 100 × qty ≈ ALPACA_TRADING_NOTIONAL_USD.
+#   Exit:   /scan sweeps positions ≥ ALPACA_TRADING_HOLD_MINUTES old and
+#           closes them via DELETE /v2/positions/{option_symbol} (safe: 404s
+#           if nothing is open instead of accidentally shorting).
+#   Log:    entries + exits both written to purgatory_orders keyed by
+#           (ticker, direction, bar_time). The EOD retro joins them and
+#           reports realized P&L in the Slack summary.
+
+ALPACA_TRADING_ENABLED = os.environ.get("ALPACA_TRADING_ENABLED", "0").strip() == "1"
+ALPACA_PAPER = os.environ.get("ALPACA_PAPER", "1").strip() != "0"
+ALPACA_TRADING_BASE = (
+    "https://paper-api.alpaca.markets" if ALPACA_PAPER
+    else "https://api.alpaca.markets"
+)
+ALPACA_OPTIONS_DATA_BASE = "https://data.alpaca.markets/v1beta1/options"
+ALPACA_TRADING_NOTIONAL_USD = float(os.environ.get("ALPACA_TRADING_NOTIONAL_USD", "500"))
+ALPACA_TRADING_HOLD_MINUTES = int(os.environ.get("ALPACA_TRADING_HOLD_MINUTES", "30"))
+_PURGATORY_ORDERS_TABLE = "purgatory_orders"
+
+
+def _alpaca_trading_headers() -> dict[str, str]:
+    return {
+        "APCA-API-KEY-ID": ALPACA_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
+        "Content-Type": "application/json",
+    }
+
+
+def _alpaca_list_option_contracts(
+    underlying: str,
+    option_type: str,
+    expiration_gte: str,
+    expiration_lte: str,
+) -> list[dict]:
+    """List active option contracts. Returns [] on failure."""
+    params = {
+        "underlying_symbols":    underlying,
+        "type":                  option_type,   # 'call' | 'put'
+        "status":                "active",
+        "expiration_date_gte":   expiration_gte,
+        "expiration_date_lte":   expiration_lte,
+        "limit":                 "500",
+    }
+    try:
+        r = requests.get(
+            f"{ALPACA_TRADING_BASE}/v2/options/contracts",
+            headers=_alpaca_trading_headers(),
+            params=params,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return (r.json() or {}).get("option_contracts") or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Alpaca options contract list failed for %s %s: %s", underlying, option_type, exc)
+        return []
+
+
+def _alpaca_get_option_latest_quote(option_symbol: str) -> dict | None:
+    try:
+        r = requests.get(
+            f"{ALPACA_OPTIONS_DATA_BASE}/quotes/latest",
+            headers=_alpaca_trading_headers(),
+            params={"symbols": option_symbol},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return (r.json() or {}).get("quotes", {}).get(option_symbol)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _select_option_contract(underlying: str, spot: float, direction: str) -> dict | None:
+    """Pick the ATM contract for `direction` ('call'|'put') at the earliest
+    listed expiration ≥ today (typically 0DTE for SPY/QQQ, otherwise the
+    next weekly Fri). Returns the Alpaca contract dict or None."""
+    today = datetime.now(timezone.utc).date()
+    horizon = today + timedelta(days=8)   # covers weekend + weekly
+    contracts = _alpaca_list_option_contracts(
+        underlying, direction,
+        expiration_gte=today.isoformat(),
+        expiration_lte=horizon.isoformat(),
+    )
+    if not contracts:
+        return None
+
+    by_exp: dict[str, list[dict]] = {}
+    for c in contracts:
+        exp = c.get("expiration_date")
+        if exp:
+            by_exp.setdefault(exp, []).append(c)
+    if not by_exp:
+        return None
+
+    same_expiry = by_exp[min(by_exp.keys())]
+
+    def _dist(c):
+        try:
+            return abs(float(c.get("strike_price", 0)) - spot)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    return min(same_expiry, key=_dist)
+
+
+def _estimate_option_premium(contract: dict) -> float | None:
+    """Per-share premium estimate for position sizing. Live mid > live ask >
+    prior close. Returns None if nothing is usable."""
+    sym = contract.get("symbol")
+    if sym:
+        q = _alpaca_get_option_latest_quote(sym) or {}
+        ap, bp = q.get("ap"), q.get("bp")
+        if isinstance(ap, (int, float)) and ap > 0:
+            if isinstance(bp, (int, float)) and bp > 0:
+                return (float(ap) + float(bp)) / 2
+            return float(ap)
+    close = contract.get("close_price")
+    try:
+        v = float(close) if close is not None else None
+        return v if (v and v > 0) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _persist_order_row(row: dict[str, Any]) -> None:
+    if _supabase_client is None:
+        return
+    try:
+        _supabase_client.table(_PURGATORY_ORDERS_TABLE).insert(row).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Order row persist failed: %s", exc)
+
+
+def _alpaca_submit_market_order(option_symbol: str, qty: int, side: str) -> dict | None:
+    body = {
+        "symbol":         option_symbol,
+        "qty":            str(qty),
+        "side":           side,          # 'buy' | 'sell'
+        "type":           "market",
+        "time_in_force":  "day",
+    }
+    try:
+        r = requests.post(
+            f"{ALPACA_TRADING_BASE}/v2/orders",
+            headers=_alpaca_trading_headers(),
+            json=body,
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            log.warning("Order rejected (%s) for %s %s x%s: %s",
+                        r.status_code, side, option_symbol, qty, r.text[:200])
+            return None
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Order submit failed: %s", exc)
+        return None
+
+
+def _alpaca_close_position(option_symbol: str) -> dict | None:
+    """DELETE /v2/positions/{symbol}. Returns a synthetic 'no_position' dict
+    on 404 so callers can log the exit attempt without re-trying forever."""
+    try:
+        r = requests.delete(
+            f"{ALPACA_TRADING_BASE}/v2/positions/{option_symbol}",
+            headers=_alpaca_trading_headers(),
+            timeout=15,
+        )
+        if r.status_code == 404:
+            return {"status": "no_position"}
+        if r.status_code >= 400:
+            log.warning("Close position failed (%s) for %s: %s",
+                        r.status_code, option_symbol, r.text[:200])
+            return None
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Close position failed: %s", exc)
+        return None
+
+
+def _alpaca_get_order(order_id: str) -> dict | None:
+    try:
+        r = requests.get(
+            f"{ALPACA_TRADING_BASE}/v2/orders/{order_id}",
+            headers=_alpaca_trading_headers(),
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
+    """Enter a position for this signal. No-op if trading is off or Alpaca
+    isn't configured. Returns the Alpaca order response on success."""
+    if not ALPACA_TRADING_ENABLED:
+        return None
+    if not _alpaca_enabled():
+        log.info("Trading enabled but Alpaca keys missing; skipping entry.")
+        return None
+
+    ticker = signal["ticker"]
+    direction = signal["signal"]     # 'call' | 'put'
+    spot = float(signal["price"])
+
+    contract = _select_option_contract(ticker, spot, direction)
+    if not contract:
+        log.info("No option contract available for %s %s @ %s", ticker, direction, spot)
+        return None
+
+    premium = _estimate_option_premium(contract)
+    if premium and premium > 0:
+        qty = max(1, int(ALPACA_TRADING_NOTIONAL_USD / (premium * 100)))
+    else:
+        qty = 1   # premium unknown → conservative single contract
+
+    order = _alpaca_submit_market_order(contract["symbol"], qty, "buy")
+    if not order:
+        return None
+
+    _persist_order_row({
+        "signal_ticker":     ticker,
+        "signal_direction":  direction,
+        "signal_bar_time":   signal["bar_time"],
+        "option_symbol":     contract["symbol"],
+        "option_strike":     _safe_float(contract.get("strike_price")),
+        "option_expiration": contract.get("expiration_date"),
+        "option_type":       direction,
+        "underlying_price":  spot,
+        "side":              "buy",
+        "role":              "entry",
+        "qty":               qty,
+        "alpaca_order_id":   order.get("id"),
+        "alpaca_status":     order.get("status"),
+        "submitted_at":      _now_iso(),
+        "paper":             ALPACA_PAPER,
+        "raw":               order,
+    })
+    log.info("Purgatory ENTRY: %s %s %s x%s (order %s)",
+             ticker, direction, contract["symbol"], qty, order.get("id"))
+    return order
+
+
+def _safe_float(v: Any) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
+    """Entries older than `min_age_minutes` that don't yet have a matching
+    exit row. Only returns entries that actually filled."""
+    if _supabase_client is None:
+        return []
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=min_age_minutes)).isoformat()
+    try:
+        entries_res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .eq("role", "entry")
+            .lt("submitted_at", cutoff)
+            .execute()
+        )
+        entries = entries_res.data or []
+        if not entries:
+            return []
+        exits_res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("signal_ticker,signal_direction,signal_bar_time")
+            .eq("role", "exit")
+            .execute()
+        )
+        closed = {
+            (r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
+            for r in (exits_res.data or [])
+        }
+        return [
+            e for e in entries
+            if (e["signal_ticker"], e["signal_direction"], e["signal_bar_time"]) not in closed
+        ]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Sweep query failed: %s", exc)
+        return []
+
+
+def _sweep_pending_positions() -> int:
+    """Close every entry ≥ ALPACA_TRADING_HOLD_MINUTES old. Idempotent —
+    404 from Alpaca (no position) still writes an exit row so we don't retry."""
+    if not ALPACA_TRADING_ENABLED or not _alpaca_enabled():
+        return 0
+
+    stale = _fetch_open_entries_for_sweep(ALPACA_TRADING_HOLD_MINUTES)
+    n_closed = 0
+    for entry in stale:
+        opt = entry.get("option_symbol")
+        qty = entry.get("qty") or 1
+        if not opt:
+            continue
+
+        result = _alpaca_close_position(opt)
+        if not result:
+            continue
+
+        status = result.get("status", "accepted")
+        _persist_order_row({
+            "signal_ticker":     entry["signal_ticker"],
+            "signal_direction":  entry["signal_direction"],
+            "signal_bar_time":   entry["signal_bar_time"],
+            "option_symbol":     opt,
+            "option_strike":     entry.get("option_strike"),
+            "option_expiration": entry.get("option_expiration"),
+            "option_type":       entry.get("option_type"),
+            "side":              "sell",
+            "role":              "exit",
+            "qty":               int(qty),
+            "alpaca_order_id":   result.get("id"),
+            "alpaca_status":     status,
+            "submitted_at":      _now_iso(),
+            "paper":             ALPACA_PAPER,
+            "raw":               result,
+        })
+        n_closed += 1
+        log.info("Purgatory EXIT: %s %s %s x%s (status %s)",
+                 entry["signal_ticker"], entry["signal_direction"], opt, qty, status)
+    return n_closed
+
+
+def _reconcile_open_order_fills(hours_back: int = 6) -> int:
+    """Update fill_price / status on any of our recent orders that aren't
+    marked 'filled' yet. Returns count updated."""
+    if _supabase_client is None or not _alpaca_enabled():
+        return 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("id,alpaca_order_id,alpaca_status,qty")
+            .gte("submitted_at", cutoff)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Reconcile query failed: %s", exc)
+        return 0
+
+    updates = 0
+    for row in rows:
+        if (row.get("alpaca_status") or "").lower() == "filled":
+            continue
+        order_id = row.get("alpaca_order_id")
+        if not order_id:
+            continue
+        remote = _alpaca_get_order(order_id)
+        if not remote:
+            continue
+        fill_price = _safe_float(remote.get("filled_avg_price"))
+        qty = row.get("qty") or 1
+        notional = (fill_price * qty * 100) if fill_price is not None else None
+        try:
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({
+                "alpaca_status": remote.get("status"),
+                "fill_price":    fill_price,
+                "notional":      notional,
+                "filled_at":     remote.get("filled_at"),
+                "raw":           remote,
+            }).eq("id", row["id"]).execute()
+            updates += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Reconcile update failed for %s: %s", order_id, exc)
+    return updates
+
+
+def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
+    """Match entry→exit pairs submitted on `date_str` (UTC day window; the
+    US session sits entirely inside one UTC day) and compute realized P&L."""
+    if _supabase_client is None:
+        return None
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d")
+        start = day.strftime("%Y-%m-%dT00:00:00Z")
+        end = (day + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+        res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .gte("submitted_at", start)
+            .lt("submitted_at", end)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("P&L query failed: %s", exc)
+        return None
+
+    entries: dict[tuple, dict] = {}
+    exits: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
+        if r["role"] == "entry":
+            entries[key] = r
+        elif r["role"] == "exit":
+            exits[key] = r
+
+    trades: list[dict] = []
+    for key, entry in entries.items():
+        ex = exits.get(key)
+        if not ex:
+            continue
+        ep = _safe_float(entry.get("fill_price"))
+        xp = _safe_float(ex.get("fill_price"))
+        qty = entry.get("qty") or 1
+        if ep is None or xp is None:
+            continue
+        pnl = (xp - ep) * qty * 100
+        trades.append({
+            "ticker":     entry["signal_ticker"],
+            "direction":  entry["signal_direction"],
+            "bar_time":   entry["signal_bar_time"],
+            "qty":        qty,
+            "entry":      ep,
+            "exit":       xp,
+            "pnl":        pnl,
+        })
+
+    if not trades:
+        return None
+
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    losses = sum(1 for t in trades if t["pnl"] < 0)
+    total = sum(t["pnl"] for t in trades)
+    best = max(trades, key=lambda t: t["pnl"])
+    worst = min(trades, key=lambda t: t["pnl"])
+    n = len(trades)
+    return {
+        "closed_trades":  n,
+        "wins":           wins,
+        "losses":         losses,
+        "flats":          n - wins - losses,
+        "win_rate_pct":   round(100 * wins / n, 1),
+        "total_pnl":      round(total, 2),
+        "avg_pnl":        round(total / n, 2),
+        "best":           {"ticker": best["ticker"], "pnl": round(best["pnl"], 2)},
+        "worst":          {"ticker": worst["ticker"], "pnl": round(worst["pnl"], 2)},
+        "trades":         trades,
+        "paper":          ALPACA_PAPER,
+    }
+
+
 # Filter thresholds (env-overridable so we can tighten/loosen without redeploy)
 # Default raised 0.05 → 0.10 after one week of data showed signals with
 # breakout depth < 0.10% had only 32% win rate vs 49% for 0.10-0.20%.
@@ -3364,6 +3817,15 @@ def purgatory_scan():
             sig["recent_stats"] = stats
 
             sig["slack_sent"] = _send_slack_alert(sig, stats=stats)
+
+            # Auto-trade the signal (paper by default; requires
+            # ALPACA_TRADING_ENABLED=1). Wrapped so a broker error can't
+            # block persistence or the rest of the scan.
+            try:
+                _maybe_place_trade_for_signal(sig)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Auto-trade entry failed for %s %s: %s", t, sig["signal"], exc)
+
             new_signals.append(sig)
             _purgatory_signals.append(sig)
             if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
@@ -3375,6 +3837,16 @@ def purgatory_scan():
     # Back-fill outcomes for matured signals (>= 25 min old, no outcome yet).
     # Runs every scan so the data piles up over the trading day.
     n_backfilled = _backfill_outcomes_for_matured_signals()
+
+    # Auto-trader housekeeping: pull fresh fill statuses, then close any
+    # positions past the hold-time cutoff. Both no-ops when trading is off.
+    n_reconciled = 0
+    n_closed = 0
+    try:
+        n_reconciled = _reconcile_open_order_fills()
+        n_closed = _sweep_pending_positions()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Auto-trade sweep failed: %s", exc)
 
     # Garbage-collect dedupe entries older than 24h
     cutoff = time.time() - 86400
@@ -3392,12 +3864,14 @@ def purgatory_scan():
         log.warning("Daily retro auto-trigger failed: %s", exc)
 
     return {
-        "scanned":       len(tickers),
-        "tickers":       tickers,
-        "signals":       new_signals,
-        "backfilled":    n_backfilled,
-        "retro_fired":   retro_fired,
-        "ts":            _now_iso(),
+        "scanned":         len(tickers),
+        "tickers":         tickers,
+        "signals":         new_signals,
+        "backfilled":      n_backfilled,
+        "trades_closed":   n_closed,
+        "trades_updated":  n_reconciled,
+        "retro_fired":     retro_fired,
+        "ts":              _now_iso(),
     }
 
 
@@ -3488,12 +3962,41 @@ def purgatory_stats(days: int = 30):
     }
 
 
+@app.get("/purgatory/orders")
+def purgatory_orders_get(date: str | None = None):
+    """Auto-trader results for a UTC date (defaults to today). Reconciles
+    open fill statuses first, then returns matched entry/exit pairs with
+    per-trade P&L. Empty payload if the trader hasn't done anything yet."""
+    if not date:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    n_updated = 0
+    try:
+        n_updated = _reconcile_open_order_fills()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Reconcile before /purgatory/orders failed: %s", exc)
+    pnl = _compute_daily_realized_pnl(date)
+    if not pnl:
+        return {
+            "date":            date,
+            "paper":           ALPACA_PAPER,
+            "trading_enabled": ALPACA_TRADING_ENABLED,
+            "closed_trades":   0,
+            "updated":         n_updated,
+            "message":         "No matched entry/exit pairs for this date.",
+        }
+    return {"date": date, "updated": n_updated, "trading_enabled": ALPACA_TRADING_ENABLED, **pnl}
+
+
 @app.get("/purgatory/status")
 def purgatory_status():
     disabled = sorted(_get_disabled_pairs())
     return {
         "alpaca_enabled":          _alpaca_enabled(),
         "slack_enabled":           _slack_enabled(),
+        "trading_enabled":         ALPACA_TRADING_ENABLED,
+        "trading_paper":           ALPACA_PAPER,
+        "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
+        "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "watchlist_count":         len(_purgatory_watchlist),
         "watchlist":               sorted(_purgatory_watchlist),
         "signals_logged":          len(_purgatory_signals),
@@ -3747,6 +4250,24 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
         if pd_lines:
             blocks.append({"type": "section", "text": {"type": "mrkdwn",
                 "text": "*By direction*\n" + "\n".join(pd_lines)}})
+
+    # Real-money (or paper) P&L — only shown if the auto-trader closed
+    # any trades on this date. Joined by (ticker, direction, bar_time).
+    try:
+        pnl = _compute_daily_realized_pnl(summary["date"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Realized P&L computation failed: %s", exc)
+        pnl = None
+    if pnl and pnl["closed_trades"] > 0:
+        tag = "Paper" if pnl["paper"] else "LIVE"
+        pnl_emoji = "🟢" if pnl["total_pnl"] > 0 else ("🔴" if pnl["total_pnl"] < 0 else "⚪")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
+            f"💰 *Real P&L ({tag})*  {pnl_emoji} *${pnl['total_pnl']:+,.2f}* net\n"
+            f"• {pnl['closed_trades']} closed · {pnl['wins']} W / {pnl['losses']} L · "
+            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade\n"
+            f"• 🏆 `{pnl['best']['ticker']}` ${pnl['best']['pnl']:+,.2f}   "
+            f"💀 `{pnl['worst']['ticker']}` ${pnl['worst']['pnl']:+,.2f}"
+        }})
 
     blocks.append({"type": "context", "elements": [
         {"type": "mrkdwn", "text": "🧠 AI analysis follows in the next message…"}
