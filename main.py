@@ -2660,6 +2660,8 @@ _purgatory_lock = threading.Lock()
 _purgatory_signals: list[dict[str, Any]] = []   # last ~100 signals (in-memory)
 _purgatory_alerted: dict[tuple, float] = {}      # (ticker, signal, bar_ts) → fired_at
 _PURGATORY_MAX_SIGNALS = 100
+_last_scan_at: str | None = None                 # ISO ts of the most recent /purgatory/scan
+                                                 # (in-memory; None right after a cold boot)
 
 
 def _alpaca_enabled() -> bool:
@@ -3790,6 +3792,11 @@ def purgatory_scan():
     if not _alpaca_enabled():
         raise HTTPException(503, "Purgatory scan requires ALPACA_API_KEY and ALPACA_API_SECRET env vars.")
 
+    # Heartbeat for the UI: lets the Alerts tab show "scanner alive, last
+    # scan Xs ago" instead of leaving cron health a guessing game.
+    global _last_scan_at
+    _last_scan_at = _now_iso()
+
     tickers = sorted(_purgatory_watchlist)
     new_signals: list[dict[str, Any]] = []
 
@@ -4004,6 +4011,7 @@ def purgatory_status():
         "trend_filter_pct":        PURGATORY_TREND_FILTER_PCT,
         "auto_disabled_pairs":     [{"ticker": t, "direction": d} for t, d in disabled],
         "supabase_signals":        _supabase_client is not None,
+        "last_scan_at":            _last_scan_at,
         "ts":                      _now_iso(),
     }
 
