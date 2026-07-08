@@ -384,22 +384,31 @@
   <header class="border-b border-line sticky top-0 z-20 backdrop-blur-md" style="background: var(--header-bg);">
     <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-4">
       <a href="/" class="flex items-center" aria-label="Ticker Tracker — home">
-        <img src="/static/logo.png" alt="Ticker Tracker" class="h-20 w-auto" />
+        <img src="/static/logo.png" alt="Ticker Tracker" class="h-10 w-auto" />
       </a>
 
+      <!-- Alerts first: it's the primary daily-use view. Tab clicks persist
+           to localStorage + URL hash so reloads land where you left off. -->
       <nav class="flex items-center gap-0 overflow-x-auto no-scrollbar">
-        <button class="tab-btn active" data-tab="analysis">Analysis</button>
+        <button class="tab-btn active" data-tab="alerts">Alerts</button>
+        <button class="tab-btn" data-tab="trading">Trading</button>
+        <button class="tab-btn" data-tab="analysis">Analysis</button>
         <button class="tab-btn" data-tab="dashboard">Dashboard</button>
-        <button class="tab-btn" data-tab="watchlist">Watchlist</button>
+        <button class="tab-btn" data-tab="watchlist">Quotes</button>
         <button class="tab-btn" data-tab="sectors">Sectors</button>
         <button class="tab-btn" data-tab="movers">Movers</button>
         <button class="tab-btn" data-tab="ai">AI</button>
-        <button class="tab-btn" data-tab="alerts">Alerts</button>
-        <button class="tab-btn" data-tab="learn">Learn</button>
       </nav>
 
       <div class="flex items-center gap-3">
         <span id="active-ticker-pill" class="ticker-pill hidden">—</span>
+        <button id="help-btn" type="button" class="btn-ghost px-2.5 py-2 flex items-center justify-center" title="How to read this app" aria-label="Help — how to read this app">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+        </button>
         <button id="theme-toggle" type="button" class="btn-ghost px-2.5 py-2 flex items-center justify-center" title="Toggle theme" aria-label="Toggle theme">
           <!-- Moon icon (shown in light mode → click to go dark) -->
           <svg class="theme-icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -417,7 +426,7 @@
 
   <main class="max-w-7xl mx-auto px-4 py-6">
     <!-- ============================== ANALYSIS TAB ============================== -->
-    <section id="tab-analysis" class="tab-panel active space-y-6">
+    <section id="tab-analysis" class="tab-panel space-y-6">
       <!-- Controls -->
       <section class="card p-4">
         <form id="analyze-form" class="flex flex-col sm:flex-row gap-3 sm:items-end">
@@ -725,7 +734,7 @@
     </section>
 
     <!-- ============================== ALERTS TAB ============================== -->
-    <section id="tab-alerts" class="tab-panel space-y-5">
+    <section id="tab-alerts" class="tab-panel active space-y-5">
       <section class="card p-4">
         <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
           <div>
@@ -734,22 +743,26 @@
           </div>
           <div class="flex items-center gap-2">
             <button id="alerts-scan-btn" type="button" class="btn-primary px-3 py-1.5 text-sm">Scan now</button>
-            <button id="alerts-refresh-btn" type="button" class="btn-ghost px-3 py-1.5 text-sm">Refresh log</button>
+            <button id="alerts-refresh-btn" type="button" class="btn-ghost px-3 py-1.5 text-sm">Refresh</button>
           </div>
         </div>
 
-        <!-- Status pills -->
-        <div class="flex flex-wrap gap-2 text-xs">
-          <span id="alerts-alpaca-pill"  class="px-2.5 py-1 rounded-full v-neutral">Alpaca: —</span>
+        <!-- Live status strip: scanner heartbeat + market clock + today's count.
+             Auto-refreshes every 60s while this tab is visible. -->
+        <div class="flex flex-wrap items-center gap-2 text-xs">
+          <span id="alerts-scanner-pill" class="px-2.5 py-1 rounded-full v-neutral" title="Time since the cron last hit /purgatory/scan">Scanner: —</span>
+          <span id="alerts-market-pill"  class="px-2.5 py-1 rounded-full v-neutral">Market: —</span>
+          <span id="alerts-today-pill"   class="px-2.5 py-1 rounded-full v-neutral">Today: —</span>
           <span id="alerts-slack-pill"   class="px-2.5 py-1 rounded-full v-neutral">Slack: —</span>
-          <span id="alerts-count-pill"   class="px-2.5 py-1 rounded-full v-neutral">Watchlist: —</span>
-          <span id="alerts-signals-pill" class="px-2.5 py-1 rounded-full v-neutral">Signals logged: —</span>
+          <span id="alerts-trading-pill" class="px-2.5 py-1 rounded-full v-neutral">Auto-trader: —</span>
+          <span id="alerts-updated" class="text-ink-faint ml-auto"></span>
         </div>
       </section>
 
-      <!-- Watchlist -->
+      <!-- Alert watchlist -->
       <section class="card p-4">
-        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Watched tickers</h3>
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-1">Alert watchlist</h3>
+        <p class="text-xs text-ink-faint mb-3">Tickers scanned every minute for Purgatory signals. Separate from the <a href="#" data-go-tab="watchlist" class="underline hover:text-ink">Quotes</a> tab, which just tracks prices.</p>
         <form id="alerts-add-form" class="flex items-center gap-2 mb-3">
           <input id="alerts-input" type="text" maxlength="10" placeholder="e.g. SPY, AVGO, TSLA"
             class="input uppercase px-3 py-1.5 font-medium mono w-40" />
@@ -771,6 +784,43 @@
       <section class="card p-4">
         <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Recent signals</h3>
         <div id="alerts-log" class="text-sm text-ink-dim">No signals yet.</div>
+      </section>
+    </section>
+
+    <!-- ============================== TRADING TAB ============================== -->
+    <section id="tab-trading" class="tab-panel space-y-5">
+      <!-- Trader status -->
+      <section class="card p-4">
+        <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
+          <div>
+            <h2 class="font-semibold text-ink">🤖 Alpaca auto-trader</h2>
+            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">Places an options order on every fresh Purgatory signal and closes it after the hold window. Everything the bot does shows up here.</p>
+          </div>
+          <button id="trading-refresh-btn" type="button" class="btn-ghost px-3 py-1.5 text-sm">Refresh</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-xs">
+          <span id="trading-enabled-pill"  class="px-2.5 py-1 rounded-full v-neutral">Trader: —</span>
+          <span id="trading-mode-pill"     class="px-2.5 py-1 rounded-full v-neutral">Mode: —</span>
+          <span id="trading-notional-pill" class="px-2.5 py-1 rounded-full v-neutral">Size: —</span>
+          <span id="trading-hold-pill"     class="px-2.5 py-1 rounded-full v-neutral">Hold: —</span>
+          <span id="trading-updated" class="text-ink-faint ml-auto"></span>
+        </div>
+      </section>
+
+      <!-- Day P&L -->
+      <section class="card p-4">
+        <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Realized P&amp;L</h3>
+          <input id="trading-date" type="date" class="input px-3 py-1.5 text-sm" />
+        </div>
+        <div id="trading-pnl-cards" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
+        <div id="trading-trades" class="text-sm text-ink-dim">—</div>
+      </section>
+
+      <!-- Daily retros -->
+      <section class="card p-4">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Daily retros (last 14 days)</h3>
+        <div id="trading-summaries" class="text-sm text-ink-dim">—</div>
       </section>
     </section>
 
@@ -1015,14 +1065,55 @@ function timeAgo(iso) {
 }
 
 // ===================== Tab nav =====================
+// One setTab for everything: switches panels, lazy-loads the tab's data,
+// and persists the choice (localStorage + URL hash) so reloads and shared
+// links land on the same view. "learn" is reachable via the ? button only.
+const KNOWN_TABS = ["alerts", "trading", "analysis", "dashboard", "watchlist", "sectors", "movers", "ai", "learn"];
 function setTab(name) {
+  if (!KNOWN_TABS.includes(name)) name = "alerts";
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab-panel").forEach(p => p.classList.toggle("active", p.id === `tab-${name}`));
-  if (name === "dashboard" && state.currentTicker) {
-    refreshDashboard(state.currentTicker);
+  // Persist everything but Learn — after reading the help you want your
+  // real view back on reload, not the help page.
+  if (name !== "learn") { try { localStorage.setItem("ui.tab", name); } catch {} }
+  if (location.hash !== `#${name}`) history.replaceState(null, "", `#${name}`);
+  // Lazy-load per tab
+  if (name === "dashboard" && state.currentTicker) refreshDashboard(state.currentTicker);
+  else if (name === "watchlist") refreshWatchlist();
+  else if (name === "sectors") refreshSectors(false);
+  else if (name === "movers") refreshMovers(false);
+  else if (name === "alerts") refreshAlerts();
+  else if (name === "trading") refreshTrading();
+  else if (name === "ai") {
+    const aiTicker = document.getElementById("ai-ticker");
+    if (state.currentTicker && aiTicker && !aiTicker.value) {
+      aiTicker.value = state.currentTicker;
+      aiState.ticker = state.currentTicker;
+    }
   }
 }
+window.setTab = setTab;
 document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
+window.addEventListener("hashchange", () => {
+  const name = location.hash.replace(/^#/, "");
+  if (KNOWN_TABS.includes(name)) setTab(name);
+});
+
+// Jump to a ticker's full analysis from anywhere in the app.
+function goAnalyze(t) {
+  if (!t) return;
+  const inp = document.getElementById("ticker");
+  if (inp) inp.value = t.toUpperCase();
+  setTab("analysis");
+  document.getElementById("analyze-form").requestSubmit();
+}
+// Delegated handler: any element with data-analyze="TICKER" becomes a link.
+document.addEventListener("click", (e) => {
+  const el = e.target.closest("[data-analyze]");
+  if (!el) return;
+  e.preventDefault();
+  goAnalyze(el.dataset.analyze);
+});
 
 // ===================== Active ticker (shared state) =====================
 function setActiveTicker(t) {
@@ -2698,23 +2789,53 @@ aiInput.addEventListener("input", () => {
 aiLoadModels();
 
 // ===================== Purgatory alerts =====================
+// US market clock, computed in ET so it's right regardless of viewer timezone.
+function marketState() {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "numeric", hour12: false,
+  }).formatToParts(new Date());
+  const get = (t) => parts.find(p => p.type === t)?.value;
+  const wd = get("weekday");
+  const mins = parseInt(get("hour"), 10) * 60 + parseInt(get("minute"), 10);
+  const weekday = !["Sat", "Sun"].includes(wd);
+  const open = weekday && mins >= 9 * 60 + 30 && mins < 16 * 60;
+  return { open, weekday };
+}
+
+function _setPill(id, label, tone) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = label;
+  el.className = "px-2.5 py-1 rounded-full " + (tone === "good" ? "v-bullish" : tone === "bad" ? "v-bearish" : "v-neutral");
+}
+
 async function refreshAlertsStatus() {
   try {
     const r = await fetch("/purgatory/status");
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
+    const mkt = marketState();
 
-    const setPill = (id, label, ok) => {
-      const el = document.getElementById(id);
-      el.textContent = label;
-      el.className = "px-2.5 py-1 rounded-full " + (ok ? "v-bullish" : "v-bearish");
-    };
-    setPill("alerts-alpaca-pill",  `Alpaca: ${data.alpaca_enabled ? "connected" : "missing key"}`, data.alpaca_enabled);
-    setPill("alerts-slack-pill",   `Slack: ${data.slack_enabled ? "wired" : "no webhook"}`, data.slack_enabled);
-    document.getElementById("alerts-count-pill").textContent   = `Watchlist: ${data.watchlist_count}`;
-    document.getElementById("alerts-count-pill").className     = "px-2.5 py-1 rounded-full v-neutral";
-    document.getElementById("alerts-signals-pill").textContent = `Signals logged: ${data.signals_logged}`;
-    document.getElementById("alerts-signals-pill").className   = "px-2.5 py-1 rounded-full v-neutral";
+    // Scanner heartbeat. Staleness only alarms while the market is open —
+    // outside hours the cron may legitimately be idle.
+    if (data.last_scan_at) {
+      const ageS = Math.max(0, (Date.now() - new Date(data.last_scan_at).getTime()) / 1000);
+      const ageTxt = ageS < 90 ? `${Math.round(ageS)}s ago` : ageS < 5400 ? `${Math.round(ageS / 60)}m ago` : `${Math.round(ageS / 3600)}h ago`;
+      const tone = ageS < 360 ? "good" : (mkt.open ? "bad" : "neutral");
+      _setPill("alerts-scanner-pill", `● Scanner: ${ageTxt}`, tone);
+    } else {
+      _setPill("alerts-scanner-pill", "● Scanner: no scan since boot", mkt.open ? "bad" : "neutral");
+    }
+
+    _setPill("alerts-market-pill", mkt.open ? "Market: open" : "Market: closed", mkt.open ? "good" : "neutral");
+    _setPill("alerts-slack-pill", `Slack: ${data.slack_enabled ? "wired" : "no webhook"}`, data.slack_enabled ? "good" : "bad");
+    const trading = data.trading_enabled
+      ? `Auto-trader: on (${data.trading_paper ? "paper" : "LIVE"})`
+      : "Auto-trader: off";
+    _setPill("alerts-trading-pill", trading, data.trading_enabled ? (data.trading_paper ? "good" : "bad") : "neutral");
+
+    const upd = document.getElementById("alerts-updated");
+    if (upd) upd.textContent = `Updated ${new Date().toLocaleTimeString()}`;
 
     renderAlertsWatchlist(data.watchlist || []);
   } catch (e) {
@@ -2752,6 +2873,12 @@ function _fmtPctSigned(v, d = 2) {
   return `${n >= 0 ? "+" : ""}${n.toFixed(d)}%`;
 }
 
+function _outcomeBadge(outcome) {
+  if (!outcome) return `<span class="text-[10px] text-ink-faint">pending</span>`;
+  const cls = outcome === "win" ? "v-bullish" : (outcome === "loss" ? "v-bearish" : "v-neutral");
+  return `<span class="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full ${cls}">${outcome}</span>`;
+}
+
 async function refreshAlertsLog() {
   const el = document.getElementById("alerts-log");
   try {
@@ -2759,59 +2886,109 @@ async function refreshAlertsLog() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     const signals = data.signals || [];
+
+    // "Today" pill (ET day, same convention as the backend's trading day)
+    const todayET = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date());
+    const dayET = (iso) => iso ? new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(new Date(iso)) : "";
+    const todayCount = signals.filter(s => dayET(s.bar_time) === todayET).length;
+    _setPill("alerts-today-pill", `Today: ${todayCount} signal${todayCount === 1 ? "" : "s"}`, todayCount ? "good" : "neutral");
+
     if (!signals.length) {
       el.innerHTML = `<span class="text-ink-faint">No signals yet. The scheduler will fire these in real time once your watchlist is set + the cron is pinging /purgatory/scan.</span>`;
       return;
     }
-    el.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs">
-      <thead class="text-ink-faint uppercase tracking-wider">
-        <tr>
-          <th class="text-left pb-2 pr-3">Time</th>
-          <th class="text-left pb-2 pr-3">Ticker</th>
-          <th class="text-center pb-2 pr-3">Signal</th>
-          <th class="text-right pb-2 pr-3">Price</th>
-          <th class="text-right pb-2 pr-3">+5m</th>
-          <th class="text-right pb-2 pr-3">+10m</th>
-          <th class="text-right pb-2 pr-3">+15m</th>
-          <th class="text-right pb-2 pr-3">+20m</th>
-          <th class="text-right pb-2 pr-3">+25m</th>
-          <th class="text-right pb-2 pr-3">+30m</th>
-          <th class="text-center pb-2 pr-3">Outcome</th>
-          <th class="text-center pb-2 pl-3">Slack</th>
-        </tr>
-      </thead>
-      <tbody>${signals.map(s => {
-        const dt = s.bar_time ? new Date(s.bar_time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
-        const sigCls = s.signal === "call" ? "val-up" : "val-down";
-        const sigTxt = s.signal === "call" ? "🟢 CALL" : "🔴 PUT";
-        const favCell = (v) => {
-          if (v === null || v === undefined) return `<td class="py-1.5 pr-3 text-right mono text-ink-faint">—</td>`;
-          const n = Number(v);
-          const cls = n > 0.05 ? "val-up" : (n < -0.05 ? "val-down" : "text-ink-dim");
-          return `<td class="py-1.5 pr-3 text-right mono ${cls}">${_fmtPctSigned(n)}</td>`;
-        };
-        const outcomeBadge = (() => {
-          if (!s.outcome) return `<span class="text-[10px] text-ink-faint">pending</span>`;
-          const cls = s.outcome === "win" ? "v-bullish" : (s.outcome === "loss" ? "v-bearish" : "v-neutral");
-          return `<span class="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full ${cls}">${s.outcome}</span>`;
-        })();
-        const price = (s.price !== null && s.price !== undefined) ? `$${Number(s.price).toFixed(2)}` : "—";
-        return `<tr class="border-t border-line">
-          <td class="py-1.5 pr-3 mono text-ink-dim">${escapeHTML(dt)}</td>
-          <td class="py-1.5 pr-3 mono font-semibold text-ink">${escapeHTML(s.ticker || "")}</td>
-          <td class="py-1.5 pr-3 text-center font-bold ${sigCls}">${sigTxt}</td>
-          <td class="py-1.5 pr-3 text-right mono">${price}</td>
-          ${favCell(s.favorable_5m)}
-          ${favCell(s.favorable_10m)}
-          ${favCell(s.favorable_15m)}
-          ${favCell(s.favorable_20m)}
-          ${favCell(s.favorable_25m)}
-          ${favCell(s.favorable_30m)}
-          <td class="py-1.5 pr-3 text-center">${outcomeBadge}</td>
-          <td class="py-1.5 pl-3 text-center">${s.slack_sent ? "✓" : "—"}</td>
-        </tr>`;
-      }).join("")}</tbody>
-    </table></div>`;
+
+    const sigMeta = (s) => ({
+      cls: s.signal === "call" ? "val-up" : "val-down",
+      txt: s.signal === "call" ? "🟢 CALL" : "🔴 PUT",
+      time: s.bar_time ? new Date(s.bar_time).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "—",
+      price: (s.price !== null && s.price !== undefined) ? `$${Number(s.price).toFixed(2)}` : "—",
+      tkr: `<a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(s.ticker || "")}">${escapeHTML(s.ticker || "")}</a>`,
+    });
+    const favCell = (v) => {
+      if (v === null || v === undefined) return `<td class="py-1.5 pr-3 text-right mono text-ink-faint">—</td>`;
+      const n = Number(v);
+      const cls = n > 0.05 ? "val-up" : (n < -0.05 ? "val-down" : "text-ink-dim");
+      return `<td class="py-1.5 pr-3 text-right mono ${cls}">${_fmtPctSigned(n)}</td>`;
+    };
+    const dateLabel = (iso) => new Date(iso).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+
+    // Desktop: table grouped by day. Mobile: compact cards.
+    let lastDay = null;
+    const tableRows = signals.map(s => {
+      const m = sigMeta(s);
+      const day = dayET(s.bar_time);
+      let sep = "";
+      if (day !== lastDay) {
+        lastDay = day;
+        const label = day === todayET ? "Today" : (s.bar_time ? dateLabel(s.bar_time) : "—");
+        sep = `<tr><td colspan="12" class="pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-ink-faint">${escapeHTML(label)}</td></tr>`;
+      }
+      return `${sep}<tr class="border-t border-line">
+        <td class="py-1.5 pr-3 mono text-ink-dim">${escapeHTML(m.time)}</td>
+        <td class="py-1.5 pr-3 mono font-semibold text-ink">${m.tkr}</td>
+        <td class="py-1.5 pr-3 text-center font-bold ${m.cls}">${m.txt}</td>
+        <td class="py-1.5 pr-3 text-right mono">${m.price}</td>
+        ${favCell(s.favorable_5m)}
+        ${favCell(s.favorable_10m)}
+        ${favCell(s.favorable_15m)}
+        ${favCell(s.favorable_20m)}
+        ${favCell(s.favorable_25m)}
+        ${favCell(s.favorable_30m)}
+        <td class="py-1.5 pr-3 text-center">${_outcomeBadge(s.outcome)}</td>
+        <td class="py-1.5 pl-3 text-center">${s.slack_sent ? "✓" : "—"}</td>
+      </tr>`;
+    }).join("");
+
+    lastDay = null;
+    const cards = signals.map(s => {
+      const m = sigMeta(s);
+      const day = dayET(s.bar_time);
+      let sep = "";
+      if (day !== lastDay) {
+        lastDay = day;
+        const label = day === todayET ? "Today" : (s.bar_time ? dateLabel(s.bar_time) : "—");
+        sep = `<div class="pt-2 text-[10px] font-bold uppercase tracking-wider text-ink-faint">${escapeHTML(label)}</div>`;
+      }
+      const fav15 = s.favorable_15m, fav30 = s.favorable_30m;
+      const favTxt = (label, v) => (v === null || v === undefined) ? "" :
+        `<span class="mono ${Number(v) > 0.05 ? "val-up" : Number(v) < -0.05 ? "val-down" : "text-ink-dim"}">${label} ${_fmtPctSigned(Number(v))}</span>`;
+      return `${sep}<div class="border border-line rounded-lg p-3 flex items-center justify-between gap-3">
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="mono font-semibold text-ink">${m.tkr}</span>
+            <span class="font-bold text-xs ${m.cls}">${m.txt}</span>
+          </div>
+          <div class="text-[11px] text-ink-faint mt-0.5">${escapeHTML(m.time)} · ${m.price}</div>
+        </div>
+        <div class="text-right">
+          <div>${_outcomeBadge(s.outcome)}</div>
+          <div class="text-[11px] mt-1 flex gap-2 justify-end">${favTxt("+15m", fav15)} ${favTxt("+30m", fav30)}</div>
+        </div>
+      </div>`;
+    }).join("");
+
+    el.innerHTML = `
+      <div class="hidden sm:block overflow-x-auto"><table class="w-full text-xs">
+        <thead class="text-ink-faint uppercase tracking-wider">
+          <tr>
+            <th class="text-left pb-2 pr-3">Time</th>
+            <th class="text-left pb-2 pr-3">Ticker</th>
+            <th class="text-center pb-2 pr-3">Signal</th>
+            <th class="text-right pb-2 pr-3">Price</th>
+            <th class="text-right pb-2 pr-3">+5m</th>
+            <th class="text-right pb-2 pr-3">+10m</th>
+            <th class="text-right pb-2 pr-3">+15m</th>
+            <th class="text-right pb-2 pr-3">+20m</th>
+            <th class="text-right pb-2 pr-3">+25m</th>
+            <th class="text-right pb-2 pr-3">+30m</th>
+            <th class="text-center pb-2 pr-3">Outcome</th>
+            <th class="text-center pb-2 pl-3">Slack</th>
+          </tr>
+        </thead>
+        <tbody>${tableRows}</tbody>
+      </table></div>
+      <div class="sm:hidden space-y-2">${cards}</div>`;
   } catch (e) {
     el.innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
   }
@@ -2873,6 +3050,157 @@ async function refreshAlerts() {
   await Promise.all([refreshAlertsStatus(), refreshAlertsLog(), refreshAlertsStats()]);
 }
 
+// ===================== Trading tab =====================
+function _fmtUsd(v) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return "—";
+  const n = Number(v);
+  return `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(2)}`;
+}
+function _pnlCls(v) { return Number(v) > 0 ? "val-up" : Number(v) < 0 ? "val-down" : "text-ink-dim"; }
+
+async function refreshTradingStatus() {
+  try {
+    const r = await fetch("/purgatory/status");
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const d = await r.json();
+    _setPill("trading-enabled-pill", `Trader: ${d.trading_enabled ? "on" : "off"}`, d.trading_enabled ? "good" : "neutral");
+    _setPill("trading-mode-pill", `Mode: ${d.trading_paper ? "paper" : "LIVE"}`, d.trading_paper ? "good" : "bad");
+    _setPill("trading-notional-pill", `Size: $${d.trading_notional_usd ?? "—"}/trade`, "neutral");
+    _setPill("trading-hold-pill", `Hold: ${d.trading_hold_minutes ?? "—"} min`, "neutral");
+    const upd = document.getElementById("trading-updated");
+    if (upd) upd.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch { /* leave pills as-is */ }
+}
+
+async function refreshTradingPnl() {
+  const cardsEl = document.getElementById("trading-pnl-cards");
+  const tradesEl = document.getElementById("trading-trades");
+  const date = document.getElementById("trading-date").value;
+  try {
+    const r = await fetch(`/purgatory/orders${date ? `?date=${encodeURIComponent(date)}` : ""}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const d = await r.json();
+
+    if (!d.closed_trades) {
+      cardsEl.innerHTML = "";
+      tradesEl.innerHTML = `<span class="text-ink-faint">${d.trading_enabled === false
+        ? "Auto-trader is off (set ALPACA_TRADING_ENABLED=1 in the deployment env to turn it on)."
+        : `No closed trades for ${escapeHTML(d.date || "this date")} yet — entries pair with exits after the hold window.`}</span>`;
+      return;
+    }
+
+    const card = (label, value, cls = "text-ink") => `
+      <div class="border border-line rounded-lg p-3">
+        <div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">${label}</div>
+        <div class="text-lg font-semibold mono ${cls}">${value}</div>
+      </div>`;
+    cardsEl.innerHTML = [
+      card("Total P&L", _fmtUsd(d.total_pnl), _pnlCls(d.total_pnl)),
+      card("Closed trades", `${d.closed_trades}`),
+      card("Win rate", `${_fmtNum(d.win_rate_pct, 1)}%`, d.win_rate_pct >= 50 ? "val-up" : "val-down"),
+      card("Avg / trade", _fmtUsd(d.avg_pnl), _pnlCls(d.avg_pnl)),
+    ].join("");
+
+    const trades = d.trades || [];
+    tradesEl.innerHTML = `
+      <div class="hidden sm:block overflow-x-auto"><table class="w-full text-xs">
+        <thead class="text-ink-faint uppercase tracking-wider">
+          <tr>
+            <th class="text-left pb-2 pr-3">Ticker</th>
+            <th class="text-center pb-2 pr-3">Dir</th>
+            <th class="text-left pb-2 pr-3">Signal bar</th>
+            <th class="text-right pb-2 pr-3">Qty</th>
+            <th class="text-right pb-2 pr-3">Entry</th>
+            <th class="text-right pb-2 pr-3">Exit</th>
+            <th class="text-right pb-2 pl-3">P&L</th>
+          </tr>
+        </thead>
+        <tbody>${trades.map(t => `
+          <tr class="border-t border-line">
+            <td class="py-1.5 pr-3 mono font-semibold text-ink"><a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(t.ticker || "")}">${escapeHTML(t.ticker || "")}</a></td>
+            <td class="py-1.5 pr-3 text-center font-bold ${t.direction === "call" ? "val-up" : "val-down"}">${t.direction === "call" ? "CALL" : "PUT"}</td>
+            <td class="py-1.5 pr-3 mono text-ink-dim">${t.bar_time ? escapeHTML(new Date(t.bar_time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })) : "—"}</td>
+            <td class="py-1.5 pr-3 text-right mono">${t.qty ?? "—"}</td>
+            <td class="py-1.5 pr-3 text-right mono">${_fmtUsd(t.entry)}</td>
+            <td class="py-1.5 pr-3 text-right mono">${_fmtUsd(t.exit)}</td>
+            <td class="py-1.5 pl-3 text-right mono font-semibold ${_pnlCls(t.pnl)}">${_fmtUsd(t.pnl)}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table></div>
+      <div class="sm:hidden space-y-2">${trades.map(t => `
+        <div class="border border-line rounded-lg p-3 flex items-center justify-between gap-3">
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="mono font-semibold text-ink"><a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(t.ticker || "")}">${escapeHTML(t.ticker || "")}</a></span>
+              <span class="font-bold text-xs ${t.direction === "call" ? "val-up" : "val-down"}">${t.direction === "call" ? "CALL" : "PUT"}</span>
+            </div>
+            <div class="text-[11px] text-ink-faint mt-0.5">${_fmtUsd(t.entry)} → ${_fmtUsd(t.exit)} × ${t.qty ?? "—"}</div>
+          </div>
+          <div class="mono font-semibold ${_pnlCls(t.pnl)}">${_fmtUsd(t.pnl)}</div>
+        </div>`).join("")}</div>`;
+  } catch (e) {
+    cardsEl.innerHTML = "";
+    tradesEl.innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
+  }
+}
+
+async function refreshTradingSummaries() {
+  const el = document.getElementById("trading-summaries");
+  try {
+    const r = await fetch("/purgatory/summaries?days=14");
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const d = await r.json();
+    const rows = d.summaries || [];
+    if (!rows.length) {
+      el.innerHTML = `<span class="text-ink-faint">No daily retros yet — one posts automatically after each market close.</span>`;
+      return;
+    }
+    el.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead class="text-ink-faint uppercase tracking-wider">
+        <tr>
+          <th class="text-left pb-2 pr-3">Date</th>
+          <th class="text-right pb-2 pr-3">Signals</th>
+          <th class="text-right pb-2 pr-3">W / L / flat</th>
+          <th class="text-right pb-2 pr-3">Win rate</th>
+          <th class="text-left pb-2 pr-3 hidden md:table-cell">Best</th>
+          <th class="text-left pb-2 pl-3 hidden md:table-cell">Worst</th>
+        </tr>
+      </thead>
+      <tbody>${rows.map(s => {
+        const wr = Number(s.win_rate_pct);
+        const sigOf = (x) => x ? `${escapeHTML(x.ticker || "")} ${escapeHTML((x.signal || "").toUpperCase())}` : "—";
+        return `<tr class="border-t border-line">
+          <td class="py-1.5 pr-3 mono text-ink">${escapeHTML(s.date || "—")}</td>
+          <td class="py-1.5 pr-3 text-right mono">${s.total_signals ?? "—"}</td>
+          <td class="py-1.5 pr-3 text-right mono text-ink-dim">${s.wins ?? 0} / ${s.losses ?? 0} / ${s.flats ?? 0}</td>
+          <td class="py-1.5 pr-3 text-right mono font-semibold ${wr >= 50 ? "val-up" : "val-down"}">${_fmtNum(wr, 1)}%</td>
+          <td class="py-1.5 pr-3 hidden md:table-cell val-up">${sigOf(s.best_signal)}</td>
+          <td class="py-1.5 pl-3 hidden md:table-cell val-down">${sigOf(s.worst_signal)}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table></div>`;
+  } catch (e) {
+    el.innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
+  }
+}
+
+async function refreshTrading() {
+  await Promise.all([refreshTradingStatus(), refreshTradingPnl(), refreshTradingSummaries()]);
+}
+
+document.getElementById("trading-refresh-btn").addEventListener("click", refreshTrading);
+document.getElementById("trading-date").addEventListener("change", refreshTradingPnl);
+
+// ===================== Live auto-refresh =====================
+// Alerts and Trading are monitors, not documents: refresh every 60s while
+// the tab is the active view and the browser tab is visible.
+setInterval(() => {
+  if (document.visibilityState !== "visible") return;
+  const active = document.querySelector(".tab-btn.active")?.dataset.tab;
+  if (active === "alerts") refreshAlerts();
+  else if (active === "trading") refreshTrading();
+}, 60_000);
+
 document.getElementById("alerts-add-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const inp = document.getElementById("alerts-input");
@@ -2920,30 +3248,11 @@ document.getElementById("alerts-refresh-btn").addEventListener("click", refreshA
 
 attachTickerSearch(document.getElementById("alerts-input"));
 
-// ===================== Tab nav: extend setTab to load on demand =====================
-const _origSetTab = setTab;
-window.setTab = function(name) {
-  _origSetTab(name);
-  if (name === "watchlist") refreshWatchlist();
-  else if (name === "sectors") refreshSectors(false);
-  else if (name === "movers") refreshMovers(false);
-  else if (name === "alerts") refreshAlerts();
-  else if (name === "ai") {
-    // Sync ticker from app state
-    const aiTicker = document.getElementById("ai-ticker");
-    if (state.currentTicker && !aiTicker.value) {
-      aiTicker.value = state.currentTicker;
-      aiState.ticker = state.currentTicker;
-    }
-  }
-};
-// Re-bind tab buttons to the wrapped setTab
-document.querySelectorAll(".tab-btn").forEach(b => {
-  b.replaceWith(b.cloneNode(true));
-});
-document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => window.setTab(b.dataset.tab)));
+// Tab switching, persistence, and per-tab lazy loading all live in setTab
+// (defined near the top of this script). The ? button opens the Learn panel.
+document.getElementById("help-btn").addEventListener("click", () => setTab("learn"));
 
-// "Go to Learn" link in watchlist tip
+// "Go to <tab>" links
 document.querySelectorAll('[data-go-tab]').forEach(a => {
   a.addEventListener("click", (e) => {
     e.preventDefault();
@@ -3039,6 +3348,18 @@ attachTickerSearch(document.getElementById("watchlist-input"));
 // ===================== Init =====================
 document.getElementById("ticker").value = "AAPL";
 loadHistory();
+
+// Trading P&L date defaults to today (UTC day, matching the backend's window)
+document.getElementById("trading-date").value = new Date().toISOString().slice(0, 10);
+
+// Land on the URL-hash tab if present, else the last-used tab, else Alerts —
+// the daily-driver view opens first instead of burying it 7 tabs deep.
+(() => {
+  const fromHash = location.hash.replace(/^#/, "");
+  let saved = null;
+  try { saved = localStorage.getItem("ui.tab"); } catch {}
+  setTab(KNOWN_TABS.includes(fromHash) ? fromHash : (KNOWN_TABS.includes(saved) ? saved : "alerts"));
+})();
 </script>
 </body>
 </html>
