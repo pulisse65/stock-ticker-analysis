@@ -3650,6 +3650,13 @@ EMA_PB_TREND_BARS = int(os.environ.get("EMA_PB_TREND_BARS", "15"))
 BB_SQUEEZE_PCTILE = float(os.environ.get("BB_SQUEEZE_PCTILE", "25"))
 BB_VOL_MULT = float(os.environ.get("BB_VOL_MULT", "1.5"))
 
+# Estimated round-trip spread cost in % of the UNDERLYING's move, applied
+# when classifying signal outcomes (win/flat/loss) so the promotion gate
+# approximates tradeable P&L rather than frictionless moves. ~0.05% covers
+# a liquid ATM option's bid/ask crossed twice, delta-adjusted; wider-spread
+# names cost more, so this default is deliberately on the punitive side.
+SIGNAL_SPREAD_COST_PCT = float(os.environ.get("SIGNAL_SPREAD_COST_PCT", "0.05"))
+
 
 def _parse_hhmm_to_mins(s: str, default_mins: int) -> int:
     try:
@@ -4007,6 +4014,7 @@ def _persist_signal(signal: dict[str, Any]) -> str | None:
             "ema30":       signal.get("ema30"),
             "vwap":        signal.get("vwap"),
             "meta":        signal.get("meta"),
+            "alerted_at":  signal.get("alerted_at"),
             "slack_sent":  signal.get("slack_sent", False),
         }, on_conflict="strategy,ticker,signal,bar_time").execute()
         if res.data and isinstance(res.data, list) and res.data:
@@ -4036,10 +4044,26 @@ def _fetch_persisted_signals(limit: int = 100, strategy: str | None = None) -> l
         return []
 
 
+def _parse_signal_ts(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
 def _backfill_outcomes_for_matured_signals() -> int:
     """Find signals that are >= 35 min old, have null outcome, and have
     enough bars available to score. Compute their favorable at +5/+10/+15/
     +20/+25/+30m and an overall outcome, then update the row.
+
+    Scoring anchors at `alerted_at` (falling back to `bar_time` for legacy
+    rows) with entry = the first 1-min close at/after the anchor — the
+    price a trader acting on the alert could actually get, not the
+    bar-close price the detector saw. The outcome is classified net of
+    SIGNAL_SPREAD_COST_PCT so win rates approximate tradeable P&L; the
+    stored favorable_* values stay gross (they're market measurements).
 
     Returns the number of signals back-filled in this pass."""
     if _supabase_client is None or not _alpaca_enabled():
@@ -4064,11 +4088,19 @@ def _backfill_outcomes_for_matured_signals() -> int:
     if not pending:
         return 0
 
-    # Batch one Alpaca call covering all tickers + time range needed
+    # Batch one Alpaca call covering all tickers + time range needed.
+    # Window spans from the earliest anchor (alerted_at may trail bar_time
+    # by a cron interval) through the latest anchor + the longest horizon.
     tickers = sorted({s["ticker"] for s in pending})
-    bar_times = [datetime.fromisoformat(s["bar_time"].replace("Z", "+00:00")) for s in pending]
-    earliest = min(bar_times)
-    latest = max(bar_times) + timedelta(minutes=32)
+    anchors = []
+    for s in pending:
+        anchor = _parse_signal_ts(s.get("alerted_at")) or _parse_signal_ts(s.get("bar_time"))
+        if anchor:
+            anchors.append(anchor)
+    if not anchors:
+        return 0
+    earliest = min(anchors)
+    latest = max(anchors) + timedelta(minutes=32)
     try:
         r = requests.get(
             f"{ALPACA_DATA_BASE}/stocks/bars",
@@ -4115,34 +4147,56 @@ def _backfill_outcomes_for_matured_signals() -> int:
     n_backfilled = 0
     for s in pending:
         try:
-            bt = datetime.fromisoformat(s["bar_time"].replace("Z", "+00:00"))
-            entry = float(s["entry_price"])
+            signal_price = float(s["entry_price"])
             side = s["signal"]
         except (KeyError, ValueError, TypeError):
+            continue
+        alerted = _parse_signal_ts(s.get("alerted_at"))
+        anchor = alerted or _parse_signal_ts(s.get("bar_time"))
+        if anchor is None:
+            continue
+        scored_from = "alerted_at" if alerted else "bar_time"
+
+        # Entry = first tradeable price after the alert, not the bar close
+        # the detector saw. If no bar exists yet, retry next scan.
+        exec_price = close_at_or_after(s["ticker"], anchor)
+        if exec_price is None or exec_price <= 0:
             continue
 
         favorables: dict[str, float | None] = {}
         for h in (5, 10, 15, 20, 25, 30):
-            price = close_at_or_after(s["ticker"], bt + timedelta(minutes=h))
+            price = close_at_or_after(s["ticker"], anchor + timedelta(minutes=h))
             if price is None:
                 favorables[f"favorable_{h}m"] = None
             else:
-                move_pct = (price - entry) / entry * 100.0
+                move_pct = (price - exec_price) / exec_price * 100.0
                 fav = move_pct if side == "call" else -move_pct
                 favorables[f"favorable_{h}m"] = fav
 
-        # Overall outcome based on best favorable across horizons
+        # Overall outcome based on best favorable across horizons, net of
+        # the estimated round-trip spread cost — a "win" should mean a
+        # trade that would have paid after crossing the spread twice.
         valid = [v for v in favorables.values() if v is not None]
         if not valid:
             # Not enough data yet — leave outcome null, try again next scan
             continue
-        best = max(valid)
-        outcome = "win" if best > 0.10 else ("flat" if best > -0.10 else "loss")
+        best_net = max(valid) - SIGNAL_SPREAD_COST_PCT
+        outcome = "win" if best_net > 0.10 else ("flat" if best_net > -0.10 else "loss")
+
+        # Slippage diagnostic: favorable-direction move between the bar
+        # close the detector saw and the first tradeable price. Positive =
+        # the move ran before entry was possible (the alert delay cost).
+        raw_slip = (exec_price - signal_price) / signal_price * 100.0
+        slippage_pct = raw_slip if side == "call" else -raw_slip
 
         try:
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE).update({
                 **favorables,
-                "outcome": outcome,
+                "outcome":            outcome,
+                "scored_from":        scored_from,
+                "entry_exec_price":   exec_price,
+                "entry_slippage_pct": round(slippage_pct, 4),
+                "spread_cost_pct":    SIGNAL_SPREAD_COST_PCT,
             }).eq("id", s["id"]).execute()
             n_backfilled += 1
         except Exception as exc:  # noqa: BLE001
@@ -4533,6 +4587,7 @@ def purgatory_stats(days: int = 30, strategy: str | None = None):
         losses = sum(1 for r in bucket if r.get("outcome") == "loss")
         flats = sum(1 for r in bucket if r.get("outcome") == "flat")
         f15 = [float(r["favorable_15m"]) for r in bucket if r.get("favorable_15m") is not None]
+        avg_f15 = (sum(f15) / len(f15)) if f15 else None
         out.append({
             "strategy":            strat,
             "ticker":              ticker,
@@ -4542,13 +4597,15 @@ def purgatory_stats(days: int = 30, strategy: str | None = None):
             "losses":              losses,
             "flats":               flats,
             "win_rate_pct":        wins / len(bucket) * 100.0 if bucket else 0.0,
-            "avg_favorable_15m":   (sum(f15) / len(f15)) if f15 else None,
+            "avg_favorable_15m":   avg_f15,
+            "avg_favorable_15m_net": (avg_f15 - SIGNAL_SPREAD_COST_PCT) if avg_f15 is not None else None,
         })
     return {
-        "days":     days,
-        "n_total":  len(rows),
-        "buckets":  out,
-        "ts":       _now_iso(),
+        "days":             days,
+        "n_total":          len(rows),
+        "spread_cost_pct":  SIGNAL_SPREAD_COST_PCT,
+        "buckets":          out,
+        "ts":               _now_iso(),
     }
 
 
@@ -4626,6 +4683,7 @@ def purgatory_status():
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
+        "signal_spread_cost_pct":  SIGNAL_SPREAD_COST_PCT,
         "strategies":              _strategy_status_block(),
         "manual_disabled_pairs":   [{"strategy": s, "ticker": t, "direction": d}
                                     for s, t, d in sorted(PURGATORY_DISABLED_PAIRS)],
@@ -4807,7 +4865,9 @@ def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
         s_scored = b["wins"] + b["losses"] + b["flats"]
         b["win_rate_pct"] = (b["wins"] / s_scored * 100.0) if s_scored else None
         f15 = b.pop("_f15")
-        b["avg_favorable_15m"] = (sum(f15) / len(f15)) if f15 else None
+        avg_f15 = (sum(f15) / len(f15)) if f15 else None
+        b["avg_favorable_15m"] = avg_f15
+        b["avg_favorable_15m_net"] = (avg_f15 - SIGNAL_SPREAD_COST_PCT) if avg_f15 is not None else None
 
     # Daily P&L estimate — sum of favorables (in %), summed over scored
     # signals. A positive sum means hypothetical net-positive day if you
@@ -4880,7 +4940,11 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
         for k in sorted(ps, key=lambda x: -ps[x]["n"]):
             v = ps[k]
             wr = f"{v['win_rate_pct']:.0f}%" if v.get("win_rate_pct") is not None else "—"
-            avg = f" · avg {v['avg_favorable_15m']:+.2f}%@15m" if v.get("avg_favorable_15m") is not None else ""
+            avg = ""
+            if v.get("avg_favorable_15m_net") is not None:
+                avg = f" · net {v['avg_favorable_15m_net']:+.2f}%@15m"
+            elif v.get("avg_favorable_15m") is not None:
+                avg = f" · avg {v['avg_favorable_15m']:+.2f}%@15m"
             ps_lines.append(f"• *{_STRATEGY_LABELS.get(k, k)}*: {v['n']} signals · "
                             f"{v['wins']}W/{v['losses']}L/{v['flats']}F · wr {wr}{avg}")
         blocks.append({"type": "section", "text": {"type": "mrkdwn",

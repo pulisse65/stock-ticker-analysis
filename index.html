@@ -3078,7 +3078,8 @@ async function refreshAlertsStats() {
           <th class="text-right pb-2 pr-3">Losses</th>
           <th class="text-right pb-2 pr-3">Flat</th>
           <th class="text-right pb-2 pr-3">Win rate</th>
-          <th class="text-right pb-2 pl-3">Avg favorable @ +15m</th>
+          <th class="text-right pb-2 pr-3">Avg fav @ +15m</th>
+          <th class="text-right pb-2 pl-3" title="Average favorable minus the estimated round-trip spread cost — closer to what a real trade nets">Net of spread</th>
         </tr>
       </thead>
       <tbody>${buckets.map(b => {
@@ -3095,7 +3096,8 @@ async function refreshAlertsStats() {
           <td class="py-1.5 pr-3 mono text-right val-down">${b.losses}</td>
           <td class="py-1.5 pr-3 mono text-right text-ink-dim">${b.flats}</td>
           <td class="py-1.5 pr-3 mono text-right font-semibold ${wrCls}">${b.win_rate_pct.toFixed(0)}%</td>
-          <td class="py-1.5 pl-3 mono text-right ${favCls}">${_fmtPctSigned(b.avg_favorable_15m)}</td>
+          <td class="py-1.5 pr-3 mono text-right ${favCls}">${_fmtPctSigned(b.avg_favorable_15m)}</td>
+          <td class="py-1.5 pl-3 mono text-right ${b.avg_favorable_15m_net == null ? "text-ink-dim" : (b.avg_favorable_15m_net > 0.05 ? "val-up" : (b.avg_favorable_15m_net < -0.05 ? "val-down" : "text-ink-dim"))}">${_fmtPctSigned(b.avg_favorable_15m_net)}</td>
         </tr>`;
       }).join("")}</tbody>
     </table></div>`;
