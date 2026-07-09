@@ -2784,7 +2784,13 @@ ALPACA_TRADING_BASE = (
 )
 ALPACA_OPTIONS_DATA_BASE = "https://data.alpaca.markets/v1beta1/options"
 ALPACA_TRADING_NOTIONAL_USD = float(os.environ.get("ALPACA_TRADING_NOTIONAL_USD", "500"))
-ALPACA_TRADING_HOLD_MINUTES = int(os.environ.get("ALPACA_TRADING_HOLD_MINUTES", "30"))
+# Default cut 30 → 15 after the 2026-07-08 retro: favorable moves peak at
+# 10-15m and mean-revert by 30m (QQQ/IWM/AVGO all gave back gains held past 15m).
+ALPACA_TRADING_HOLD_MINUTES = int(os.environ.get("ALPACA_TRADING_HOLD_MINUTES", "15"))
+# Stop-loss: close early when the option's live mid drops this % below the
+# entry fill. Caps the -$300 tail losses (AAPL 7/8 put was -35% within 5 min
+# and never recovered). Set <= 0 to disable.
+ALPACA_TRADING_STOP_LOSS_PCT = float(os.environ.get("ALPACA_TRADING_STOP_LOSS_PCT", "30"))
 _PURGATORY_ORDERS_TABLE = "purgatory_orders"
 
 
@@ -3095,6 +3101,65 @@ def _sweep_pending_positions() -> int:
     return n_closed
 
 
+def _sweep_stop_losses() -> int:
+    """Close any open entry whose option mid has dropped more than
+    ALPACA_TRADING_STOP_LOSS_PCT below the entry fill price. Runs on every
+    scan pass (before the hold-time sweep), so worst-case reaction time is
+    one cron interval. Entries without a reconciled fill_price yet are
+    skipped — the fill reconcile runs immediately before this."""
+    if not ALPACA_TRADING_ENABLED or not _alpaca_enabled():
+        return 0
+    if ALPACA_TRADING_STOP_LOSS_PCT <= 0:
+        return 0
+
+    open_entries = _fetch_open_entries_for_sweep(0)   # all open, any age
+    n_stopped = 0
+    for entry in open_entries:
+        opt = entry.get("option_symbol")
+        fill = _safe_float(entry.get("fill_price"))
+        qty = entry.get("qty") or 1
+        if not opt or fill is None or fill <= 0:
+            continue
+
+        q = _alpaca_get_option_latest_quote(opt) or {}
+        ap, bp = q.get("ap"), q.get("bp")
+        if not (isinstance(ap, (int, float)) and ap > 0):
+            continue
+        mid = (float(ap) + float(bp)) / 2 if (isinstance(bp, (int, float)) and bp > 0) else float(ap)
+
+        loss_pct = (fill - mid) / fill * 100.0
+        if loss_pct < ALPACA_TRADING_STOP_LOSS_PCT:
+            continue
+
+        result = _alpaca_close_position(opt)
+        if not result:
+            continue
+        _persist_order_row({
+            "signal_ticker":     entry["signal_ticker"],
+            "signal_direction":  entry["signal_direction"],
+            "signal_bar_time":   entry["signal_bar_time"],
+            "option_symbol":     opt,
+            "option_strike":     entry.get("option_strike"),
+            "option_expiration": entry.get("option_expiration"),
+            "option_type":       entry.get("option_type"),
+            "side":              "sell",
+            "role":              "exit",
+            "qty":               int(qty),
+            "alpaca_order_id":   result.get("id"),
+            "alpaca_status":     result.get("status", "accepted"),
+            "submitted_at":      _now_iso(),
+            "paper":             ALPACA_PAPER,
+            "raw":               {"exit_reason": "stop_loss",
+                                  "loss_pct_at_trigger": round(loss_pct, 2),
+                                  "entry_fill": fill, "mid_at_trigger": mid,
+                                  **(result or {})},
+        })
+        n_stopped += 1
+        log.info("Purgatory STOP-LOSS EXIT: %s %s %s x%s (-%.1f%% vs entry)",
+                 entry["signal_ticker"], entry["signal_direction"], opt, qty, loss_pct)
+    return n_stopped
+
+
 def _reconcile_open_order_fills(hours_back: int = 6) -> int:
     """Update fill_price / status on any of our recent orders that aren't
     marked 'filled' yet. Returns count updated."""
@@ -3221,14 +3286,39 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
 PURGATORY_MIN_BREAKOUT_PCT = float(os.environ.get("PURGATORY_MIN_BREAKOUT_PCT", "0.10"))   # %
 PURGATORY_TREND_FILTER_PCT = float(os.environ.get("PURGATORY_TREND_FILTER_PCT", "0.5"))    # %
 
-# Time-of-day windows in ET. Three windows showed consistently bad outcomes
-# in the data (open-noise, lunch-chop, end-of-day-chaos) so we skip them.
-_CHOP_WINDOWS = {"open_first_15", "lunch_chop", "close_chop"}
+# Time-of-day windows in ET. Windows with consistently bad outcomes are
+# skipped (open-noise, lunch-chop, end-of-day-chaos). early_afternoon_chop
+# (13:00-14:30) added after the 2026-07-08 retro: all three signals in that
+# window lost, -$718 of the day's -$809. Note 7/7 had one winner there, so
+# revisit once there's more data.
+_CHOP_WINDOWS = {"open_first_15", "lunch_chop", "early_afternoon_chop", "close_chop"}
 
 # Auto-disable thresholds for (ticker, direction) pairs
 _AUTO_DISABLE_MIN_N = 10
 _AUTO_DISABLE_MAX_WIN_RATE = 30.0     # %
 _AUTO_DISABLE_MIN_AVG_FAV = -0.20     # %  (any pair worse than this avg is disabled)
+
+
+def _parse_manual_disabled_pairs(raw: str) -> set[tuple[str, str]]:
+    """Parse 'AVGO:call,TSLA:put' → {('AVGO','call'), ('TSLA','put')}."""
+    out: set[tuple[str, str]] = set()
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        t, d = chunk.split(":", 1)
+        t, d = t.strip().upper(), d.strip().lower()
+        if t and d in ("call", "put"):
+            out.add((t, d))
+    return out
+
+
+# Manually disabled pairs, on top of the automatic 30-day-record rule.
+# AVGO:call added 2026-07-08: -$363 on the day, 30d avg favorable -0.16%
+# (sits just above the -0.20% auto cutoff but has been a chronic drag).
+PURGATORY_DISABLED_PAIRS = _parse_manual_disabled_pairs(
+    os.environ.get("PURGATORY_DISABLED_PAIRS", "AVGO:call")
+)
 
 
 def _bar_window_category(bar_time_iso: str) -> str:
@@ -3245,8 +3335,9 @@ def _bar_window_category(bar_time_iso: str) -> str:
     if mins < 660:        return "prime_morning"       # 10:00 - 11:00 ⭐ 76% wr in data
     if mins < 690:        return "pre_lunch"           # 11:00 - 11:30
     if mins < 750:        return "lunch_chop"          # 11:30 - 12:30 (chop, 18% wr)
-    if mins < 840:        return "post_lunch"          # 12:30 - 14:00
-    if mins < 900:        return "prime_afternoon"     # 14:00 - 15:00 ⭐ 67% wr
+    if mins < 780:        return "post_lunch"          # 12:30 - 13:00
+    if mins < 870:        return "early_afternoon_chop"  # 13:00 - 14:30 (chop, 7/8 retro)
+    if mins < 900:        return "prime_afternoon"     # 14:30 - 15:00
     if mins < 915:        return "pre_close"           # 15:00 - 15:15
     if mins < 960:        return "close_chop"          # 15:15 - 16:00 (chop, 25% wr)
     return "after_hours"
@@ -3261,8 +3352,9 @@ _WINDOW_LABELS = {
     "prime_morning":    "10:00–11:00 ET",
     "pre_lunch":        "11:00–11:30 ET",
     "lunch_chop":       "11:30–12:30 ET lunch",
-    "post_lunch":       "12:30–14:00 ET",
-    "prime_afternoon":  "14:00–15:00 ET",
+    "post_lunch":       "12:30–13:00 ET",
+    "early_afternoon_chop": "13:00–14:30 ET",
+    "prime_afternoon":  "14:30–15:00 ET",
     "pre_close":        "15:00–15:15 ET",
     "close_chop":       "15:15–16:00 ET close",
     "after_hours":      "after hours",
@@ -3290,8 +3382,8 @@ def _get_disabled_pairs() -> set[tuple[str, str]]:
     if now - last_ts < _DISABLED_CACHE_TTL:
         return last_val
     if _supabase_client is None:
-        _disabled_pairs_cache = (now, set())
-        return set()
+        _disabled_pairs_cache = (now, set(PURGATORY_DISABLED_PAIRS))
+        return set(PURGATORY_DISABLED_PAIRS)
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         res = (
@@ -3304,8 +3396,8 @@ def _get_disabled_pairs() -> set[tuple[str, str]]:
         rows = list(res.data or [])
     except Exception as exc:  # noqa: BLE001
         log.warning("Disabled-pairs query failed: %s", exc)
-        _disabled_pairs_cache = (now, set())
-        return set()
+        _disabled_pairs_cache = (now, set(PURGATORY_DISABLED_PAIRS))
+        return set(PURGATORY_DISABLED_PAIRS)
 
     buckets: dict[tuple[str, str], list[dict]] = {}
     for r in rows:
@@ -3325,6 +3417,7 @@ def _get_disabled_pairs() -> set[tuple[str, str]]:
         if win_rate <= _AUTO_DISABLE_MAX_WIN_RATE or avg_fav < _AUTO_DISABLE_MIN_AVG_FAV:
             disabled.add(key)
 
+    disabled |= PURGATORY_DISABLED_PAIRS
     _disabled_pairs_cache = (now, disabled)
     return disabled
 
@@ -3851,7 +3944,8 @@ def purgatory_scan():
     n_closed = 0
     try:
         n_reconciled = _reconcile_open_order_fills()
-        n_closed = _sweep_pending_positions()
+        n_closed = _sweep_stop_losses()      # stop-outs first (checks live quote)
+        n_closed += _sweep_pending_positions()
     except Exception as exc:  # noqa: BLE001
         log.warning("Auto-trade sweep failed: %s", exc)
 
@@ -4004,6 +4098,8 @@ def purgatory_status():
         "trading_paper":           ALPACA_PAPER,
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
+        "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
+        "manual_disabled_pairs":   [{"ticker": t, "direction": d} for t, d in sorted(PURGATORY_DISABLED_PAIRS)],
         "watchlist_count":         len(_purgatory_watchlist),
         "watchlist":               sorted(_purgatory_watchlist),
         "signals_logged":          len(_purgatory_signals),
