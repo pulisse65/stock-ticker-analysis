@@ -738,8 +738,8 @@
       <section class="card p-4">
         <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
           <div>
-            <h2 class="font-semibold text-ink">🔔 Purgatory Method alerts</h2>
-            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">4-minute intraday strategy: fires when 5 EMA / 9 EMA cross above (or below) both VWAP and 30 EMA — the "Purgatory" breakout. Sends a Slack message on every fresh signal. Educational, not investment advice.</p>
+            <h2 class="font-semibold text-ink">🔔 Signal alerts</h2>
+            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">Five intraday strategies scan the watchlist: Purgatory (EMA/VWAP cross), ORB (opening-range breakout), VWAP-R (band-fade reversion), EMA-PB (pullback continuation), and BB-SQZ (squeeze breakout). Each fresh signal posts to Slack. New strategies run signals-only until their stats earn auto-trading. Educational, not investment advice.</p>
           </div>
           <div class="flex items-center gap-2">
             <button id="alerts-scan-btn" type="button" class="btn-primary px-3 py-1.5 text-sm">Scan now</button>
@@ -757,6 +757,9 @@
           <span id="alerts-trading-pill" class="px-2.5 py-1 rounded-full v-neutral">Auto-trader: —</span>
           <span id="alerts-updated" class="text-ink-faint ml-auto"></span>
         </div>
+
+        <!-- Per-strategy chips: enabled/trading state + 30d record -->
+        <div id="alerts-strategies" class="flex flex-wrap items-center gap-2 text-xs mt-2"></div>
       </section>
 
       <!-- Alert watchlist -->
@@ -782,7 +785,17 @@
 
       <!-- Recent signals log -->
       <section class="card p-4">
-        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Recent signals</h3>
+        <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Recent signals</h3>
+          <select id="alerts-strategy-filter" class="input px-2 py-1 text-xs">
+            <option value="">All strategies</option>
+            <option value="purgatory">PURG — Purgatory</option>
+            <option value="orb">ORB — Opening range</option>
+            <option value="vwap_reversion">VWAP-R — Reversion</option>
+            <option value="ema_pullback">EMA-PB — Pullback</option>
+            <option value="bb_squeeze">BB-SQZ — Squeeze</option>
+          </select>
+        </div>
         <div id="alerts-log" class="text-sm text-ink-dim">No signals yet.</div>
       </section>
     </section>
@@ -804,6 +817,12 @@
           <span id="trading-notional-pill" class="px-2.5 py-1 rounded-full v-neutral">Size: —</span>
           <span id="trading-hold-pill"     class="px-2.5 py-1 rounded-full v-neutral">Hold: —</span>
           <span id="trading-updated" class="text-ink-faint ml-auto"></span>
+        </div>
+
+        <!-- Strategy roster: which detectors run, which may trade, 30d record -->
+        <div class="mt-3">
+          <h4 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-2">Strategies</h4>
+          <div id="trading-strategies" class="text-sm text-ink-dim">—</div>
         </div>
       </section>
 
@@ -2838,6 +2857,7 @@ async function refreshAlertsStatus() {
     if (upd) upd.textContent = `Updated ${new Date().toLocaleTimeString()}`;
 
     renderAlertsWatchlist(data.watchlist || []);
+    renderAlertsStrategies(data.strategies || []);
   } catch (e) {
     // leave pills as-is
   }
@@ -2879,10 +2899,43 @@ function _outcomeBadge(outcome) {
   return `<span class="text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full ${cls}">${outcome}</span>`;
 }
 
+const STRATEGY_LABELS = {
+  purgatory: "PURG", orb: "ORB", vwap_reversion: "VWAP-R",
+  ema_pullback: "EMA-PB", bb_squeeze: "BB-SQZ",
+};
+const STRATEGY_NAMES = {
+  purgatory: "Purgatory — EMA/VWAP cross", orb: "Opening range breakout",
+  vwap_reversion: "VWAP band reversion", ema_pullback: "EMA pullback continuation",
+  bb_squeeze: "Bollinger squeeze breakout",
+};
+function _strategyBadge(key) {
+  const k = key || "purgatory";
+  const label = STRATEGY_LABELS[k] || k.toUpperCase();
+  return `<span class="text-[10px] font-bold tracking-wider px-1.5 py-0.5 rounded-full chip mono" title="${escapeHTML(STRATEGY_NAMES[k] || k)}">${escapeHTML(label)}</span>`;
+}
+
+function renderAlertsStrategies(strats) {
+  const el = document.getElementById("alerts-strategies");
+  if (!el) return;
+  if (!strats || !strats.length) { el.innerHTML = ""; return; }
+  el.innerHTML = strats.map(s => {
+    const tone = !s.enabled ? "v-neutral opacity-50" : (s.trading ? "v-bullish" : "v-neutral");
+    const mode = !s.enabled ? "off" : (s.trading ? "trading" : "signals");
+    const rec = s.signals_30d ? ` · ${s.win_rate_30d != null ? s.win_rate_30d.toFixed(0) + "%" : "—"} (${s.signals_30d})` : "";
+    return `<span class="px-2.5 py-1 rounded-full ${tone}" title="${escapeHTML(STRATEGY_NAMES[s.strategy] || s.strategy)} — ${mode}${s.signals_30d ? `, ${s.signals_30d} scored signals last 30d` : ", no scored signals yet"}">${escapeHTML(s.label || s.strategy)}: ${mode}${rec}</span>`;
+  }).join("");
+}
+
 async function refreshAlertsLog() {
   const el = document.getElementById("alerts-log");
+  const filterSel = document.getElementById("alerts-strategy-filter");
+  if (filterSel && !filterSel.dataset.bound) {
+    filterSel.dataset.bound = "1";
+    filterSel.addEventListener("change", refreshAlertsLog);
+  }
+  const strat = filterSel ? filterSel.value : "";
   try {
-    const r = await fetch("/purgatory/signals?limit=50");
+    const r = await fetch(`/purgatory/signals?limit=50${strat ? `&strategy=${encodeURIComponent(strat)}` : ""}`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
     const signals = data.signals || [];
@@ -2922,11 +2975,12 @@ async function refreshAlertsLog() {
       if (day !== lastDay) {
         lastDay = day;
         const label = day === todayET ? "Today" : (s.bar_time ? dateLabel(s.bar_time) : "—");
-        sep = `<tr><td colspan="12" class="pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-ink-faint">${escapeHTML(label)}</td></tr>`;
+        sep = `<tr><td colspan="13" class="pt-3 pb-1 text-[10px] font-bold uppercase tracking-wider text-ink-faint">${escapeHTML(label)}</td></tr>`;
       }
       return `${sep}<tr class="border-t border-line">
         <td class="py-1.5 pr-3 mono text-ink-dim">${escapeHTML(m.time)}</td>
         <td class="py-1.5 pr-3 mono font-semibold text-ink">${m.tkr}</td>
+        <td class="py-1.5 pr-3 text-center">${_strategyBadge(s.strategy)}</td>
         <td class="py-1.5 pr-3 text-center font-bold ${m.cls}">${m.txt}</td>
         <td class="py-1.5 pr-3 text-right mono">${m.price}</td>
         ${favCell(s.favorable_5m)}
@@ -2957,6 +3011,7 @@ async function refreshAlertsLog() {
         <div>
           <div class="flex items-center gap-2">
             <span class="mono font-semibold text-ink">${m.tkr}</span>
+            ${_strategyBadge(s.strategy)}
             <span class="font-bold text-xs ${m.cls}">${m.txt}</span>
           </div>
           <div class="text-[11px] text-ink-faint mt-0.5">${escapeHTML(m.time)} · ${m.price}</div>
@@ -2974,6 +3029,7 @@ async function refreshAlertsLog() {
           <tr>
             <th class="text-left pb-2 pr-3">Time</th>
             <th class="text-left pb-2 pr-3">Ticker</th>
+            <th class="text-center pb-2 pr-3">Strat</th>
             <th class="text-center pb-2 pr-3">Signal</th>
             <th class="text-right pb-2 pr-3">Price</th>
             <th class="text-right pb-2 pr-3">+5m</th>
@@ -3015,6 +3071,7 @@ async function refreshAlertsStats() {
       <thead class="text-ink-faint uppercase tracking-wider">
         <tr>
           <th class="text-left pb-2 pr-3">Ticker</th>
+          <th class="text-center pb-2 pr-3">Strat</th>
           <th class="text-left pb-2 pr-3">Side</th>
           <th class="text-right pb-2 pr-3">N</th>
           <th class="text-right pb-2 pr-3">Wins</th>
@@ -3031,6 +3088,7 @@ async function refreshAlertsStats() {
         const favCls = b.avg_favorable_15m == null ? "text-ink-dim" : (b.avg_favorable_15m > 0.05 ? "val-up" : (b.avg_favorable_15m < -0.05 ? "val-down" : "text-ink-dim"));
         return `<tr class="border-t border-line">
           <td class="py-1.5 pr-3 mono font-semibold text-ink">${escapeHTML(b.ticker || "")}</td>
+          <td class="py-1.5 pr-3 text-center">${_strategyBadge(b.strategy)}</td>
           <td class="py-1.5 pr-3 font-bold ${dirCls}">${dirTxt}</td>
           <td class="py-1.5 pr-3 mono text-right">${b.n}</td>
           <td class="py-1.5 pr-3 mono text-right val-up">${b.wins}</td>
@@ -3067,9 +3125,34 @@ async function refreshTradingStatus() {
     _setPill("trading-mode-pill", `Mode: ${d.trading_paper ? "paper" : "LIVE"}`, d.trading_paper ? "good" : "bad");
     _setPill("trading-notional-pill", `Size: $${d.trading_notional_usd ?? "—"}/trade`, "neutral");
     _setPill("trading-hold-pill", `Hold: ${d.trading_hold_minutes ?? "—"} min`, "neutral");
+    renderTradingStrategies(d.strategies || []);
     const upd = document.getElementById("trading-updated");
     if (upd) upd.textContent = `Updated ${new Date().toLocaleTimeString()}`;
   } catch { /* leave pills as-is */ }
+}
+
+function renderTradingStrategies(strats) {
+  const el = document.getElementById("trading-strategies");
+  if (!el) return;
+  if (!strats || !strats.length) { el.innerHTML = "—"; return; }
+  el.innerHTML = `<div class="space-y-1.5">${strats.map(s => {
+    const mode = !s.enabled
+      ? `<span class="text-ink-faint">disabled</span>`
+      : (s.trading
+        ? `<span class="val-up font-semibold">auto-trading</span>`
+        : `<span class="text-ink-dim">signals-only</span>`);
+    const rec = s.signals_30d
+      ? `${s.signals_30d} scored · ${s.win_rate_30d != null ? s.win_rate_30d.toFixed(0) + "% wr" : "—"}`
+      : "no scored signals yet";
+    const gate = (!s.trading && s.enabled)
+      ? ` <span class="text-ink-faint">(promotes at ≥30 scored + ≥50% wr)</span>` : "";
+    return `<div class="flex items-center gap-2 flex-wrap">
+      ${_strategyBadge(s.strategy)}
+      <span class="text-xs text-ink">${escapeHTML(STRATEGY_NAMES[s.strategy] || s.strategy)}</span>
+      <span class="text-xs">· ${mode}</span>
+      <span class="text-xs text-ink-dim">· 30d: ${escapeHTML(rec)}${gate}</span>
+    </div>`;
+  }).join("")}</div>`;
 }
 
 async function refreshTradingPnl() {
@@ -3107,6 +3190,7 @@ async function refreshTradingPnl() {
         <thead class="text-ink-faint uppercase tracking-wider">
           <tr>
             <th class="text-left pb-2 pr-3">Ticker</th>
+            <th class="text-center pb-2 pr-3">Strat</th>
             <th class="text-center pb-2 pr-3">Dir</th>
             <th class="text-left pb-2 pr-3">Signal bar</th>
             <th class="text-right pb-2 pr-3">Qty</th>
@@ -3118,6 +3202,7 @@ async function refreshTradingPnl() {
         <tbody>${trades.map(t => `
           <tr class="border-t border-line">
             <td class="py-1.5 pr-3 mono font-semibold text-ink"><a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(t.ticker || "")}">${escapeHTML(t.ticker || "")}</a></td>
+            <td class="py-1.5 pr-3 text-center">${_strategyBadge(t.strategy)}</td>
             <td class="py-1.5 pr-3 text-center font-bold ${t.direction === "call" ? "val-up" : "val-down"}">${t.direction === "call" ? "CALL" : "PUT"}</td>
             <td class="py-1.5 pr-3 mono text-ink-dim">${t.bar_time ? escapeHTML(new Date(t.bar_time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })) : "—"}</td>
             <td class="py-1.5 pr-3 text-right mono">${t.qty ?? "—"}</td>

@@ -2973,6 +2973,9 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
     if not _alpaca_enabled():
         log.info("Trading enabled but Alpaca keys missing; skipping entry.")
         return None
+    strategy = signal.get("strategy", "purgatory")
+    if strategy not in STRATEGIES_TRADING:
+        return None   # signals-only strategy — validate before promoting
 
     ticker = signal["ticker"]
     direction = signal["signal"]     # 'call' | 'put'
@@ -2994,6 +2997,7 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
         return None
 
     _persist_order_row({
+        "strategy":          strategy,
         "signal_ticker":     ticker,
         "signal_direction":  direction,
         "signal_bar_time":   signal["bar_time"],
@@ -3042,17 +3046,17 @@ def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
             return []
         exits_res = (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("signal_ticker,signal_direction,signal_bar_time")
+            .select("strategy,signal_ticker,signal_direction,signal_bar_time")
             .eq("role", "exit")
             .execute()
         )
         closed = {
-            (r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
+            (r.get("strategy") or "purgatory", r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
             for r in (exits_res.data or [])
         }
         return [
             e for e in entries
-            if (e["signal_ticker"], e["signal_direction"], e["signal_bar_time"]) not in closed
+            if (e.get("strategy") or "purgatory", e["signal_ticker"], e["signal_direction"], e["signal_bar_time"]) not in closed
         ]
     except Exception as exc:  # noqa: BLE001
         log.warning("Sweep query failed: %s", exc)
@@ -3079,6 +3083,7 @@ def _sweep_pending_positions() -> int:
 
         status = result.get("status", "accepted")
         _persist_order_row({
+            "strategy":          entry.get("strategy") or "purgatory",
             "signal_ticker":     entry["signal_ticker"],
             "signal_direction":  entry["signal_direction"],
             "signal_bar_time":   entry["signal_bar_time"],
@@ -3135,6 +3140,7 @@ def _sweep_stop_losses() -> int:
         if not result:
             continue
         _persist_order_row({
+            "strategy":          entry.get("strategy") or "purgatory",
             "signal_ticker":     entry["signal_ticker"],
             "signal_direction":  entry["signal_direction"],
             "signal_bar_time":   entry["signal_bar_time"],
@@ -3229,7 +3235,8 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
     entries: dict[tuple, dict] = {}
     exits: dict[tuple, dict] = {}
     for r in rows:
-        key = (r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
+        key = (r.get("strategy") or "purgatory",
+               r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
         if r["role"] == "entry":
             entries[key] = r
         elif r["role"] == "exit":
@@ -3247,6 +3254,7 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
             continue
         pnl = (xp - ep) * qty * 100
         trades.append({
+            "strategy":   key[0],
             "ticker":     entry["signal_ticker"],
             "direction":  entry["signal_direction"],
             "bar_time":   entry["signal_bar_time"],
@@ -3299,17 +3307,24 @@ _AUTO_DISABLE_MAX_WIN_RATE = 30.0     # %
 _AUTO_DISABLE_MIN_AVG_FAV = -0.20     # %  (any pair worse than this avg is disabled)
 
 
-def _parse_manual_disabled_pairs(raw: str) -> set[tuple[str, str]]:
-    """Parse 'AVGO:call,TSLA:put' → {('AVGO','call'), ('TSLA','put')}."""
-    out: set[tuple[str, str]] = set()
+def _parse_manual_disabled_pairs(raw: str) -> set[tuple[str, str, str]]:
+    """Parse manual disable entries into (strategy, ticker, direction) triples.
+    Accepts both 'strategy:TICKER:direction' and the legacy 2-part
+    'TICKER:direction' form (which implies strategy='purgatory')."""
+    out: set[tuple[str, str, str]] = set()
     for chunk in (raw or "").split(","):
         chunk = chunk.strip()
         if not chunk or ":" not in chunk:
             continue
-        t, d = chunk.split(":", 1)
-        t, d = t.strip().upper(), d.strip().lower()
-        if t and d in ("call", "put"):
-            out.add((t, d))
+        parts = [p.strip() for p in chunk.split(":")]
+        if len(parts) == 2:
+            strat, t, d = "purgatory", parts[0].upper(), parts[1].lower()
+        elif len(parts) == 3:
+            strat, t, d = parts[0].lower(), parts[1].upper(), parts[2].lower()
+        else:
+            continue
+        if strat and t and d in ("call", "put"):
+            out.add((strat, t, d))
     return out
 
 
@@ -3371,11 +3386,11 @@ _disabled_pairs_cache: tuple[float, set[tuple[str, str]]] = (0.0, set())
 _DISABLED_CACHE_TTL = 600  # 10 min
 
 
-def _get_disabled_pairs() -> set[tuple[str, str]]:
-    """Return (ticker, direction) pairs that consistently underperform over
-    the last 30 days. Cached for 10 min so we don't re-query Supabase on
-    every scan. Pairs are disabled when N >= 10 scored signals AND
-    (win_rate <= 30% OR avg_favorable_15m < -0.20%)."""
+def _get_disabled_pairs() -> set[tuple[str, str, str]]:
+    """Return (strategy, ticker, direction) triples that consistently
+    underperform over the last 30 days. Cached for 10 min so we don't
+    re-query Supabase on every scan. Pairs are disabled when N >= 10 scored
+    signals AND (win_rate <= 30% OR avg_favorable_15m < -0.20%)."""
     global _disabled_pairs_cache
     now = time.time()
     last_ts, last_val = _disabled_pairs_cache
@@ -3388,7 +3403,7 @@ def _get_disabled_pairs() -> set[tuple[str, str]]:
         since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         res = (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
-            .select("ticker, signal, outcome, favorable_15m")
+            .select("strategy, ticker, signal, outcome, favorable_15m")
             .gte("bar_time", since)
             .not_.is_("outcome", "null")
             .execute()
@@ -3399,14 +3414,14 @@ def _get_disabled_pairs() -> set[tuple[str, str]]:
         _disabled_pairs_cache = (now, set(PURGATORY_DISABLED_PAIRS))
         return set(PURGATORY_DISABLED_PAIRS)
 
-    buckets: dict[tuple[str, str], list[dict]] = {}
+    buckets: dict[tuple[str, str, str], list[dict]] = {}
     for r in rows:
-        k = (r.get("ticker"), r.get("signal"))
+        k = (r.get("strategy") or "purgatory", r.get("ticker"), r.get("signal"))
         if not all(k):
             continue
         buckets.setdefault(k, []).append(r)
 
-    disabled: set[tuple[str, str]] = set()
+    disabled: set[tuple[str, str, str]] = set()
     for key, group in buckets.items():
         if len(group) < _AUTO_DISABLE_MIN_N:
             continue
@@ -3549,8 +3564,8 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
                  ticker, signal_type, window)
         return None
 
-    # --- Filter: auto-disabled (ticker, direction) pairs ---
-    if (ticker, signal_type) in _get_disabled_pairs():
+    # --- Filter: auto-disabled (strategy, ticker, direction) pairs ---
+    if ("purgatory", ticker, signal_type) in _get_disabled_pairs():
         log.info("Purgatory filter (%s %s): pair auto-disabled (poor 30d record) — skipping",
                  ticker, signal_type)
         return None
@@ -3570,6 +3585,404 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
     }
 
 
+# ----------------------------- Multi-strategy registry -----------------------------
+#
+# Four detectors run alongside Purgatory, signals-only: they log + alert but
+# place no orders until promoted into STRATEGIES_TRADING after ~2 weeks of
+# scored outcomes show an edge (promotion gate: >=30 scored, >=50% wr,
+# avg favorable_15m > +0.05%).
+#
+# Purgatory keeps its 4-min bars and internal filters untouched. The new
+# detectors share one 1-min indicator frame per ticker per pass
+# (_build_intraday_context) — computed once, passed to all four.
+
+_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze")
+
+_STRATEGY_LABELS = {
+    "purgatory":      "PURG",
+    "orb":            "ORB",
+    "vwap_reversion": "VWAP-R",
+    "ema_pullback":   "EMA-PB",
+    "bb_squeeze":     "BB-SQZ",
+}
+
+# Per-strategy chop-window skips. Deliberately NOT the global _CHOP_WINDOWS:
+# VWAP reversion's prime window is exactly the midday chop Purgatory avoids.
+_STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
+    "purgatory":      set(),   # detector applies _CHOP_WINDOWS internally
+    "orb":            set(),   # active window 9:45-11:00 is the constraint
+    "vwap_reversion": set(),   # active window 11:00-14:30 is the constraint
+    "ema_pullback":   {"open_first_15", "close_chop"},
+    "bb_squeeze":     {"open_first_15", "close_chop"},
+}
+
+# Cooldown between signals, per (strategy, ticker, direction) — except
+# bb_squeeze which cools down per ticker regardless of direction.
+# Purgatory gets 0 to preserve its existing fresh-cross-only behavior.
+_STRATEGY_COOLDOWN_MIN = {
+    "purgatory": 0, "orb": 30, "vwap_reversion": 30, "ema_pullback": 30, "bb_squeeze": 60,
+}
+_STRATEGY_TICKER_SCOPE_COOLDOWN = {"bb_squeeze"}
+_strategy_last_fired: dict[tuple, float] = {}
+
+
+def _parse_strategy_csv(env_name: str, default: tuple[str, ...] | set[str]) -> set[str]:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return set(default)
+    vals = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    unknown = vals - set(_ALL_STRATEGIES)
+    if unknown:
+        log.warning("%s contains unknown strategies %s — ignored", env_name, sorted(unknown))
+    return vals & set(_ALL_STRATEGIES)
+
+
+STRATEGIES_ENABLED = _parse_strategy_csv("STRATEGIES_ENABLED", _ALL_STRATEGIES)
+STRATEGIES_TRADING = _parse_strategy_csv("STRATEGIES_TRADING", {"purgatory"}) & STRATEGIES_ENABLED
+
+# Strategy tuning knobs (env-overridable)
+ORB_RANGE_MINUTES = int(os.environ.get("ORB_RANGE_MINUTES", "15"))
+ORB_VOL_MULT = float(os.environ.get("ORB_VOL_MULT", "1.5"))
+ORB_CUTOFF_ET = os.environ.get("ORB_CUTOFF_ET", "11:00").strip()
+VWAPR_SIGMA = float(os.environ.get("VWAPR_SIGMA", "2.0"))
+VWAPR_WINDOW_ET = os.environ.get("VWAPR_WINDOW_ET", "11:00-14:30").strip()
+EMA_PB_TREND_BARS = int(os.environ.get("EMA_PB_TREND_BARS", "15"))
+BB_SQUEEZE_PCTILE = float(os.environ.get("BB_SQUEEZE_PCTILE", "25"))
+BB_VOL_MULT = float(os.environ.get("BB_VOL_MULT", "1.5"))
+
+
+def _parse_hhmm_to_mins(s: str, default_mins: int) -> int:
+    try:
+        h, m = s.strip().split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, AttributeError):
+        return default_mins
+
+
+_ORB_CUTOFF_MIN = _parse_hhmm_to_mins(ORB_CUTOFF_ET, 660)
+_vwapr_parts = VWAPR_WINDOW_ET.split("-")
+_VWAPR_START_MIN = _parse_hhmm_to_mins(_vwapr_parts[0] if _vwapr_parts else "", 660)
+_VWAPR_END_MIN = _parse_hhmm_to_mins(_vwapr_parts[1] if len(_vwapr_parts) > 1 else "", 870)
+
+
+def _strategy_cooldown_ok(strategy: str, ticker: str, direction: str) -> bool:
+    cd = _STRATEGY_COOLDOWN_MIN.get(strategy, 30)
+    if cd <= 0:
+        return True
+    key = (strategy, ticker) if strategy in _STRATEGY_TICKER_SCOPE_COOLDOWN \
+        else (strategy, ticker, direction)
+    last = _strategy_last_fired.get(key)
+    return last is None or (time.time() - last) >= cd * 60
+
+
+def _strategy_mark_fired(strategy: str, ticker: str, direction: str) -> None:
+    key = (strategy, ticker) if strategy in _STRATEGY_TICKER_SCOPE_COOLDOWN \
+        else (strategy, ticker, direction)
+    _strategy_last_fired[key] = time.time()
+
+
+def _passes_common_strategy_filters(sig: dict[str, Any]) -> bool:
+    """Window-skip + disabled-pairs + cooldown for the registry strategies.
+    Purgatory self-filters windows and disabled pairs inside its detector,
+    so only the (no-op) cooldown applies to it here."""
+    strat = sig["strategy"]
+    if strat != "purgatory":
+        if sig.get("window") in _STRATEGY_SKIP_WINDOWS.get(strat, set()):
+            return False
+        if (strat, sig["ticker"], sig["signal"]) in _get_disabled_pairs():
+            log.info("%s filter (%s %s): pair disabled — skipping",
+                     strat, sig["ticker"], sig["signal"])
+            return False
+    return _strategy_cooldown_ok(strat, sig["ticker"], sig["signal"])
+
+
+def _build_intraday_context(bars: list[dict]) -> dict[str, Any] | None:
+    """One shared 1-min indicator frame per ticker per scan pass, consumed
+    by every non-purgatory detector. Column conventions mirror the purgatory
+    detector: EMAs warm up over the whole fetched window, VWAP resets per ET
+    day using typical price. The volume-weighted band sigma uses the
+    identity Var = E[p²] − E[p]² (both expectations volume-weighted), which
+    keeps it O(n) instead of re-scanning the session per bar.
+
+    `today` keeps the frame's positional index labels so detectors can do
+    trailing-window arithmetic against the full frame (BB squeeze needs
+    yesterday's bars in its 120-bar percentile window)."""
+    if not bars or len(bars) < 30:
+        return None
+    df = pd.DataFrame(bars)
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df = df.sort_values("t").reset_index(drop=True)
+    for col in ("o", "h", "l", "c", "v"):
+        df[col] = df[col].astype(float)
+    et_t = df["t"].dt.tz_convert("America/New_York")
+    df["date"] = et_t.dt.date
+    df["mins"] = et_t.dt.hour * 60 + et_t.dt.minute
+
+    df["ema9"] = df["c"].ewm(span=9, adjust=False).mean()
+    df["ema30"] = df["c"].ewm(span=30, adjust=False).mean()
+
+    typ = (df["h"] + df["l"] + df["c"]) / 3
+    df["_tpv"] = typ * df["v"]
+    df["_cv"] = df["c"] * df["v"]
+    df["_c2v"] = df["c"] * df["c"] * df["v"]
+    g = df.groupby("date")
+    cum_v = g["v"].cumsum().replace(0, np.nan)
+    df["vwap"] = g["_tpv"].cumsum() / cum_v
+    # Band sigma from CLOSE dispersion (not typical price): the reversion
+    # trigger compares closes to the band, and closes are noisier than
+    # typical prices — a typ-based sigma makes the band too tight and
+    # "prev bar inside band" rarely holds.
+    ec = g["_cv"].cumsum() / cum_v
+    ec2 = g["_c2v"].cumsum() / cum_v
+    df["vwap_sigma"] = np.sqrt((ec2 - ec ** 2).clip(lower=0))
+
+    mid = df["c"].rolling(20).mean()
+    sd = df["c"].rolling(20).std(ddof=0)
+    df["bb_up"] = mid + 2 * sd
+    df["bb_lo"] = mid - 2 * sd
+    df["bb_bw"] = (df["bb_up"] - df["bb_lo"]) / mid.replace(0, np.nan)
+    # Trailing percentile threshold, excluding the current bar. min_periods
+    # lets the squeeze test work from ~bar 90 of a session instead of
+    # requiring the full 120-bar history (a fresh day plus sparse pre-market
+    # IEX bars often won't have 140 bars until midday).
+    df["bb_bw_thresh"] = (df["bb_bw"].shift(1)
+                          .rolling(120, min_periods=60)
+                          .quantile(BB_SQUEEZE_PCTILE / 100.0))
+    # 75th percentile guards against a degenerate flat-bandwidth history:
+    # a real squeeze must also be compressed vs the wider distribution,
+    # not just "lowest quartile of values that are all identical".
+    df["bb_bw_q75"] = (df["bb_bw"].shift(1)
+                       .rolling(120, min_periods=60)
+                       .quantile(0.75))
+
+    # Trailing 20-bar average volume, excluding the current bar
+    df["vol20"] = df["v"].shift(1).rolling(20).mean()
+
+    today_date = df["date"].iloc[-1]
+    today = df[(df["date"] == today_date) & (df["mins"] >= 570) & (df["mins"] < 960)]
+    if len(today) < 2:
+        return None
+    return {"df": df, "today": today}
+
+
+def _mk_strategy_signal(strategy: str, ticker: str, direction: str,
+                        cur: Any, meta: dict[str, Any]) -> dict[str, Any]:
+    bar_time_iso = cur["t"].isoformat()
+    return {
+        "strategy": strategy,
+        "ticker":   ticker,
+        "signal":   direction,
+        "bar_time": bar_time_iso,
+        "price":    float(cur["c"]),
+        "window":   _bar_window_category(bar_time_iso),
+        "meta":     meta,
+    }
+
+
+def _check_orb_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """Opening Range Breakout: first 1-min close beyond the 9:30-9:45 ET
+    range on >=1.5x volume, entries 9:45-11:00 ET only. The first-breakout
+    requirement makes it stateless: at most one chance per direction per
+    day, and a breakout bar that fails the volume filter forfeits it."""
+    today = ctx["today"]
+    or_end = 570 + ORB_RANGE_MINUTES
+    cur = today.iloc[-1]
+    if not (or_end <= cur["mins"] < _ORB_CUTOFF_MIN):
+        return None
+    or_bars = today[today["mins"] < or_end]
+    # IEX can miss quiet minutes; accept a mostly-complete range
+    if len(or_bars) < max(3, ORB_RANGE_MINUTES - 5):
+        return None
+    or_high = float(or_bars["h"].max())
+    or_low = float(or_bars["l"].min())
+    rng_pct = (or_high - or_low) / float(cur["c"]) * 100.0
+    if not (0.10 <= rng_pct <= 1.50):
+        return None
+
+    post = today[today["mins"] >= or_end].reset_index(drop=True)
+    if len(post) < 1:
+        return None
+    last = len(post) - 1
+    above = post.index[post["c"] > or_high]
+    below = post.index[post["c"] < or_low]
+    direction = None
+    if len(above) and above[0] == last:
+        direction = "call"
+    elif len(below) and below[0] == last:
+        direction = "put"
+    if not direction:
+        return None
+
+    vol20 = float(cur["vol20"]) if cur["vol20"] == cur["vol20"] else 0.0  # NaN guard
+    if vol20 <= 0:
+        return None
+    vol_ratio = float(cur["v"]) / vol20
+    if vol_ratio < ORB_VOL_MULT:
+        return None
+
+    return _mk_strategy_signal("orb", ticker, direction, cur, {
+        "or_high":      round(or_high, 4),
+        "or_low":       round(or_low, 4),
+        "or_range_pct": round(rng_pct, 3),
+        "vol_ratio":    round(vol_ratio, 2),
+    })
+
+
+def _check_vwap_reversion_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """Fade a fresh close beyond the VWAP ± 2σ band, back toward VWAP.
+    Only in the 11:00-14:30 ET chop, and never on trend days (reversion's
+    documented failure mode) — reuses the Purgatory trend threshold."""
+    today = ctx["today"]
+    if len(today) < 5:
+        return None
+    cur, prev = today.iloc[-1], today.iloc[-2]
+    if not (_VWAPR_START_MIN <= cur["mins"] < _VWAPR_END_MIN):
+        return None
+    sigma, psigma = float(cur["vwap_sigma"]), float(prev["vwap_sigma"])
+    if not (sigma > 0 and psigma > 0):   # also rejects NaN
+        return None
+
+    day_open = float(today.iloc[0]["o"])
+    day_move_pct = (float(cur["c"]) - day_open) / day_open * 100.0
+    if abs(day_move_pct) > PURGATORY_TREND_FILTER_PCT:
+        return None
+
+    up_cur = float(cur["vwap"]) + VWAPR_SIGMA * sigma
+    lo_cur = float(cur["vwap"]) - VWAPR_SIGMA * sigma
+    up_prev = float(prev["vwap"]) + VWAPR_SIGMA * psigma
+    lo_prev = float(prev["vwap"]) - VWAPR_SIGMA * psigma
+
+    direction = None
+    if float(cur["c"]) >= up_cur and float(prev["c"]) < up_prev:
+        direction = "put"    # fade the up-stretch
+    elif float(cur["c"]) <= lo_cur and float(prev["c"]) > lo_prev:
+        direction = "call"   # fade the down-stretch
+    if not direction:
+        return None
+
+    return _mk_strategy_signal("vwap_reversion", ticker, direction, cur, {
+        "deviation_sigma": round((float(cur["c"]) - float(cur["vwap"])) / sigma, 2),
+        "vwap":            round(float(cur["vwap"]), 4),
+        "band_upper":      round(up_cur, 4),
+        "band_lower":      round(lo_cur, 4),
+        "day_move_pct":    round(day_move_pct, 3),
+    })
+
+
+def _check_ema_pullback_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """Trend-continuation: established EMA9>EMA30>VWAP trend, an orderly
+    low-volume pullback below EMA9 (holding EMA30) in the last 5 bars, then
+    a recross above EMA9 that also takes out the prior bar's high."""
+    today = ctx["today"]
+    if len(today) < EMA_PB_TREND_BARS + 2:
+        return None
+    cur, prev = today.iloc[-1], today.iloc[-2]
+    trend = today.iloc[-EMA_PB_TREND_BARS:]
+    call_trend = bool(((trend["ema9"] > trend["ema30"]) & (trend["ema30"] > trend["vwap"])).all())
+    put_trend = bool(((trend["ema9"] < trend["ema30"]) & (trend["ema30"] < trend["vwap"])).all())
+    if not (call_trend or put_trend):
+        return None
+
+    lookback = today.iloc[-6:-1]   # the 5 bars before cur
+    direction = None
+    if call_trend:
+        pb = lookback[(lookback["c"] < lookback["ema9"]) & (lookback["c"] > lookback["ema30"])
+                      & (lookback["v"] < lookback["vol20"])]
+        if len(pb) and float(cur["c"]) > float(cur["ema9"]) \
+                and float(prev["c"]) < float(prev["ema9"]) and float(cur["c"]) > float(prev["h"]):
+            direction = "call"
+            depth_pct = float(((pb["ema9"] - pb["c"]) / pb["c"]).max() * 100.0)
+            vol_ratio = float((pb["v"] / pb["vol20"]).min())
+    elif put_trend:
+        pb = lookback[(lookback["c"] > lookback["ema9"]) & (lookback["c"] < lookback["ema30"])
+                      & (lookback["v"] < lookback["vol20"])]
+        if len(pb) and float(cur["c"]) < float(cur["ema9"]) \
+                and float(prev["c"]) > float(prev["ema9"]) and float(cur["c"]) < float(prev["l"]):
+            direction = "put"
+            depth_pct = float(((pb["c"] - pb["ema9"]) / pb["c"]).max() * 100.0)
+            vol_ratio = float((pb["v"] / pb["vol20"]).min())
+    if not direction:
+        return None
+
+    # Count how long the trend has actually been in place (may exceed the minimum)
+    trend_bars = 0
+    for i in range(len(today) - 1, -1, -1):
+        row = today.iloc[i]
+        if call_trend and row["ema9"] > row["ema30"] and row["ema30"] > row["vwap"]:
+            trend_bars += 1
+        elif put_trend and row["ema9"] < row["ema30"] and row["ema30"] < row["vwap"]:
+            trend_bars += 1
+        else:
+            break
+
+    return _mk_strategy_signal("ema_pullback", ticker, direction, cur, {
+        "trend_bars":        trend_bars,
+        "pullback_depth_pct": round(depth_pct, 3),
+        "pullback_vol_ratio": round(vol_ratio, 2),
+    })
+
+
+def _check_bb_squeeze_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """Volatility-compression breakout: BB(20,2) bandwidth pinned in the
+    lowest 25th percentile of the trailing 120 bars for >=10 consecutive
+    bars, then a volume-confirmed close outside the band, agreeing with the
+    VWAP side. Weakest evidence of the four — strictest filters."""
+    df, today = ctx["df"], ctx["today"]
+    if len(today) < 2:
+        return None
+    cur, prev = today.iloc[-1], today.iloc[-2]
+    cur_pos = int(today.index[-1])
+    if cur_pos < 91:   # 20 BB warmup + 60 min percentile window + 10 squeeze + breakout
+        return None
+
+    sq = df.iloc[cur_pos - 10:cur_pos]
+    sq_ok = (sq["bb_bw"] <= sq["bb_bw_thresh"]) & (sq["bb_bw"] <= 0.5 * sq["bb_bw_q75"])
+    if sq_ok.isna().any() or not bool(sq_ok.all()):
+        return None
+
+    vol20 = float(cur["vol20"]) if cur["vol20"] == cur["vol20"] else 0.0
+    if vol20 <= 0:
+        return None
+    vol_ratio = float(cur["v"]) / vol20
+    if vol_ratio < BB_VOL_MULT:
+        return None
+
+    direction = None
+    if float(cur["c"]) > float(cur["bb_up"]) and float(prev["c"]) <= float(prev["bb_up"]) \
+            and float(cur["c"]) > float(cur["vwap"]):
+        direction = "call"
+    elif float(cur["c"]) < float(cur["bb_lo"]) and float(prev["c"]) >= float(prev["bb_lo"]) \
+            and float(cur["c"]) < float(cur["vwap"]):
+        direction = "put"
+    if not direction:
+        return None
+
+    squeeze_bars = 0
+    for i in range(cur_pos - 1, -1, -1):
+        bw, th = df["bb_bw"].iloc[i], df["bb_bw_thresh"].iloc[i]
+        if bw == bw and th == th and bw <= th:
+            squeeze_bars += 1
+        else:
+            break
+
+    return _mk_strategy_signal("bb_squeeze", ticker, direction, cur, {
+        "bandwidth":        round(float(cur["bb_bw"]), 5),
+        "bandwidth_pctile": BB_SQUEEZE_PCTILE,
+        "squeeze_bars":     squeeze_bars,
+        "vol_ratio":        round(vol_ratio, 2),
+    })
+
+
+# 1-min detectors, dispatched from the scan loop. Purgatory is handled
+# separately (4-min bars, legacy signature).
+_STRATEGY_DETECTORS_1MIN = {
+    "orb":            _check_orb_signal,
+    "vwap_reversion": _check_vwap_reversion_signal,
+    "ema_pullback":   _check_ema_pullback_signal,
+    "bb_squeeze":     _check_bb_squeeze_signal,
+}
+
+
 # --- Signal persistence + outcome back-fill (Supabase) ---
 
 _PURGATORY_SIGNALS_TABLE = "purgatory_signals"
@@ -3578,11 +3991,13 @@ _PURGATORY_SIGNALS_TABLE = "purgatory_signals"
 def _persist_signal(signal: dict[str, Any]) -> str | None:
     """Insert a signal into Supabase. Returns the new row id (or None if
     Supabase unavailable / insert failed). Idempotent via the unique
-    (ticker, signal, bar_time) constraint — re-inserts return existing row."""
+    (strategy, ticker, signal, bar_time) constraint — re-inserts return
+    existing row."""
     if _supabase_client is None:
         return None
     try:
         res = _supabase_client.table(_PURGATORY_SIGNALS_TABLE).upsert({
+            "strategy":    signal.get("strategy", "purgatory"),
             "ticker":      signal["ticker"],
             "signal":      signal["signal"],
             "bar_time":    signal["bar_time"],
@@ -3591,8 +4006,9 @@ def _persist_signal(signal: dict[str, Any]) -> str | None:
             "ema9":        signal.get("ema9"),
             "ema30":       signal.get("ema30"),
             "vwap":        signal.get("vwap"),
+            "meta":        signal.get("meta"),
             "slack_sent":  signal.get("slack_sent", False),
-        }, on_conflict="ticker,signal,bar_time").execute()
+        }, on_conflict="strategy,ticker,signal,bar_time").execute()
         if res.data and isinstance(res.data, list) and res.data:
             return res.data[0].get("id")
     except Exception as exc:  # noqa: BLE001
@@ -3600,18 +4016,20 @@ def _persist_signal(signal: dict[str, Any]) -> str | None:
     return None
 
 
-def _fetch_persisted_signals(limit: int = 100) -> list[dict[str, Any]]:
+def _fetch_persisted_signals(limit: int = 100, strategy: str | None = None) -> list[dict[str, Any]]:
     """Pull recent signals from Supabase. Returns newest first."""
     if _supabase_client is None:
         return []
     try:
-        res = (
+        q = (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("*")
             .order("alerted_at", desc=True)
             .limit(limit)
-            .execute()
         )
+        if strategy:
+            q = q.eq("strategy", strategy)
+        res = q.execute()
         return list(res.data or [])
     except Exception as exc:  # noqa: BLE001
         log.warning("Supabase signal fetch failed: %s", exc)
@@ -3733,16 +4151,18 @@ def _backfill_outcomes_for_matured_signals() -> int:
     return n_backfilled
 
 
-def _recent_stats_for_ticker_direction(ticker: str, direction: str, n: int = 10) -> dict[str, Any] | None:
+def _recent_stats_for_ticker_direction(ticker: str, direction: str, n: int = 10,
+                                       strategy: str = "purgatory") -> dict[str, Any] | None:
     """Return win-rate + average favorable for the last N signals on
-    (ticker, direction). Only counts signals where outcome has been scored
-    (i.e., not the brand-new one we're currently firing)."""
+    (strategy, ticker, direction). Only counts signals where outcome has
+    been scored (i.e., not the brand-new one we're currently firing)."""
     if _supabase_client is None:
         return None
     try:
         res = (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("outcome, favorable_10m, favorable_15m")
+            .eq("strategy", strategy)
             .eq("ticker", ticker)
             .eq("signal", direction)
             .not_.is_("outcome", "null")
@@ -3788,18 +4208,32 @@ def _send_slack_alert(signal: dict[str, Any], stats: dict[str, Any] | None = Non
     else:
         window_note = f"⚠️ *Soft window* ({_window_label(window)}) — outside the strongest windows"
 
-    fields = [
-        {"type": "mrkdwn", "text": f"*EMA 5/9/30*\n{signal['ema5']:.2f} / {signal['ema9']:.2f} / {signal['ema30']:.2f}"},
-        {"type": "mrkdwn", "text": f"*VWAP*\n{signal['vwap']:.2f}"},
-        {"type": "mrkdwn", "text": f"*Bar time*\n{signal['bar_time']}"},
-    ]
-    if "depth_pct" in signal and "day_move_pct" in signal:
-        fields.append({"type": "mrkdwn",
-            "text": f"*Breakout depth*\n{signal['depth_pct']:.3f}% · day {signal['day_move_pct']:+.2f}%"})
+    strategy = signal.get("strategy", "purgatory")
+    label = _STRATEGY_LABELS.get(strategy, strategy.upper())
 
+    if strategy == "purgatory":
+        # Legacy rich format — EMA stack + breakout depth
+        fields = [
+            {"type": "mrkdwn", "text": f"*EMA 5/9/30*\n{signal['ema5']:.2f} / {signal['ema9']:.2f} / {signal['ema30']:.2f}"},
+            {"type": "mrkdwn", "text": f"*VWAP*\n{signal['vwap']:.2f}"},
+            {"type": "mrkdwn", "text": f"*Bar time*\n{signal['bar_time']}"},
+        ]
+        if "depth_pct" in signal and "day_move_pct" in signal:
+            fields.append({"type": "mrkdwn",
+                "text": f"*Breakout depth*\n{signal['depth_pct']:.3f}% · day {signal['day_move_pct']:+.2f}%"})
+    else:
+        # Generic format — render each strategy's meta dict
+        fields = [{"type": "mrkdwn", "text": f"*Bar time*\n{signal['bar_time']}"}]
+        for k, v in (signal.get("meta") or {}).items():
+            pretty = k.replace("_", " ").capitalize()
+            v_str = f"{v:g}" if isinstance(v, (int, float)) else str(v)
+            fields.append({"type": "mrkdwn", "text": f"*{pretty}*\n{v_str}"})
+        fields = fields[:10]   # Slack caps section fields at 10
+
+    tag = "" if strategy in STRATEGIES_TRADING else " (signals-only — no auto-trade yet)"
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn",
-            "text": f"{emoji} *{ticker}* — Purgatory signal: *{direction}*  @  *${price:.2f}*"}},
+            "text": f"{emoji} *[{label}]* *{ticker}* — *{direction}*  @  *${price:.2f}*{tag}"}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": window_note}]},
         {"type": "section", "fields": fields},
     ]
@@ -3808,16 +4242,21 @@ def _send_slack_alert(signal: dict[str, Any], stats: dict[str, Any] | None = Non
         avg_str = f"avg +0.00%" if stats.get("avg_favorable_15m") is None else f"avg {stats['avg_favorable_15m']:+.2f}%"
         blocks.append({"type": "context", "elements": [
             {"type": "mrkdwn",
-                "text": (f"📊 *Last {stats['n']} {ticker} {signal['signal'].upper()}s*: "
+                "text": (f"📊 *Last {stats['n']} {label} {ticker} {signal['signal'].upper()}s*: "
                          f"{stats['wins']}/{stats['n']} wins ({stats['win_rate_pct']:.0f}%) · "
                          f"{avg_str} favorable @ +15m")}
         ]})
 
-    blocks.append({"type": "context", "elements": [
-        {"type": "mrkdwn", "text": "Hold target: ~20–25 min from signal close (42% of winners peak at +20m). Not investment advice."}
-    ]})
+    if strategy in STRATEGIES_TRADING:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "Hold target: ~20–25 min from signal close (42% of winners peak at +20m). Not investment advice."}
+        ]})
+    else:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": "Validation phase — outcome scoring only, promotion gate at ≥30 scored signals. Not investment advice."}
+        ]})
 
-    payload = {"text": f"{emoji} {ticker} — Purgatory {direction} @ ${price:.2f}", "blocks": blocks}
+    payload = {"text": f"{emoji} [{label}] {ticker} — {direction} @ ${price:.2f}", "blocks": blocks}
     try:
         r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
         return 200 <= r.status_code < 300
@@ -3892,47 +4331,86 @@ def purgatory_scan():
 
     tickers = sorted(_purgatory_watchlist)
     new_signals: list[dict[str, Any]] = []
+    by_strategy: dict[str, int] = {}
 
     if tickers:
-        # One batched API call for all watched symbols
+        # One batched API call for all watched symbols (Purgatory, 4-min)
         try:
             bars_by_sym = _fetch_alpaca_bars(tickers, timeframe="4Min", lookback_hours=24)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(502, f"Alpaca fetch failed: {exc}") from exc
 
-        for t in tickers:
-            bars = bars_by_sym.get(t) or []
-            sig = _check_purgatory_signal(t, bars)
-            if not sig:
-                continue
-            # Dedupe by (ticker, signal-type, bar_time)
-            key = (t, sig["signal"], sig["bar_time"])
-            if key in _purgatory_alerted:
-                continue
-            _purgatory_alerted[key] = time.time()
-            sig["alerted_at"] = _now_iso()
-
-            # Look up recent stats for this ticker+direction to enrich the alert (C)
-            stats = _recent_stats_for_ticker_direction(t, sig["signal"], n=10)
-            sig["recent_stats"] = stats
-
-            sig["slack_sent"] = _send_slack_alert(sig, stats=stats)
-
-            # Auto-trade the signal (paper by default; requires
-            # ALPACA_TRADING_ENABLED=1). Wrapped so a broker error can't
-            # block persistence or the rest of the scan.
+        # Second batched call for the 1-min registry strategies. A failure
+        # here degrades to purgatory-only rather than failing the scan.
+        active_1min = [k for k in _STRATEGY_DETECTORS_1MIN if k in STRATEGIES_ENABLED]
+        ctx_by_sym: dict[str, dict[str, Any] | None] = {}
+        if active_1min:
             try:
-                _maybe_place_trade_for_signal(sig)
+                bars1_by_sym = _fetch_alpaca_bars(tickers, timeframe="1Min", lookback_hours=12)
+                for t in tickers:
+                    try:
+                        ctx_by_sym[t] = _build_intraday_context(bars1_by_sym.get(t) or [])
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Intraday context build failed for %s: %s", t, exc)
+                        ctx_by_sym[t] = None
             except Exception as exc:  # noqa: BLE001
-                log.warning("Auto-trade entry failed for %s %s: %s", t, sig["signal"], exc)
+                log.warning("1-min bar fetch failed (%s); registry strategies skipped this pass", exc)
+                active_1min = []
 
-            new_signals.append(sig)
-            _purgatory_signals.append(sig)
-            if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
-                del _purgatory_signals[:-_PURGATORY_MAX_SIGNALS]
+        for t in tickers:
+            # Collect candidates from every enabled detector for this ticker
+            candidates: list[dict[str, Any]] = []
+            if "purgatory" in STRATEGIES_ENABLED:
+                sig = _check_purgatory_signal(t, bars_by_sym.get(t) or [])
+                if sig:
+                    sig["strategy"] = "purgatory"
+                    candidates.append(sig)
+            ctx = ctx_by_sym.get(t)
+            if ctx is not None:
+                for skey in active_1min:
+                    try:
+                        s2 = _STRATEGY_DETECTORS_1MIN[skey](t, ctx)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Detector %s failed for %s: %s", skey, t, exc)
+                        s2 = None
+                    if s2:
+                        candidates.append(s2)
 
-            # Persist to Supabase
-            _persist_signal(sig)
+            for sig in candidates:
+                if not _passes_common_strategy_filters(sig):
+                    continue
+                # Dedupe by (strategy, ticker, signal-type, bar_time)
+                key = (sig["strategy"], t, sig["signal"], sig["bar_time"])
+                if key in _purgatory_alerted:
+                    continue
+                _purgatory_alerted[key] = time.time()
+                _strategy_mark_fired(sig["strategy"], t, sig["signal"])
+                sig["alerted_at"] = _now_iso()
+
+                # Recent stats for this strategy+ticker+direction enrich the alert
+                stats = _recent_stats_for_ticker_direction(t, sig["signal"], n=10,
+                                                           strategy=sig["strategy"])
+                sig["recent_stats"] = stats
+
+                sig["slack_sent"] = _send_slack_alert(sig, stats=stats)
+
+                # Auto-trade the signal (paper by default; only strategies in
+                # STRATEGIES_TRADING place orders). Wrapped so a broker error
+                # can't block persistence or the rest of the scan.
+                try:
+                    _maybe_place_trade_for_signal(sig)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Auto-trade entry failed for %s %s %s: %s",
+                                sig["strategy"], t, sig["signal"], exc)
+
+                new_signals.append(sig)
+                by_strategy[sig["strategy"]] = by_strategy.get(sig["strategy"], 0) + 1
+                _purgatory_signals.append(sig)
+                if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
+                    del _purgatory_signals[:-_PURGATORY_MAX_SIGNALS]
+
+                # Persist to Supabase
+                _persist_signal(sig)
 
     # Back-fill outcomes for matured signals (>= 25 min old, no outcome yet).
     # Runs every scan so the data piles up over the trading day.
@@ -3968,6 +4446,7 @@ def purgatory_scan():
         "scanned":         len(tickers),
         "tickers":         tickers,
         "signals":         new_signals,
+        "by_strategy":     by_strategy,
         "backfilled":      n_backfilled,
         "trades_closed":   n_closed,
         "trades_updated":  n_reconciled,
@@ -3977,16 +4456,18 @@ def purgatory_scan():
 
 
 @app.get("/purgatory/signals")
-def purgatory_signals_get(limit: int = 50):
+def purgatory_signals_get(limit: int = 50, strategy: str | None = None):
     """Recent signals. Prefers Supabase (survives redeploys, includes
-    back-filled outcomes); falls back to in-memory list."""
+    back-filled outcomes); falls back to in-memory list. Optional
+    ?strategy= narrows to one strategy."""
     limit = max(1, min(int(limit), _PURGATORY_MAX_SIGNALS))
-    persisted = _fetch_persisted_signals(limit=limit)
+    persisted = _fetch_persisted_signals(limit=limit, strategy=strategy)
     if persisted:
         # Normalize keys to match the frontend's expectations
         normalized = []
         for s in persisted:
             normalized.append({
+                "strategy":      s.get("strategy") or "purgatory",
                 "ticker":        s.get("ticker"),
                 "signal":        s.get("signal"),
                 "bar_time":      s.get("bar_time"),
@@ -3995,6 +4476,7 @@ def purgatory_signals_get(limit: int = 50):
                 "ema9":          s.get("ema9"),
                 "ema30":         s.get("ema30"),
                 "vwap":          s.get("vwap"),
+                "meta":          s.get("meta"),
                 "alerted_at":    s.get("alerted_at"),
                 "slack_sent":    s.get("slack_sent"),
                 "outcome":       s.get("outcome"),
@@ -4006,46 +4488,53 @@ def purgatory_signals_get(limit: int = 50):
                 "favorable_30m": s.get("favorable_30m"),
             })
         return {"signals": normalized, "source": "supabase"}
+    mem = _purgatory_signals
+    if strategy:
+        mem = [s for s in mem if (s.get("strategy") or "purgatory") == strategy]
     return {
-        "signals": list(reversed(_purgatory_signals[-limit:])),
+        "signals": list(reversed(mem[-limit:])),
         "source": "memory",
     }
 
 
 @app.get("/purgatory/stats")
-def purgatory_stats(days: int = 30):
-    """Per-(ticker, direction) win rate + average favorable move at +15m
-    over the last `days` days of signals with computed outcomes."""
+def purgatory_stats(days: int = 30, strategy: str | None = None):
+    """Per-(strategy, ticker, direction) win rate + average favorable move
+    at +15m over the last `days` days of signals with computed outcomes.
+    Optional ?strategy= narrows to one strategy."""
     if _supabase_client is None:
         raise HTTPException(503, "Stats require Supabase (SUPABASE_URL / SUPABASE_KEY env vars).")
 
     days = max(1, min(int(days), 365))
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     try:
-        res = (
+        q = (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
-            .select("ticker, signal, outcome, favorable_10m, favorable_15m, favorable_20m")
+            .select("strategy, ticker, signal, outcome, favorable_10m, favorable_15m, favorable_20m")
             .gte("bar_time", since)
             .not_.is_("outcome", "null")
-            .execute()
         )
+        if strategy:
+            q = q.eq("strategy", strategy)
+        res = q.execute()
         rows = list(res.data or [])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Supabase stats query failed: {exc}") from exc
 
-    # Bucket by (ticker, direction)
+    # Bucket by (strategy, ticker, direction)
     buckets: dict[tuple, list[dict]] = {}
     for r in rows:
-        k = (r.get("ticker"), r.get("signal"))
+        k = (r.get("strategy") or "purgatory", r.get("ticker"), r.get("signal"))
         buckets.setdefault(k, []).append(r)
 
     out = []
-    for (ticker, direction), bucket in sorted(buckets.items()):
+    for (strat, ticker, direction), bucket in sorted(buckets.items()):
         wins = sum(1 for r in bucket if r.get("outcome") == "win")
         losses = sum(1 for r in bucket if r.get("outcome") == "loss")
         flats = sum(1 for r in bucket if r.get("outcome") == "flat")
         f15 = [float(r["favorable_15m"]) for r in bucket if r.get("favorable_15m") is not None]
         out.append({
+            "strategy":            strat,
             "ticker":              ticker,
             "direction":           direction,
             "n":                   len(bucket),
@@ -4088,6 +4577,44 @@ def purgatory_orders_get(date: str | None = None):
     return {"date": date, "updated": n_updated, "trading_enabled": ALPACA_TRADING_ENABLED, **pnl}
 
 
+def _strategy_status_block() -> list[dict[str, Any]]:
+    """Per-strategy health for /purgatory/status: enabled/trading flags and
+    30-day scored-signal record. One grouped query; degrades to flags-only
+    if Supabase is unavailable (or pre-migration)."""
+    counts: dict[str, dict[str, int]] = {}
+    if _supabase_client is not None:
+        try:
+            since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            res = (
+                _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+                .select("strategy, outcome")
+                .gte("bar_time", since)
+                .not_.is_("outcome", "null")
+                .execute()
+            )
+            for r in (res.data or []):
+                k = r.get("strategy") or "purgatory"
+                c = counts.setdefault(k, {"n": 0, "wins": 0})
+                c["n"] += 1
+                if r.get("outcome") == "win":
+                    c["wins"] += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Strategy status query failed: %s", exc)
+
+    out = []
+    for key in _ALL_STRATEGIES:
+        c = counts.get(key)
+        out.append({
+            "strategy":     key,
+            "label":        _STRATEGY_LABELS.get(key, key),
+            "enabled":      key in STRATEGIES_ENABLED,
+            "trading":      key in STRATEGIES_TRADING,
+            "signals_30d":  c["n"] if c else 0,
+            "win_rate_30d": round(c["wins"] / c["n"] * 100.0, 1) if c and c["n"] else None,
+        })
+    return out
+
+
 @app.get("/purgatory/status")
 def purgatory_status():
     disabled = sorted(_get_disabled_pairs())
@@ -4099,13 +4626,16 @@ def purgatory_status():
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
-        "manual_disabled_pairs":   [{"ticker": t, "direction": d} for t, d in sorted(PURGATORY_DISABLED_PAIRS)],
+        "strategies":              _strategy_status_block(),
+        "manual_disabled_pairs":   [{"strategy": s, "ticker": t, "direction": d}
+                                    for s, t, d in sorted(PURGATORY_DISABLED_PAIRS)],
         "watchlist_count":         len(_purgatory_watchlist),
         "watchlist":               sorted(_purgatory_watchlist),
         "signals_logged":          len(_purgatory_signals),
         "min_breakout_pct":        PURGATORY_MIN_BREAKOUT_PCT,
         "trend_filter_pct":        PURGATORY_TREND_FILTER_PCT,
-        "auto_disabled_pairs":     [{"ticker": t, "direction": d} for t, d in disabled],
+        "auto_disabled_pairs":     [{"strategy": s, "ticker": t, "direction": d}
+                                    for s, t, d in disabled],
         "supabase_signals":        _supabase_client is not None,
         "last_scan_at":            _last_scan_at,
         "ts":                      _now_iso(),
@@ -4255,6 +4785,30 @@ def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
             "win_rate_pct":   (d_wins / max(d_wins + d_losses + d_flats, 1)) * 100.0,
         }
 
+    # Per-strategy summary
+    per_strategy: dict[str, dict[str, Any]] = {}
+    for s in signals:
+        k = s.get("strategy") or "purgatory"
+        b = per_strategy.setdefault(k, {"n": 0, "wins": 0, "losses": 0, "flats": 0,
+                                        "pending": 0, "_f15": []})
+        b["n"] += 1
+        oc = s.get("outcome")
+        if oc == "win":
+            b["wins"] += 1
+        elif oc == "loss":
+            b["losses"] += 1
+        elif oc == "flat":
+            b["flats"] += 1
+        else:
+            b["pending"] += 1
+        if s.get("favorable_15m") is not None:
+            b["_f15"].append(float(s["favorable_15m"]))
+    for b in per_strategy.values():
+        s_scored = b["wins"] + b["losses"] + b["flats"]
+        b["win_rate_pct"] = (b["wins"] / s_scored * 100.0) if s_scored else None
+        f15 = b.pop("_f15")
+        b["avg_favorable_15m"] = (sum(f15) / len(f15)) if f15 else None
+
     # Daily P&L estimate — sum of favorables (in %), summed over scored
     # signals. A positive sum means hypothetical net-positive day if you
     # took every signal at uniform size and exited at +15m. Doesn't account
@@ -4275,6 +4829,7 @@ def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
         "worst_signal":      _slim(worst),
         "per_ticker":        per_ticker,
         "per_direction":     per_direction,
+        "per_strategy":      per_strategy,
     }
 
 
@@ -4312,9 +4867,24 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
     # Surface what's currently auto-disabled
     disabled = _get_disabled_pairs()
     if disabled:
-        d_str = ", ".join(f"{t} {d.upper()}" for t, d in sorted(disabled))
+        d_str = ", ".join(
+            f"{t} {d.upper()}" if s == "purgatory" else f"{_STRATEGY_LABELS.get(s, s)} {t} {d.upper()}"
+            for s, t, d in sorted(disabled))
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
             "text": f"🚫 Auto-disabled (≥10 scored signals, ≤30% wr or ≤−0.20% avg): `{d_str}`"}]})
+
+    # Per-strategy breakdown — shown once more than one strategy has signals
+    ps = summary.get("per_strategy") or {}
+    if len(ps) > 1:
+        ps_lines = []
+        for k in sorted(ps, key=lambda x: -ps[x]["n"]):
+            v = ps[k]
+            wr = f"{v['win_rate_pct']:.0f}%" if v.get("win_rate_pct") is not None else "—"
+            avg = f" · avg {v['avg_favorable_15m']:+.2f}%@15m" if v.get("avg_favorable_15m") is not None else ""
+            ps_lines.append(f"• *{_STRATEGY_LABELS.get(k, k)}*: {v['n']} signals · "
+                            f"{v['wins']}W/{v['losses']}L/{v['flats']}F · wr {wr}{avg}")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": "*By strategy*\n" + "\n".join(ps_lines)}})
 
     if summary.get("best_signal"):
         b = summary["best_signal"]
@@ -4404,6 +4974,7 @@ def _save_daily_summary(summary: dict[str, Any], slack_posted: bool) -> None:
             "worst_signal":      summary.get("worst_signal"),
             "per_ticker":        summary.get("per_ticker"),
             "per_direction":     summary.get("per_direction"),
+            "per_strategy":      summary.get("per_strategy"),
             "slack_posted":      slack_posted,
         }, on_conflict="date").execute()
     except Exception as exc:  # noqa: BLE001
@@ -4567,9 +5138,9 @@ def purgatory_retro(date: str | None = None):
 
 
 @app.get("/purgatory/summaries")
-def purgatory_summaries(days: int = 30):
-    """Return the last N days of daily summaries. Used by the (next-week)
-    Retro tab in the UI."""
+def purgatory_summaries(days: int = 30, strategy: str | None = None):
+    """Return the last N days of daily summaries. Optional ?strategy=
+    narrows each row's per_strategy breakdown to that one strategy."""
     if _supabase_client is None:
         raise HTTPException(503, "Summaries require Supabase.")
     days = max(1, min(int(days), 365))
@@ -4582,9 +5153,14 @@ def purgatory_summaries(days: int = 30):
             .order("date", desc=True)
             .execute()
         )
-        return {"days": days, "summaries": list(res.data or [])}
+        rows = list(res.data or [])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Supabase query failed: {exc}") from exc
+    if strategy:
+        for row in rows:
+            ps = row.get("per_strategy") or {}
+            row["per_strategy"] = {strategy: ps.get(strategy)} if strategy in ps else {}
+    return {"days": days, "summaries": rows}
 
 
 class _ReplaySignal(BaseModel):
