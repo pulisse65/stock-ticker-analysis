@@ -794,6 +794,7 @@
             <option value="vwap_reversion">VWAP-R — Reversion</option>
             <option value="ema_pullback">EMA-PB — Pullback</option>
             <option value="bb_squeeze">BB-SQZ — Squeeze</option>
+            <option value="orb_ntz">ORB-NTZ — Break + retest</option>
           </select>
         </div>
         <div id="alerts-log" class="text-sm text-ink-dim">No signals yet.</div>
@@ -2901,12 +2902,13 @@ function _outcomeBadge(outcome) {
 
 const STRATEGY_LABELS = {
   purgatory: "PURG", orb: "ORB", vwap_reversion: "VWAP-R",
-  ema_pullback: "EMA-PB", bb_squeeze: "BB-SQZ",
+  ema_pullback: "EMA-PB", bb_squeeze: "BB-SQZ", orb_ntz: "ORB-NTZ",
 };
 const STRATEGY_NAMES = {
   purgatory: "Purgatory — EMA/VWAP cross", orb: "Opening range breakout",
   vwap_reversion: "VWAP band reversion", ema_pullback: "EMA pullback continuation",
   bb_squeeze: "Bollinger squeeze breakout",
+  orb_ntz: "ORB break + retest entry, NTZ-filtered",
 };
 function _strategyBadge(key) {
   const k = key || "purgatory";
