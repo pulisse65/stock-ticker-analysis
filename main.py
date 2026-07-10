@@ -24,6 +24,16 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+# ORB+NTZ strategy module (stdlib-only, lives next to main.py). Aliased
+# imports: the module exports `ET` (the US/Eastern ZoneInfo) which would
+# shadow xml.etree.ElementTree above.
+from orb_ntz_strategy import (
+    Bar as OrbBar,
+    ORBConfig as OrbConfig,
+    ORBEngine as OrbEngine,
+    find_pivot_levels as orb_find_pivot_levels,
+)
+
 log = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Stock Ticker Analysis")
@@ -3596,7 +3606,7 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
 # detectors share one 1-min indicator frame per ticker per pass
 # (_build_intraday_context) — computed once, passed to all four.
 
-_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze")
+_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz")
 
 _STRATEGY_LABELS = {
     "purgatory":      "PURG",
@@ -3604,6 +3614,7 @@ _STRATEGY_LABELS = {
     "vwap_reversion": "VWAP-R",
     "ema_pullback":   "EMA-PB",
     "bb_squeeze":     "BB-SQZ",
+    "orb_ntz":        "ORB-NTZ",
 }
 
 # Per-strategy chop-window skips. Deliberately NOT the global _CHOP_WINDOWS:
@@ -3614,6 +3625,7 @@ _STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
     "vwap_reversion": set(),   # active window 11:00-14:30 is the constraint
     "ema_pullback":   {"open_first_15", "close_chop"},
     "bb_squeeze":     {"open_first_15", "close_chop"},
+    "orb_ntz":        set(),   # engine enforces its own 9:45-11:00 window
 }
 
 # Cooldown between signals, per (strategy, ticker, direction) — except
@@ -3621,6 +3633,9 @@ _STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
 # Purgatory gets 0 to preserve its existing fresh-cross-only behavior.
 _STRATEGY_COOLDOWN_MIN = {
     "purgatory": 0, "orb": 30, "vwap_reversion": 30, "ema_pullback": 30, "bb_squeeze": 60,
+    # orb_ntz: the engine allows one signal per direction per day and the
+    # bar_time dedupe kills replays, so no extra cooldown is needed.
+    "orb_ntz": 0,
 }
 _STRATEGY_TICKER_SCOPE_COOLDOWN = {"bb_squeeze"}
 _strategy_last_fired: dict[tuple, float] = {}
@@ -3649,6 +3664,9 @@ VWAPR_WINDOW_ET = os.environ.get("VWAPR_WINDOW_ET", "11:00-14:30").strip()
 EMA_PB_TREND_BARS = int(os.environ.get("EMA_PB_TREND_BARS", "15"))
 BB_SQUEEZE_PCTILE = float(os.environ.get("BB_SQUEEZE_PCTILE", "25"))
 BB_VOL_MULT = float(os.environ.get("BB_VOL_MULT", "1.5"))
+# ORB+NTZ (break + retest + next-candle entry; see orb_ntz_strategy.py)
+ORB_NTZ_MIN_CONFLUENCE = int(os.environ.get("ORB_NTZ_MIN_CONFLUENCE", "0"))
+ORB_NTZ_REQUIRE_TREND = os.environ.get("ORB_NTZ_REQUIRE_TREND", "").strip() in ("1", "true", "yes")
 
 # Estimated round-trip spread cost in % of the UNDERLYING's move, applied
 # when classifying signal outcomes (win/flat/loss) so the promotion gate
@@ -3980,6 +3998,135 @@ def _check_bb_squeeze_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any]
     })
 
 
+# --- ORB+NTZ: break + retest + next-candle entry (orb_ntz_strategy.py) ---
+#
+# Unlike the other 1-min detectors, the engine is a stateful stream machine,
+# so each scan pass rebuilds it and replays today's bars from the shared
+# 1-min frame. The replay is deterministic: the same session prefix always
+# yields the same signal with the same entry-bar time, so the standard
+# (strategy, ticker, signal, bar_time) dedupe collapses repeats. A freshness
+# check (entry bar within the last few minutes) stops a mid-day restart from
+# re-alerting a morning signal.
+
+# Session context (prev-day RTH high/low + hourly pivot levels) changes once
+# per day — cached per (ticker, ET date) so the extra Alpaca calls happen
+# once each morning, not every minute.
+_orb_ntz_day_ctx: dict[tuple[str, str], dict[str, Any] | None] = {}
+
+
+def _orb_ntz_day_context(ticker: str, et_date: str) -> dict[str, Any] | None:
+    key = (ticker, et_date)
+    if key in _orb_ntz_day_ctx:
+        return _orb_ntz_day_ctx[key]
+    ctx: dict[str, Any] | None = None
+    try:
+        daily = (_fetch_alpaca_bars([ticker], timeframe="1Day", lookback_hours=24 * 10)
+                 .get(ticker) or [])
+        prev = [b for b in daily
+                if str(pd.Timestamp(b["t"]).tz_convert("America/New_York").date()) < et_date]
+        hourly = (_fetch_alpaca_bars([ticker], timeframe="1Hour", lookback_hours=24 * 8)
+                  .get(ticker) or [])
+        hourly_bars = [
+            OrbBar(ts=pd.Timestamp(b["t"]).to_pydatetime(),
+                   open=float(b["o"]), high=float(b["h"]), low=float(b["l"]),
+                   close=float(b["c"]), volume=float(b.get("v") or 0.0))
+            for b in hourly
+        ]
+        if prev:
+            ctx = {
+                "prev_day_high": float(prev[-1]["h"]),
+                "prev_day_low":  float(prev[-1]["l"]),
+                "exit_levels":   orb_find_pivot_levels(hourly_bars),
+            }
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ORB-NTZ day context fetch failed for %s: %s", ticker, exc)
+        return None   # not cached — retried next pass
+    _orb_ntz_day_ctx[key] = ctx
+    # GC stale entries (previous days)
+    for k in [k for k in _orb_ntz_day_ctx if k[1] != et_date]:
+        del _orb_ntz_day_ctx[k]
+    return ctx
+
+
+def _orb_ntz_replay(ticker: str, ctx: dict[str, Any]) -> tuple[Any, list[Any]]:
+    """Rebuild the engine and replay today's bars (premarket included).
+    Returns (engine, signals) — the engine is also used for the NTZ box."""
+    df = ctx["df"]
+    today_date = df["date"].iloc[-1]
+    et_date = str(today_date)
+    day_ctx = _orb_ntz_day_context(ticker, et_date)
+    if day_ctx is None:
+        return None, []
+
+    eng = OrbEngine(ticker, OrbConfig(
+        min_confluence=ORB_NTZ_MIN_CONFLUENCE,
+        allow_without_trend_filter=not ORB_NTZ_REQUIRE_TREND,
+    ))
+    prior = df[df["date"] < today_date]
+    eng.set_session_context(
+        prev_day_high=day_ctx["prev_day_high"],
+        prev_day_low=day_ctx["prev_day_low"],
+        exit_levels=day_ctx["exit_levels"],
+        seed_closes=[float(c) for c in prior["c"]],   # pre-warms 200 SMA (1-min)
+    )
+
+    signals = []
+    for row in df[df["date"] == today_date].itertuples():
+        bar = OrbBar(ts=row.t.to_pydatetime(), open=float(row.o), high=float(row.h),
+                     low=float(row.l), close=float(row.c), volume=float(row.v))
+        s = eng.on_bar(bar)
+        if s:
+            signals.append(s)
+    return eng, signals
+
+
+def _check_orb_ntz_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    _, signals = _orb_ntz_replay(ticker, ctx)
+    if not signals:
+        return None
+    s = signals[-1]
+    # Freshness: only alert when the entry bar just happened; older replayed
+    # signals were either already alerted (deduped) or missed for good.
+    age_s = (datetime.now(timezone.utc) - s.ts.astimezone(timezone.utc)).total_seconds()
+    if age_s > 360:
+        return None
+    direction = "call" if s.direction.value == "calls" else "put"
+    bar_time_iso = s.ts.isoformat()
+    return {
+        "strategy": "orb_ntz",
+        "ticker":   ticker,
+        "signal":   direction,
+        "bar_time": bar_time_iso,
+        "price":    float(s.entry_price),
+        "window":   _bar_window_category(bar_time_iso),
+        "meta": {
+            "stop":        round(float(s.stop_price), 4),
+            "targets":     [round(float(t), 2) for t in s.targets[:3]],
+            "orb_high":    round(float(s.orb_high), 4),
+            "orb_low":     round(float(s.orb_low), 4),
+            "confluence":  f"{s.confluence_score}/3" + (f" ({'; '.join(s.confluence_reasons)})" if s.confluence_reasons else ""),
+            "size_tier":   s.size_tier.value,
+            "note":        s.note,
+        },
+    }
+
+
+def _purgatory_inside_ntz(ticker: str, ctx: dict[str, Any] | None, price: float) -> bool | None:
+    """NTZ tag for Purgatory signals — the A/B the June backtest asked for
+    (13/25 Purgatory signals went flat; the hypothesis is most were inside
+    the box). Tags only; nothing is suppressed until the data says so."""
+    if ctx is None:
+        return None
+    try:
+        eng, _ = _orb_ntz_replay(ticker, ctx)
+        if eng is None or eng.ntz is None:
+            return None
+        return bool(eng.price_inside_ntz(price))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("NTZ tag failed for %s: %s", ticker, exc)
+        return None
+
+
 # 1-min detectors, dispatched from the scan loop. Purgatory is handled
 # separately (4-min bars, legacy signature).
 _STRATEGY_DETECTORS_1MIN = {
@@ -3987,6 +4134,7 @@ _STRATEGY_DETECTORS_1MIN = {
     "vwap_reversion": _check_vwap_reversion_signal,
     "ema_pullback":   _check_ema_pullback_signal,
     "bb_squeeze":     _check_bb_squeeze_signal,
+    "orb_ntz":        _check_orb_ntz_signal,
 }
 
 
@@ -4414,12 +4562,18 @@ def purgatory_scan():
         for t in tickers:
             # Collect candidates from every enabled detector for this ticker
             candidates: list[dict[str, Any]] = []
+            ctx = ctx_by_sym.get(t)
             if "purgatory" in STRATEGIES_ENABLED:
                 sig = _check_purgatory_signal(t, bars_by_sym.get(t) or [])
                 if sig:
                     sig["strategy"] = "purgatory"
+                    # NTZ A/B tag: record whether the signal fired inside the
+                    # no-trade zone so the flat-rate hypothesis can be tested
+                    # against real outcomes. Tag only — never suppress here.
+                    inside = _purgatory_inside_ntz(t, ctx, sig["price"])
+                    if inside is not None:
+                        sig.setdefault("meta", {})["inside_ntz"] = inside
                     candidates.append(sig)
-            ctx = ctx_by_sym.get(t)
             if ctx is not None:
                 for skey in active_1min:
                     try:
