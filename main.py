@@ -3116,12 +3116,55 @@ def _sweep_pending_positions() -> int:
     return n_closed
 
 
+def _latest_underlying_closes(tickers: set[str]) -> dict[str, float]:
+    """Most recent 1-min close per ticker, for the stop-loss fallback."""
+    if not tickers:
+        return {}
+    try:
+        bars = _fetch_alpaca_bars(sorted(tickers), timeframe="1Min", lookback_hours=1)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Underlying close fetch failed for stop fallback: %s", exc)
+        return {}
+    out: dict[str, float] = {}
+    for t, rows in bars.items():
+        if rows:
+            try:
+                out[t] = float(rows[-1]["c"])
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def _estimate_stop_loss_from_underlying(entry: dict[str, Any],
+                                        und_closes: dict[str, float]) -> tuple[float, float] | None:
+    """Estimate the current premium loss % from the underlying's move since
+    entry, for when the options-quote endpoint returns nothing (common on
+    paper accounts). ATM delta ≈ 0.5, so premium leverage ≈ 0.5 * S / P.
+    Returns (loss_pct, estimated_mid) or None if inputs are missing."""
+    fill = _safe_float(entry.get("fill_price"))
+    und0 = _safe_float(entry.get("underlying_price"))
+    und1 = und_closes.get(entry.get("signal_ticker"))
+    if not (fill and fill > 0 and und0 and und0 > 0 and und1 and und1 > 0):
+        return None
+    move_pct = (und1 - und0) / und0 * 100.0
+    fav = move_pct if entry.get("signal_direction") == "call" else -move_pct
+    leverage = 0.5 * und0 / fill
+    loss_pct = -fav * leverage           # positive = losing
+    est_mid = fill * (1 - loss_pct / 100.0)
+    return loss_pct, est_mid
+
+
 def _sweep_stop_losses() -> int:
     """Close any open entry whose option mid has dropped more than
     ALPACA_TRADING_STOP_LOSS_PCT below the entry fill price. Runs on every
     scan pass (before the hold-time sweep), so worst-case reaction time is
     one cron interval. Entries without a reconciled fill_price yet are
-    skipped — the fill reconcile runs immediately before this."""
+    skipped — the fill reconcile runs immediately before this.
+
+    When no live option quote is available (paper accounts frequently get
+    none, which made this sweep silently inert during the 7/9-7/10
+    sessions — several losers closed well past the stop), the loss is
+    estimated from the underlying's move instead."""
     if not ALPACA_TRADING_ENABLED or not _alpaca_enabled():
         return 0
     if ALPACA_TRADING_STOP_LOSS_PCT <= 0:
@@ -3129,6 +3172,7 @@ def _sweep_stop_losses() -> int:
 
     open_entries = _fetch_open_entries_for_sweep(0)   # all open, any age
     n_stopped = 0
+    und_closes: dict[str, float] | None = None        # fetched lazily, once
     for entry in open_entries:
         opt = entry.get("option_symbol")
         fill = _safe_float(entry.get("fill_price"))
@@ -3138,11 +3182,20 @@ def _sweep_stop_losses() -> int:
 
         q = _alpaca_get_option_latest_quote(opt) or {}
         ap, bp = q.get("ap"), q.get("bp")
-        if not (isinstance(ap, (int, float)) and ap > 0):
-            continue
-        mid = (float(ap) + float(bp)) / 2 if (isinstance(bp, (int, float)) and bp > 0) else float(ap)
+        stop_basis = "option_quote"
+        if isinstance(ap, (int, float)) and ap > 0:
+            mid = (float(ap) + float(bp)) / 2 if (isinstance(bp, (int, float)) and bp > 0) else float(ap)
+            loss_pct = (fill - mid) / fill * 100.0
+        else:
+            if und_closes is None:
+                und_closes = _latest_underlying_closes(
+                    {e.get("signal_ticker") for e in open_entries if e.get("signal_ticker")})
+            est = _estimate_stop_loss_from_underlying(entry, und_closes)
+            if est is None:
+                continue
+            loss_pct, mid = est
+            stop_basis = "underlying_est"
 
-        loss_pct = (fill - mid) / fill * 100.0
         if loss_pct < ALPACA_TRADING_STOP_LOSS_PCT:
             continue
 
@@ -3166,13 +3219,14 @@ def _sweep_stop_losses() -> int:
             "submitted_at":      _now_iso(),
             "paper":             ALPACA_PAPER,
             "raw":               {"exit_reason": "stop_loss",
+                                  "stop_basis": stop_basis,
                                   "loss_pct_at_trigger": round(loss_pct, 2),
-                                  "entry_fill": fill, "mid_at_trigger": mid,
+                                  "entry_fill": fill, "mid_at_trigger": round(mid, 4),
                                   **(result or {})},
         })
         n_stopped += 1
-        log.info("Purgatory STOP-LOSS EXIT: %s %s %s x%s (-%.1f%% vs entry)",
-                 entry["signal_ticker"], entry["signal_direction"], opt, qty, loss_pct)
+        log.info("Purgatory STOP-LOSS EXIT: %s %s %s x%s (-%.1f%% vs entry, basis %s)",
+                 entry["signal_ticker"], entry["signal_direction"], opt, qty, loss_pct, stop_basis)
     return n_stopped
 
 
@@ -3263,15 +3317,18 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
         if ep is None or xp is None:
             continue
         pnl = (xp - ep) * qty * 100
+        exit_raw = ex.get("raw") if isinstance(ex.get("raw"), dict) else {}
         trades.append({
-            "strategy":   key[0],
-            "ticker":     entry["signal_ticker"],
-            "direction":  entry["signal_direction"],
-            "bar_time":   entry["signal_bar_time"],
-            "qty":        qty,
-            "entry":      ep,
-            "exit":       xp,
-            "pnl":        pnl,
+            "strategy":    key[0],
+            "ticker":      entry["signal_ticker"],
+            "direction":   entry["signal_direction"],
+            "bar_time":    entry["signal_bar_time"],
+            "qty":         qty,
+            "entry":       ep,
+            "exit":        xp,
+            "pnl":         pnl,
+            "exit_reason": exit_raw.get("exit_reason") or "hold",
+            "stop_basis":  exit_raw.get("stop_basis"),
         })
 
     if not trades:
@@ -3285,6 +3342,7 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
     n = len(trades)
     return {
         "closed_trades":  n,
+        "stopped":        sum(1 for t in trades if t["exit_reason"] == "stop_loss"),
         "wins":           wins,
         "losses":         losses,
         "flats":          n - wins - losses,
@@ -3661,7 +3719,11 @@ ORB_VOL_MULT = float(os.environ.get("ORB_VOL_MULT", "1.5"))
 ORB_CUTOFF_ET = os.environ.get("ORB_CUTOFF_ET", "11:00").strip()
 VWAPR_SIGMA = float(os.environ.get("VWAPR_SIGMA", "2.0"))
 VWAPR_WINDOW_ET = os.environ.get("VWAPR_WINDOW_ET", "11:00-14:30").strip()
-EMA_PB_TREND_BARS = int(os.environ.get("EMA_PB_TREND_BARS", "15"))
+# Default raised 15 → 30 after 7/9-7/10 data (n=66): signals in trends
+# >= 30 bars old ran 38% wr with +0.065% avg favorable vs 35% / -0.052%
+# for younger trends. Also cuts signal volume ~40% (it was 55% of all
+# signals). Small sample — revisit after the validation window.
+EMA_PB_TREND_BARS = int(os.environ.get("EMA_PB_TREND_BARS", "30"))
 BB_SQUEEZE_PCTILE = float(os.environ.get("BB_SQUEEZE_PCTILE", "25"))
 BB_VOL_MULT = float(os.environ.get("BB_VOL_MULT", "1.5"))
 # ORB+NTZ (break + retest + next-candle entry; see orb_ntz_strategy.py)
@@ -4650,6 +4712,13 @@ def purgatory_scan():
     except Exception as exc:  # noqa: BLE001
         log.warning("Daily retro auto-trigger failed: %s", exc)
 
+    # Weekly retro: Fridays, first scan >= 16:20 ET (after the daily slot)
+    weekly_fired = False
+    try:
+        weekly_fired = _run_weekly_retro_if_due()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Weekly retro auto-trigger failed: %s", exc)
+
     return {
         "scanned":         len(tickers),
         "tickers":         tickers,
@@ -4659,6 +4728,7 @@ def purgatory_scan():
         "trades_closed":   n_closed,
         "trades_updated":  n_reconciled,
         "retro_fired":     retro_fired,
+        "weekly_retro_fired": weekly_fired,
         "ts":              _now_iso(),
     }
 
@@ -5153,10 +5223,11 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
     if pnl and pnl["closed_trades"] > 0:
         tag = "Paper" if pnl["paper"] else "LIVE"
         pnl_emoji = "🟢" if pnl["total_pnl"] > 0 else ("🔴" if pnl["total_pnl"] < 0 else "⚪")
+        stopped_str = f" · ⛔ {pnl['stopped']} stopped" if pnl.get("stopped") else ""
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
             f"💰 *Real P&L ({tag})*  {pnl_emoji} *${pnl['total_pnl']:+,.2f}* net\n"
             f"• {pnl['closed_trades']} closed · {pnl['wins']} W / {pnl['losses']} L · "
-            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade\n"
+            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade{stopped_str}\n"
             f"• 🏆 `{pnl['best']['ticker']}` ${pnl['best']['pnl']:+,.2f}   "
             f"💀 `{pnl['worst']['ticker']}` ${pnl['worst']['pnl']:+,.2f}"
         }})
@@ -5343,6 +5414,149 @@ def _run_daily_retro_if_due(force_date: str | None = None) -> dict[str, Any] | N
     return summary
 
 
+# --- Weekly retro (Fridays after close) ---
+#
+# The daily retro answers "how was today"; this answers "which strategies
+# are earning promotion". Cross-strategy scoreboard, the week's real P&L
+# with stop-out counts, and the Purgatory call-vs-put split (flagged in the
+# 7/6-7/10 review: calls bled while puts paid — watching for recurrence).
+
+_weekly_retro_posted: str | None = None   # ISO year-week of last post (in-memory;
+                                          # a Friday-afternoon redeploy may repost once)
+
+
+def _compute_weekly_retro(dates: list[str]) -> dict[str, Any] | None:
+    """Aggregate signal + trade record for the given trading dates."""
+    if _supabase_client is None:
+        return None
+    start, end = dates[0], dates[-1]
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("strategy, signal, outcome, favorable_15m")
+            .gte("bar_time", f"{start}T00:00:00+00:00")
+            .lte("bar_time", f"{end}T23:59:59+00:00")
+            .execute()
+        )
+        rows = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Weekly retro signals query failed: %s", exc)
+        rows = []
+
+    def _agg(group: list[dict]) -> dict[str, Any]:
+        wins = sum(1 for r in group if r.get("outcome") == "win")
+        losses = sum(1 for r in group if r.get("outcome") == "loss")
+        flats = sum(1 for r in group if r.get("outcome") == "flat")
+        scored = wins + losses + flats
+        f15 = [float(r["favorable_15m"]) for r in group if r.get("favorable_15m") is not None]
+        avg = (sum(f15) / len(f15)) if f15 else None
+        return {
+            "n": len(group), "wins": wins, "losses": losses, "flats": flats,
+            "win_rate_pct": (wins / scored * 100.0) if scored else None,
+            "avg_favorable_15m_net": (avg - SIGNAL_SPREAD_COST_PCT) if avg is not None else None,
+        }
+
+    per_strategy = {
+        k: _agg([r for r in rows if (r.get("strategy") or "purgatory") == k])
+        for k in {(r.get("strategy") or "purgatory") for r in rows}
+    }
+    prg = [r for r in rows if (r.get("strategy") or "purgatory") == "purgatory"]
+    purgatory_by_dir = {
+        d: _agg([r for r in prg if r.get("signal") == d]) for d in ("call", "put")
+    }
+
+    day_pnls = []
+    total_pnl, total_trades, total_wins, total_stopped = 0.0, 0, 0, 0
+    for d in dates:
+        p = _compute_daily_realized_pnl(d)
+        if not p:
+            continue
+        day_pnls.append({"date": d, "pnl": p["total_pnl"], "trades": p["closed_trades"]})
+        total_pnl += p["total_pnl"]
+        total_trades += p["closed_trades"]
+        total_wins += p["wins"]
+        total_stopped += p.get("stopped", 0)
+
+    return {
+        "start": start, "end": end,
+        "total_signals": len(rows),
+        "per_strategy": per_strategy,
+        "purgatory_by_dir": purgatory_by_dir,
+        "pnl": {"total": round(total_pnl, 2), "trades": total_trades,
+                "wins": total_wins, "stopped": total_stopped, "days": day_pnls},
+    }
+
+
+def _post_weekly_retro_to_slack(w: dict[str, Any]) -> bool:
+    if not _slack_enabled():
+        return False
+    pretty = f"{pd.Timestamp(w['start']).strftime('%b %d')} – {pd.Timestamp(w['end']).strftime('%b %d')}"
+    p = w["pnl"]
+    pnl_emoji = "🟢" if p["total"] > 0 else ("🔴" if p["total"] < 0 else "⚪")
+    day_str = " · ".join(f"{d['date'][5:]}: ${d['pnl']:+,.0f}" for d in p["days"]) or "no trades"
+
+    strat_lines = []
+    for k in sorted(w["per_strategy"], key=lambda x: -w["per_strategy"][x]["n"]):
+        v = w["per_strategy"][k]
+        wr = f"{v['win_rate_pct']:.0f}%" if v.get("win_rate_pct") is not None else "—"
+        net = f" · net {v['avg_favorable_15m_net']:+.3f}%@15m" if v.get("avg_favorable_15m_net") is not None else ""
+        strat_lines.append(f"• *{_STRATEGY_LABELS.get(k, k)}*: {v['n']} signals · "
+                           f"{v['wins']}W/{v['losses']}L/{v['flats']}F · wr {wr}{net}")
+
+    dir_parts = []
+    for d in ("call", "put"):
+        v = w["purgatory_by_dir"].get(d) or {}
+        if v.get("n"):
+            wr = f"{v['win_rate_pct']:.0f}%" if v.get("win_rate_pct") is not None else "—"
+            net = f"{v['avg_favorable_15m_net']:+.3f}%" if v.get("avg_favorable_15m_net") is not None else "—"
+            dir_parts.append(f"{d.upper()}s {v['n']} · wr {wr} · net {net}")
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": f"📅 Weekly Retro — {pretty}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text":
+            f"💰 *Real P&L*  {pnl_emoji} *${p['total']:+,.2f}* · {p['trades']} trades · "
+            f"{p['wins']} wins · ⛔ {p['stopped']} stopped\n{day_str}"}},
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": "*Strategy scoreboard*\n" + ("\n".join(strat_lines) or "no signals")}},
+    ]
+    if dir_parts:
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+            "text": "🧭 Purgatory direction split: " + "  |  ".join(dir_parts)}]})
+    blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+        "text": "Promotion gate: ≥30 scored · ≥50% wr · net avg > +0.05% @15m. Not investment advice."}]})
+
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL,
+                          json={"text": f"📅 Weekly Retro — {pretty}", "blocks": blocks}, timeout=10)
+        return 200 <= r.status_code < 300
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Weekly retro Slack post failed: %s", exc)
+        return False
+
+
+def _run_weekly_retro_if_due(force: bool = False) -> bool:
+    """Post the weekly retro on Fridays at the first scan >= 16:20 ET
+    (after the daily retro's 16:05 slot). Once per ISO week."""
+    global _weekly_retro_posted
+    if not _slack_enabled():
+        return False
+    now_et = pd.Timestamp.now(tz=_ET)
+    week_key = now_et.strftime("%G-W%V")
+    if not force:
+        if now_et.weekday() != 4:                      # Friday
+            return False
+        if now_et.hour * 60 + now_et.minute < 16 * 60 + 20:
+            return False
+        if _weekly_retro_posted == week_key:
+            return False
+    dates = [(now_et - pd.Timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4, -1, -1)]
+    w = _compute_weekly_retro(dates)
+    _weekly_retro_posted = week_key
+    if not w or not w.get("total_signals"):
+        return False
+    return _post_weekly_retro_to_slack(w)
+
+
 @app.post("/purgatory/retro")
 def purgatory_retro(date: str | None = None):
     """Manually trigger today's retro + AI analysis. Useful for testing and
@@ -5353,6 +5567,15 @@ def purgatory_retro(date: str | None = None):
     if result is None:
         raise HTTPException(503, "Retro could not be computed (Supabase or Slack not configured?)")
     return result
+
+
+@app.post("/purgatory/retro/weekly")
+def purgatory_retro_weekly():
+    """Manually trigger the weekly retro for the trailing 5 trading days."""
+    ok = _run_weekly_retro_if_due(force=True)
+    if not ok:
+        raise HTTPException(503, "Weekly retro not posted (no signals this week, or Slack/Supabase not configured).")
+    return {"posted": True, "ts": _now_iso()}
 
 
 @app.get("/purgatory/summaries")
