@@ -800,6 +800,20 @@
             <option value="call">Calls</option>
             <option value="put">Puts</option>
           </select>
+          <select id="alerts-stats-wr" class="input px-2 py-1 text-xs" title="Only rows at or above this win rate">
+            <option value="">Any win rate</option>
+            <option value="50">Win rate ≥ 50%</option>
+            <option value="60">Win rate ≥ 60%</option>
+            <option value="80">Win rate ≥ 80%</option>
+            <option value="100">Win rate 100%</option>
+          </select>
+          <select id="alerts-stats-minn" class="input px-2 py-1 text-xs" title="Only rows with at least this many scored signals — a 100% win rate on 2 signals isn't an edge yet">
+            <option value="">Any # signals</option>
+            <option value="5">N ≥ 5</option>
+            <option value="10">N ≥ 10</option>
+            <option value="20">N ≥ 20</option>
+            <option value="30">N ≥ 30 (promotion gate)</option>
+          </select>
           <button id="alerts-stats-clear" type="button" class="btn-ghost px-2.5 py-1 text-xs hidden">Clear filters</button>
         </div>
         <div id="alerts-stats" class="text-sm text-ink-dim">No outcome data yet — signals get scored ~25 min after they fire.</div>
@@ -3083,6 +3097,8 @@ function _statsFilterEls() {
     ticker: document.getElementById("alerts-stats-ticker"),
     strategy: document.getElementById("alerts-stats-strategy"),
     side: document.getElementById("alerts-stats-side"),
+    wr: document.getElementById("alerts-stats-wr"),
+    minn: document.getElementById("alerts-stats-minn"),
     clear: document.getElementById("alerts-stats-clear"),
   };
 }
@@ -3091,9 +3107,9 @@ function _bindStatsFilters() {
   const f = _statsFilterEls();
   if (!f.ticker || f.ticker.dataset.bound) return;
   f.ticker.dataset.bound = "1";
-  [f.ticker, f.strategy, f.side].forEach(sel => sel.addEventListener("change", renderAlertsStats));
+  [f.ticker, f.strategy, f.side, f.wr, f.minn].forEach(sel => sel.addEventListener("change", renderAlertsStats));
   f.clear.addEventListener("click", () => {
-    f.ticker.value = ""; f.strategy.value = ""; f.side.value = "";
+    f.ticker.value = ""; f.strategy.value = ""; f.side.value = ""; f.wr.value = ""; f.minn.value = "";
     renderAlertsStats();
   });
 }
@@ -3139,12 +3155,16 @@ function renderAlertsStats() {
 
     const f = _statsFilterEls();
     const fTicker = f.ticker.value, fStrat = f.strategy.value, fSide = f.side.value;
-    const filtered = fTicker || fStrat || fSide;
+    const fWr = f.wr.value ? Number(f.wr.value) : null;
+    const fMinN = f.minn.value ? Number(f.minn.value) : null;
+    const filtered = fTicker || fStrat || fSide || fWr != null || fMinN != null;
     f.clear.classList.toggle("hidden", !filtered);
     const buckets = all.filter(b =>
       (!fTicker || b.ticker === fTicker)
       && (!fStrat || (b.strategy || "purgatory") === fStrat)
-      && (!fSide || b.direction === fSide));
+      && (!fSide || b.direction === fSide)
+      && (fWr == null || (b.win_rate_pct != null && b.win_rate_pct >= fWr))
+      && (fMinN == null || (b.n || 0) >= fMinN));
 
     const shownN = buckets.reduce((s, b) => s + (b.n || 0), 0);
     meta.textContent = filtered
