@@ -776,9 +776,45 @@
 
       <!-- Per-ticker / per-direction stats -->
       <section class="card p-4">
-        <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
           <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Performance by ticker (last 30 days)</h3>
           <span id="alerts-stats-meta" class="text-xs text-ink-faint"></span>
+        </div>
+        <!-- Column filters. Live outside #alerts-stats so the 60s auto-refresh
+             re-render doesn't wipe the selections. -->
+        <div class="flex items-center gap-2 flex-wrap mb-3 text-xs">
+          <select id="alerts-stats-ticker" class="input px-2 py-1 text-xs">
+            <option value="">All tickers</option>
+          </select>
+          <select id="alerts-stats-strategy" class="input px-2 py-1 text-xs">
+            <option value="">All strategies</option>
+            <option value="purgatory">PURG — Purgatory</option>
+            <option value="orb">ORB — Opening range</option>
+            <option value="vwap_reversion">VWAP-R — Reversion</option>
+            <option value="ema_pullback">EMA-PB — Pullback</option>
+            <option value="bb_squeeze">BB-SQZ — Squeeze</option>
+            <option value="orb_ntz">ORB-NTZ — Break + retest</option>
+          </select>
+          <select id="alerts-stats-side" class="input px-2 py-1 text-xs">
+            <option value="">Both sides</option>
+            <option value="call">Calls</option>
+            <option value="put">Puts</option>
+          </select>
+          <select id="alerts-stats-wr" class="input px-2 py-1 text-xs" title="Only rows at or above this win rate">
+            <option value="">Any win rate</option>
+            <option value="50">Win rate ≥ 50%</option>
+            <option value="60">Win rate ≥ 60%</option>
+            <option value="80">Win rate ≥ 80%</option>
+            <option value="100">Win rate 100%</option>
+          </select>
+          <select id="alerts-stats-minn" class="input px-2 py-1 text-xs" title="Only rows with at least this many scored signals — a 100% win rate on 2 signals isn't an edge yet">
+            <option value="">Any # signals</option>
+            <option value="5">N ≥ 5</option>
+            <option value="10">N ≥ 10</option>
+            <option value="20">N ≥ 20</option>
+            <option value="30">N ≥ 30 (promotion gate)</option>
+          </select>
+          <button id="alerts-stats-clear" type="button" class="btn-ghost px-2.5 py-1 text-xs hidden">Clear filters</button>
         </div>
         <div id="alerts-stats" class="text-sm text-ink-dim">No outcome data yet — signals get scored ~25 min after they fire.</div>
       </section>
@@ -3052,9 +3088,47 @@ async function refreshAlertsLog() {
   }
 }
 
+// Last-fetched stats payload; filter changes re-render from this cache
+// instead of refetching.
+let _alertsStatsData = null;
+
+function _statsFilterEls() {
+  return {
+    ticker: document.getElementById("alerts-stats-ticker"),
+    strategy: document.getElementById("alerts-stats-strategy"),
+    side: document.getElementById("alerts-stats-side"),
+    wr: document.getElementById("alerts-stats-wr"),
+    minn: document.getElementById("alerts-stats-minn"),
+    clear: document.getElementById("alerts-stats-clear"),
+  };
+}
+
+function _bindStatsFilters() {
+  const f = _statsFilterEls();
+  if (!f.ticker || f.ticker.dataset.bound) return;
+  f.ticker.dataset.bound = "1";
+  [f.ticker, f.strategy, f.side, f.wr, f.minn].forEach(sel => sel.addEventListener("change", renderAlertsStats));
+  f.clear.addEventListener("click", () => {
+    f.ticker.value = ""; f.strategy.value = ""; f.side.value = ""; f.wr.value = ""; f.minn.value = "";
+    renderAlertsStats();
+  });
+}
+
+function _syncStatsTickerOptions(buckets) {
+  // Rebuild the ticker dropdown from the data, preserving the selection.
+  const sel = _statsFilterEls().ticker;
+  const tickers = [...new Set(buckets.map(b => b.ticker).filter(Boolean))].sort();
+  const want = ["", ...tickers].join("|");
+  if (sel.dataset.opts === want) return;
+  const cur = sel.value;
+  sel.innerHTML = `<option value="">All tickers</option>` +
+    tickers.map(t => `<option value="${escapeHTML(t)}">${escapeHTML(t)}</option>`).join("");
+  sel.dataset.opts = want;
+  if (tickers.includes(cur)) sel.value = cur;
+}
+
 async function refreshAlertsStats() {
   const el = document.getElementById("alerts-stats");
-  const meta = document.getElementById("alerts-stats-meta");
   try {
     const r = await fetch("/purgatory/stats?days=30");
     if (!r.ok) {
@@ -3062,11 +3136,47 @@ async function refreshAlertsStats() {
       el.innerHTML = `<span class="text-ink-faint">${escapeHTML(err.detail || "Stats unavailable")}</span>`;
       return;
     }
-    const data = await r.json();
-    meta.textContent = `${data.n_total} scored signals · over ${data.days}d`;
-    const buckets = (data.buckets || []).sort((a, b) => b.n - a.n);
-    if (!buckets.length) {
+    _alertsStatsData = await r.json();
+    renderAlertsStats();
+  } catch (e) {
+    el.innerHTML = `<span class="text-down">Couldn't load: ${escapeHTML(e.message)}</span>`;
+  }
+}
+
+function renderAlertsStats() {
+  const el = document.getElementById("alerts-stats");
+  const meta = document.getElementById("alerts-stats-meta");
+  const data = _alertsStatsData;
+  if (!data) return;
+  _bindStatsFilters();
+  try {
+    const all = (data.buckets || []).sort((a, b) => b.n - a.n);
+    _syncStatsTickerOptions(all);
+
+    const f = _statsFilterEls();
+    const fTicker = f.ticker.value, fStrat = f.strategy.value, fSide = f.side.value;
+    const fWr = f.wr.value ? Number(f.wr.value) : null;
+    const fMinN = f.minn.value ? Number(f.minn.value) : null;
+    const filtered = fTicker || fStrat || fSide || fWr != null || fMinN != null;
+    f.clear.classList.toggle("hidden", !filtered);
+    const buckets = all.filter(b =>
+      (!fTicker || b.ticker === fTicker)
+      && (!fStrat || (b.strategy || "purgatory") === fStrat)
+      && (!fSide || b.direction === fSide)
+      && (fWr == null || (b.win_rate_pct != null && b.win_rate_pct >= fWr))
+      && (fMinN == null || (b.n || 0) >= fMinN));
+
+    const shownN = buckets.reduce((s, b) => s + (b.n || 0), 0);
+    meta.textContent = filtered
+      ? `${shownN} of ${data.n_total} scored signals · ${buckets.length} of ${all.length} rows · over ${data.days}d`
+      : `${data.n_total} scored signals · over ${data.days}d`;
+
+    if (!all.length) {
       el.innerHTML = `<span class="text-ink-faint">No outcome data yet — signals get scored ~25 min after they fire. Come back tomorrow.</span>`;
+      return;
+    }
+    if (!buckets.length) {
+      el.innerHTML = `<span class="text-ink-faint">No rows match the current filters.</span>`;
       return;
     }
     el.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs">
