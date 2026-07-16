@@ -774,49 +774,56 @@
         <div id="alerts-watchlist" class="text-sm text-ink-dim">—</div>
       </section>
 
-      <!-- Per-ticker / per-direction stats -->
+      <!-- Per-ticker / per-direction stats (collapsible — the table got long
+           with 6 strategies, and Recent signals below is the priority view
+           during trading hours) -->
       <section class="card p-4">
-        <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
-          <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Performance by ticker (last 30 days)</h3>
-          <span id="alerts-stats-meta" class="text-xs text-ink-faint"></span>
+        <button id="alerts-stats-toggle" type="button" class="w-full flex items-center justify-between gap-3 text-left group">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim group-hover:text-ink transition-colors">Performance by ticker (last 30 days)</h3>
+          <span class="flex items-center gap-2 shrink-0">
+            <span id="alerts-stats-meta" class="text-xs text-ink-faint"></span>
+            <span id="alerts-stats-chevron" class="text-ink-faint text-xs">▸</span>
+          </span>
+        </button>
+        <div id="alerts-stats-body" class="mt-3 hidden">
+          <!-- Column filters. Live outside #alerts-stats so the 60s auto-refresh
+               re-render doesn't wipe the selections. -->
+          <div class="flex items-center gap-2 flex-wrap mb-3 text-xs">
+            <select id="alerts-stats-ticker" class="input px-2 py-1 text-xs">
+              <option value="">All tickers</option>
+            </select>
+            <select id="alerts-stats-strategy" class="input px-2 py-1 text-xs">
+              <option value="">All strategies</option>
+              <option value="purgatory">PURG — Purgatory</option>
+              <option value="orb">ORB — Opening range</option>
+              <option value="vwap_reversion">VWAP-R — Reversion</option>
+              <option value="ema_pullback">EMA-PB — Pullback</option>
+              <option value="bb_squeeze">BB-SQZ — Squeeze</option>
+              <option value="orb_ntz">ORB-NTZ — Break + retest</option>
+            </select>
+            <select id="alerts-stats-side" class="input px-2 py-1 text-xs">
+              <option value="">Both sides</option>
+              <option value="call">Calls</option>
+              <option value="put">Puts</option>
+            </select>
+            <select id="alerts-stats-wr" class="input px-2 py-1 text-xs" title="Only rows at or above this win rate">
+              <option value="">Any win rate</option>
+              <option value="50">Win rate ≥ 50%</option>
+              <option value="60">Win rate ≥ 60%</option>
+              <option value="80">Win rate ≥ 80%</option>
+              <option value="100">Win rate 100%</option>
+            </select>
+            <select id="alerts-stats-minn" class="input px-2 py-1 text-xs" title="Only rows with at least this many scored signals — a 100% win rate on 2 signals isn't an edge yet">
+              <option value="">Any # signals</option>
+              <option value="5">N ≥ 5</option>
+              <option value="10">N ≥ 10</option>
+              <option value="20">N ≥ 20</option>
+              <option value="30">N ≥ 30 (promotion gate)</option>
+            </select>
+            <button id="alerts-stats-clear" type="button" class="btn-ghost px-2.5 py-1 text-xs hidden">Clear filters</button>
+          </div>
+          <div id="alerts-stats" class="text-sm text-ink-dim">No outcome data yet — signals get scored ~25 min after they fire.</div>
         </div>
-        <!-- Column filters. Live outside #alerts-stats so the 60s auto-refresh
-             re-render doesn't wipe the selections. -->
-        <div class="flex items-center gap-2 flex-wrap mb-3 text-xs">
-          <select id="alerts-stats-ticker" class="input px-2 py-1 text-xs">
-            <option value="">All tickers</option>
-          </select>
-          <select id="alerts-stats-strategy" class="input px-2 py-1 text-xs">
-            <option value="">All strategies</option>
-            <option value="purgatory">PURG — Purgatory</option>
-            <option value="orb">ORB — Opening range</option>
-            <option value="vwap_reversion">VWAP-R — Reversion</option>
-            <option value="ema_pullback">EMA-PB — Pullback</option>
-            <option value="bb_squeeze">BB-SQZ — Squeeze</option>
-            <option value="orb_ntz">ORB-NTZ — Break + retest</option>
-          </select>
-          <select id="alerts-stats-side" class="input px-2 py-1 text-xs">
-            <option value="">Both sides</option>
-            <option value="call">Calls</option>
-            <option value="put">Puts</option>
-          </select>
-          <select id="alerts-stats-wr" class="input px-2 py-1 text-xs" title="Only rows at or above this win rate">
-            <option value="">Any win rate</option>
-            <option value="50">Win rate ≥ 50%</option>
-            <option value="60">Win rate ≥ 60%</option>
-            <option value="80">Win rate ≥ 80%</option>
-            <option value="100">Win rate 100%</option>
-          </select>
-          <select id="alerts-stats-minn" class="input px-2 py-1 text-xs" title="Only rows with at least this many scored signals — a 100% win rate on 2 signals isn't an edge yet">
-            <option value="">Any # signals</option>
-            <option value="5">N ≥ 5</option>
-            <option value="10">N ≥ 10</option>
-            <option value="20">N ≥ 20</option>
-            <option value="30">N ≥ 30 (promotion gate)</option>
-          </select>
-          <button id="alerts-stats-clear" type="button" class="btn-ghost px-2.5 py-1 text-xs hidden">Clear filters</button>
-        </div>
-        <div id="alerts-stats" class="text-sm text-ink-dim">No outcome data yet — signals get scored ~25 min after they fire.</div>
       </section>
 
       <!-- Recent signals log -->
@@ -3127,7 +3134,32 @@ function _syncStatsTickerOptions(buckets) {
   if (tickers.includes(cur)) sel.value = cur;
 }
 
+function _statsCollapsed() {
+  // Default collapsed — Recent signals is the priority view intraday
+  return localStorage.getItem("alerts.statsCollapsed") !== "0";
+}
+function _applyStatsCollapsed() {
+  const body = document.getElementById("alerts-stats-body");
+  const chev = document.getElementById("alerts-stats-chevron");
+  const c = _statsCollapsed();
+  if (body) body.classList.toggle("hidden", c);
+  if (chev) chev.textContent = c ? "▸" : "▾";
+}
+
 async function refreshAlertsStats() {
+  const toggle = document.getElementById("alerts-stats-toggle");
+  if (toggle && !toggle.dataset.bound) {
+    toggle.dataset.bound = "1";
+    _applyStatsCollapsed();
+    toggle.addEventListener("click", () => {
+      const next = _statsCollapsed() ? "0" : "1";
+      localStorage.setItem("alerts.statsCollapsed", next);
+      _applyStatsCollapsed();
+      if (next === "0") refreshAlertsStats();   // fetch fresh data on expand
+    });
+  }
+  if (_statsCollapsed()) return;   // don't fetch what isn't visible
+
   const el = document.getElementById("alerts-stats");
   try {
     const r = await fetch("/purgatory/stats?days=30");
