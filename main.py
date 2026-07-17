@@ -3275,27 +3275,10 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
     return updates
 
 
-def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
-    """Match entry→exit pairs submitted on `date_str` (UTC day window; the
-    US session sits entirely inside one UTC day) and compute realized P&L."""
-    if _supabase_client is None:
-        return None
-    try:
-        day = datetime.strptime(date_str, "%Y-%m-%d")
-        start = day.strftime("%Y-%m-%dT00:00:00Z")
-        end = (day + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
-        res = (
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("*")
-            .gte("submitted_at", start)
-            .lt("submitted_at", end)
-            .execute()
-        )
-        rows = res.data or []
-    except Exception as exc:  # noqa: BLE001
-        log.warning("P&L query failed: %s", exc)
-        return None
-
+def _match_order_rows(rows: list[dict]) -> list[dict]:
+    """Pair entry↔exit order rows by (strategy, ticker, direction, bar_time)
+    and compute per-trade realized P&L. Shared by the daily summary and the
+    all-time P&L series."""
     entries: dict[tuple, dict] = {}
     exits: dict[tuple, dict] = {}
     for r in rows:
@@ -3319,18 +3302,43 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
         pnl = (xp - ep) * qty * 100
         exit_raw = ex.get("raw") if isinstance(ex.get("raw"), dict) else {}
         trades.append({
-            "strategy":    key[0],
-            "ticker":      entry["signal_ticker"],
-            "direction":   entry["signal_direction"],
-            "bar_time":    entry["signal_bar_time"],
-            "qty":         qty,
-            "entry":       ep,
-            "exit":        xp,
-            "pnl":         pnl,
-            "exit_reason": exit_raw.get("exit_reason") or "hold",
-            "stop_basis":  exit_raw.get("stop_basis"),
+            "strategy":     key[0],
+            "ticker":       entry["signal_ticker"],
+            "direction":    entry["signal_direction"],
+            "bar_time":     entry["signal_bar_time"],
+            "date":         (entry.get("submitted_at") or "")[:10],   # UTC day
+            "qty":          qty,
+            "entry":        ep,
+            "exit":         xp,
+            "pnl":          pnl,
+            "exit_reason":  exit_raw.get("exit_reason") or "hold",
+            "stop_basis":   exit_raw.get("stop_basis"),
         })
+    return trades
 
+
+def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
+    """Match entry→exit pairs submitted on `date_str` (UTC day window; the
+    US session sits entirely inside one UTC day) and compute realized P&L."""
+    if _supabase_client is None:
+        return None
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d")
+        start = day.strftime("%Y-%m-%dT00:00:00Z")
+        end = (day + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+        res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .gte("submitted_at", start)
+            .lt("submitted_at", end)
+            .execute()
+        )
+        rows = res.data or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("P&L query failed: %s", exc)
+        return None
+
+    trades = _match_order_rows(rows)
     if not trades:
         return None
 
@@ -4856,6 +4864,67 @@ def purgatory_orders_get(date: str | None = None):
             "message":         "No matched entry/exit pairs for this date.",
         }
     return {"date": date, "updated": n_updated, "trading_enabled": ALPACA_TRADING_ENABLED, **pnl}
+
+
+@app.get("/purgatory/pnl")
+def purgatory_pnl():
+    """All-time realized P&L: per-day series (with running cumulative) plus
+    rollups for today / trailing 7d / 30d / 180d / all time. Drives the
+    Trading tab's performance chart and stat tiles."""
+    if _supabase_client is None:
+        raise HTTPException(503, "P&L history requires Supabase.")
+    try:
+        res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .order("submitted_at", desc=False)
+            .execute()
+        )
+        rows = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Supabase P&L query failed: {exc}") from exc
+
+    trades = _match_order_rows(rows)
+
+    by_day: dict[str, dict[str, Any]] = {}
+    for t in trades:
+        d = t["date"]
+        if not d:
+            continue
+        b = by_day.setdefault(d, {"date": d, "pnl": 0.0, "trades": 0, "wins": 0})
+        b["pnl"] += t["pnl"]
+        b["trades"] += 1
+        if t["pnl"] > 0:
+            b["wins"] += 1
+
+    days = sorted(by_day.values(), key=lambda b: b["date"])
+    cum = 0.0
+    for b in days:
+        b["pnl"] = round(b["pnl"], 2)
+        cum += b["pnl"]
+        b["cumulative"] = round(cum, 2)
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _rollup(days_back: int | None) -> float:
+        if days_back is None:
+            return round(sum(b["pnl"] for b in days), 2)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        return round(sum(b["pnl"] for b in days if b["date"] > cutoff), 2)
+
+    return {
+        "days": days,
+        "totals": {
+            "today":      round(by_day.get(today, {}).get("pnl", 0.0), 2),
+            "week":       _rollup(7),
+            "month":      _rollup(30),
+            "six_months": _rollup(180),
+            "all_time":   _rollup(None),
+        },
+        "total_trades": len(trades),
+        "paper":        ALPACA_PAPER,
+        "ts":           _now_iso(),
+    }
 
 
 def _strategy_status_block() -> list[dict[str, Any]]:
