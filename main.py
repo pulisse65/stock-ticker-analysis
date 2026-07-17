@@ -4904,7 +4904,10 @@ def purgatory_pnl():
         cum += b["pnl"]
         b["cumulative"] = round(cum, 2)
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # "Today" = the ET trading day. Keying on UTC would zero the tile at
+    # 8 PM ET when UTC rolls over, even though the session just closed.
+    # (Per-trade dates stay UTC-grouped — the session sits inside one UTC day.)
+    today = pd.Timestamp.now(tz=_ET).strftime("%Y-%m-%d")
 
     def _rollup(days_back: int | None) -> float:
         if days_back is None:
