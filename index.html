@@ -2974,10 +2974,13 @@ function renderAlertsStrategies(strats) {
   if (!el) return;
   if (!strats || !strats.length) { el.innerHTML = ""; return; }
   el.innerHTML = strats.map(s => {
-    const tone = !s.enabled ? "v-neutral opacity-50" : (s.trading ? "v-bullish" : "v-neutral");
-    const mode = !s.enabled ? "off" : (s.trading ? "trading" : "signals");
+    const tone = !s.enabled ? "v-neutral opacity-50"
+      : (s.muted ? "v-bearish opacity-70" : (s.trading ? "v-bullish" : "v-neutral"));
+    const mode = !s.enabled ? "off" : (s.muted ? "muted" : (s.trading ? "trading" : "signals"));
     const rec = s.signals_30d ? ` · ${s.win_rate_30d != null ? s.win_rate_30d.toFixed(0) + "%" : "—"} (${s.signals_30d})` : "";
-    return `<span class="px-2.5 py-1 rounded-full ${tone}" title="${escapeHTML(STRATEGY_NAMES[s.strategy] || s.strategy)} — ${mode}${s.signals_30d ? `, ${s.signals_30d} scored signals last 30d` : ", no scored signals yet"}">${escapeHTML(s.label || s.strategy)}: ${mode}${rec}</span>`;
+    const muteNote = s.muted && s.mute_stats
+      ? ` — auto-muted by the kill gate (wr ${s.mute_stats.win_rate_pct}% over ${s.mute_stats.n} honest-scored)` : "";
+    return `<span class="px-2.5 py-1 rounded-full ${tone}" title="${escapeHTML(STRATEGY_NAMES[s.strategy] || s.strategy)} — ${mode}${muteNote}${s.signals_30d ? `, ${s.signals_30d} scored signals last 30d` : ", no scored signals yet"}">${escapeHTML(s.label || s.strategy)}: ${mode}${rec}</span>`;
   }).join("");
 }
 
@@ -3294,14 +3297,18 @@ function renderTradingStrategies(strats) {
   el.innerHTML = `<div class="space-y-1.5">${strats.map(s => {
     const mode = !s.enabled
       ? `<span class="text-ink-faint">disabled</span>`
-      : (s.trading
-        ? `<span class="val-up font-semibold">auto-trading</span>`
-        : `<span class="text-ink-dim">signals-only</span>`);
+      : (s.muted
+        ? `<span class="val-down font-semibold">auto-muted</span>`
+        : (s.trading
+          ? `<span class="val-up font-semibold">auto-trading</span>`
+          : `<span class="text-ink-dim">signals-only</span>`));
     const rec = s.signals_30d
       ? `${s.signals_30d} scored · ${s.win_rate_30d != null ? s.win_rate_30d.toFixed(0) + "% wr" : "—"}`
       : "no scored signals yet";
-    const gate = (!s.trading && s.enabled)
-      ? ` <span class="text-ink-faint">(promotes at ≥30 scored + ≥50% wr)</span>` : "";
+    const gate = s.muted && s.mute_stats
+      ? ` <span class="text-ink-faint">(kill gate: wr ${s.mute_stats.win_rate_pct}%${s.mute_stats.net_avg_f15 != null ? `, net ${s.mute_stats.net_avg_f15 > 0 ? "+" : ""}${s.mute_stats.net_avg_f15}%` : ""} over ${s.mute_stats.n} — unbenches if the record recovers)</span>`
+      : (!s.trading && s.enabled)
+        ? ` <span class="text-ink-faint">(promotes at ≥30 scored + ≥50% wr)</span>` : "";
     return `<div class="flex items-center gap-2 flex-wrap">
       ${_strategyBadge(s.strategy)}
       <span class="text-xs text-ink">${escapeHTML(STRATEGY_NAMES[s.strategy] || s.strategy)}</span>

@@ -3718,8 +3718,88 @@ def _parse_strategy_csv(env_name: str, default: tuple[str, ...] | set[str]) -> s
     return vals & set(_ALL_STRATEGIES)
 
 
-STRATEGIES_ENABLED = _parse_strategy_csv("STRATEGIES_ENABLED", _ALL_STRATEGIES)
+# Raw ORB dropped from the default roster 7/16: 17% wr on its 30d record
+# while ORB-NTZ (break + retest) ran 50% — the retest variant supersedes it.
+# Re-enable anytime via STRATEGIES_ENABLED.
+_DEFAULT_ENABLED = tuple(k for k in _ALL_STRATEGIES if k != "orb")
+STRATEGIES_ENABLED = _parse_strategy_csv("STRATEGIES_ENABLED", _DEFAULT_ENABLED)
 STRATEGIES_TRADING = _parse_strategy_csv("STRATEGIES_TRADING", {"purgatory"}) & STRATEGIES_ENABLED
+
+# --- Strategy kill gate (auto-mute) ---
+#
+# The rollout plan's "< 35% win rate after 30 scored signals → disable"
+# rule, enforced by the system instead of a weekly human review. A
+# signals-only strategy whose trailing-30d honest-scored record (scored
+# from alerted_at, i.e. post-scorer-fix rows only) breaches the gate is
+# benched: its detector stops running until the record recovers or an env
+# override rescues it. Trading strategies are never auto-muted — demoting
+# live trading is a human decision.
+STRATEGY_MUTE_MIN_N = int(os.environ.get("STRATEGY_MUTE_MIN_N", "30"))
+STRATEGY_MUTE_MAX_WIN_RATE = float(os.environ.get("STRATEGY_MUTE_MAX_WIN_RATE", "35"))
+STRATEGY_MUTE_MIN_NET_F15 = float(os.environ.get("STRATEGY_MUTE_MIN_NET_F15", "-0.05"))
+STRATEGIES_NEVER_MUTE = _parse_strategy_csv("STRATEGIES_NEVER_MUTE", set())
+_muted_strategies_cache: tuple[float, dict[str, dict]] = (0.0, {})
+
+
+def _breaches_kill_gate(n: int, win_rate_pct: float, net_avg_f15: float | None) -> bool:
+    """Mute when the record is both large enough to mean something and
+    shows either a sub-threshold win rate or persistently negative net
+    expectancy (no path to promotion)."""
+    if n < STRATEGY_MUTE_MIN_N:
+        return False
+    if win_rate_pct < STRATEGY_MUTE_MAX_WIN_RATE:
+        return True
+    return net_avg_f15 is not None and net_avg_f15 < STRATEGY_MUTE_MIN_NET_F15
+
+
+def _get_muted_strategies() -> dict[str, dict[str, Any]]:
+    """Return {strategy: {n, win_rate_pct, net_avg_f15}} for every
+    signals-only strategy currently benched by the kill gate. Cached for
+    10 min (same TTL as the disabled-pairs check)."""
+    global _muted_strategies_cache
+    now = time.time()
+    ts, val = _muted_strategies_cache
+    if now - ts < _DISABLED_CACHE_TTL:
+        return val
+    if _supabase_client is None:
+        _muted_strategies_cache = (now, {})
+        return {}
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        res = (
+            _supabase_client.table("purgatory_signals")
+            .select("strategy, outcome, favorable_15m")
+            .gte("bar_time", since)
+            .not_.is_("outcome", "null")
+            .eq("scored_from", "alerted_at")
+            .execute()
+        )
+        rows = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Muted-strategies query failed: %s", exc)
+        _muted_strategies_cache = (now, {})
+        return {}
+
+    groups: dict[str, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(r.get("strategy") or "purgatory", []).append(r)
+
+    muted: dict[str, dict[str, Any]] = {}
+    for k, g in groups.items():
+        if k in STRATEGIES_TRADING or k in STRATEGIES_NEVER_MUTE:
+            continue
+        n = len(g)
+        wins = sum(1 for r in g if r.get("outcome") == "win")
+        wr = wins / n * 100.0
+        f15 = [float(r["favorable_15m"]) for r in g if r.get("favorable_15m") is not None]
+        net = (sum(f15) / len(f15) - SIGNAL_SPREAD_COST_PCT) if f15 else None
+        if _breaches_kill_gate(n, wr, net):
+            muted[k] = {"n": n, "win_rate_pct": round(wr, 1),
+                        "net_avg_f15": round(net, 3) if net is not None else None}
+    if muted != val:
+        log.info("Strategy kill gate: muted=%s", sorted(muted) or "none")
+    _muted_strategies_cache = (now, muted)
+    return muted
 
 # Strategy tuning knobs (env-overridable)
 ORB_RANGE_MINUTES = int(os.environ.get("ORB_RANGE_MINUTES", "15"))
@@ -4614,7 +4694,14 @@ def purgatory_scan():
 
         # Second batched call for the 1-min registry strategies. A failure
         # here degrades to purgatory-only rather than failing the scan.
-        active_1min = [k for k in _STRATEGY_DETECTORS_1MIN if k in STRATEGIES_ENABLED]
+        # Strategies benched by the kill gate don't run at all.
+        muted = set()
+        try:
+            muted = set(_get_muted_strategies())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Kill-gate check failed (running all strategies): %s", exc)
+        active_1min = [k for k in _STRATEGY_DETECTORS_1MIN
+                       if k in STRATEGIES_ENABLED and k not in muted]
         ctx_by_sym: dict[str, dict[str, Any] | None] = {}
         if active_1min:
             try:
@@ -4954,6 +5041,7 @@ def _strategy_status_block() -> list[dict[str, Any]]:
         except Exception as exc:  # noqa: BLE001
             log.warning("Strategy status query failed: %s", exc)
 
+    muted = _get_muted_strategies()
     out = []
     for key in _ALL_STRATEGIES:
         c = counts.get(key)
@@ -4962,6 +5050,8 @@ def _strategy_status_block() -> list[dict[str, Any]]:
             "label":        _STRATEGY_LABELS.get(key, key),
             "enabled":      key in STRATEGIES_ENABLED,
             "trading":      key in STRATEGIES_TRADING,
+            "muted":        key in muted,
+            "mute_stats":   muted.get(key),
             "signals_30d":  c["n"] if c else 0,
             "win_rate_30d": round(c["wins"] / c["n"] * 100.0, 1) if c and c["n"] else None,
         })
@@ -5594,6 +5684,15 @@ def _post_weekly_retro_to_slack(w: dict[str, Any]) -> bool:
     if dir_parts:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
             "text": "🧭 Purgatory direction split: " + "  |  ".join(dir_parts)}]})
+    muted = _get_muted_strategies()
+    if muted:
+        m_str = ", ".join(
+            f"{_STRATEGY_LABELS.get(k, k)} (wr {v['win_rate_pct']:.0f}%"
+            + (f", net {v['net_avg_f15']:+.3f}%" if v.get("net_avg_f15") is not None else "")
+            + f" over {v['n']})"
+            for k, v in sorted(muted.items()))
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
+            "text": f"⛔ Auto-muted by the kill gate: {m_str}"}]})
     blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
         "text": "Promotion gate: ≥30 scored · ≥50% wr · net avg > +0.05% @15m. Not investment advice."}]})
 
