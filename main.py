@@ -1067,6 +1067,11 @@ def _get_reddit_token() -> str | None:
     return token
 
 
+# Last successful Reddit result per ticker, any age — the stale fallback
+# for when the shared egress IP is being rate-limited.
+_reddit_last_good: dict[str, tuple[str, dict]] = {}
+
+
 def _fetch_reddit_rss_entries(ticker: str) -> list[dict[str, Any]]:
     """Fetch recent posts about the ticker from Reddit's RSS feed.
 
@@ -1150,6 +1155,16 @@ def widget_reddit(ticker: str):
     try:
         entries = _fetch_reddit_rss_entries(ticker)
     except Exception as exc:  # noqa: BLE001
+        # Reddit rate-limits by IP, and Render's egress IP is shared with
+        # other customers — 429s come and go all day through no fault of
+        # ours. Serve the last-known-good posts (marked stale) instead of
+        # erroring; only fail hard if we've never succeeded for this ticker.
+        stale = _reddit_last_good.get(ticker)
+        if stale is not None:
+            fetched_at, result = stale
+            log.info("Reddit RSS failed for %s (%s); serving stale copy from %s",
+                     ticker, exc, fetched_at)
+            return {**result, "stale": True, "as_of": fetched_at}
         raise HTTPException(502, f"Reddit RSS fetch failed: {exc}") from exc
 
     # Same relevance filtering as before. RSS doesn't include selftext, so
@@ -1185,7 +1200,11 @@ def widget_reddit(ticker: str):
         "sentiment": _aggregate_sentiment(posts),
         "source":    "reddit-rss",
     }
-    _cache_set(cache_key, result, ttl=300)  # 5 min
+    # 15 min fresh-cache (Reddit chatter doesn't need 5-min freshness, and
+    # fewer fetches = fewer chances to trip the shared-IP rate limit), plus
+    # an unbounded-age last-good copy for stale fallback on 429s.
+    _cache_set(cache_key, result, ttl=900)
+    _reddit_last_good[ticker] = (_now_iso(), result)
     return result
 
 
