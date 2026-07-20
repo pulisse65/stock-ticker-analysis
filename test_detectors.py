@@ -166,5 +166,42 @@ check("skip-window blocks ema_pullback at open", not main._passes_common_strateg
 sig_fake2 = {"strategy": "vwap_reversion", "ticker": "X", "signal": "call", "window": "lunch_chop"}
 check("vwap_reversion allowed in lunch chop", main._passes_common_strategy_filters(sig_fake2))
 
+
+
+# ---------------- PD-LVL (prev-day level break + hold) ----------------
+print("PD-LVL:")
+import pandas as _pd
+_today_et = _pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d")
+main._pd_levels_cache = (_today_et, {"TEST": (100.6, 99.4)})
+
+# 40 flat bars around 100, then a volume break above PDH 100.6
+base = flat_bars(0, 40, px=100.0, amp=0.05)
+brk = [mk_bar(40, 100.05, 100.9, 100.0, 100.8, 1500)]
+sig = main._check_pd_level_signal("TEST", main._build_intraday_context(base + brk))
+check("fires call on first PDH break", sig is not None and sig["signal"] == "call", f"got {sig}")
+if sig:
+    check("meta level/dist", abs(sig["meta"]["level"] - 100.6) < 1e-6 and sig["meta"]["dist_pct"] > 0, str(sig["meta"]))
+
+# weak volume → no fire
+brk_lo = [mk_bar(40, 100.05, 100.9, 100.0, 100.8, 1100)]
+check("no fire on weak volume", main._check_pd_level_signal("TEST", main._build_intraday_context(base + brk_lo)) is None)
+
+# not the FIRST break of the day → no fire (earlier bar already closed above)
+early = flat_bars(0, 20, px=100.0, amp=0.05)
+early_brk = [mk_bar(20, 100.05, 100.9, 100.0, 100.8, 1500)]      # first break, earlier
+back_in = flat_bars(21, 19, px=100.0, amp=0.05)
+re_brk = [mk_bar(40, 100.05, 100.9, 100.0, 100.8, 1500)]         # re-cross later
+check("no fire on a re-cross (first-break only)",
+      main._check_pd_level_signal("TEST", main._build_intraday_context(early + early_brk + back_in + re_brk)) is None)
+
+# put mirror at PDL
+brk_dn = [mk_bar(40, 99.95, 100.0, 99.1, 99.2, 1500)]
+sig_dn = main._check_pd_level_signal("TEST", main._build_intraday_context(base + brk_dn))
+check("fires put on first PDL break", sig_dn is not None and sig_dn["signal"] == "put", f"got {sig_dn}")
+
+# no cached levels for the ticker → no fire
+main._pd_levels_cache = (_today_et, {"OTHER": (1.0, 0.5)})
+check("no fire without prev-day levels", main._check_pd_level_signal("TEST", main._build_intraday_context(base + brk)) is None)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

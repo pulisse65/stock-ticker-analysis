@@ -3691,7 +3691,7 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
 # detectors share one 1-min indicator frame per ticker per pass
 # (_build_intraday_context) — computed once, passed to all four.
 
-_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz")
+_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz", "pd_level")
 
 _STRATEGY_LABELS = {
     "purgatory":      "PURG",
@@ -3700,6 +3700,7 @@ _STRATEGY_LABELS = {
     "ema_pullback":   "EMA-PB",
     "bb_squeeze":     "BB-SQZ",
     "orb_ntz":        "ORB-NTZ",
+    "pd_level":       "PD-LVL",
 }
 
 # Per-strategy chop-window skips. Deliberately NOT the global _CHOP_WINDOWS:
@@ -3711,6 +3712,7 @@ _STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
     "ema_pullback":   {"open_first_15", "close_chop"},
     "bb_squeeze":     {"open_first_15", "close_chop"},
     "orb_ntz":        set(),   # engine enforces its own 9:45-11:00 window
+    "pd_level":       {"open_first_15", "close_chop"},
 }
 
 # Cooldown between signals, per (strategy, ticker, direction) — except
@@ -3721,6 +3723,8 @@ _STRATEGY_COOLDOWN_MIN = {
     # orb_ntz: the engine allows one signal per direction per day and the
     # bar_time dedupe kills replays, so no extra cooldown is needed.
     "orb_ntz": 0,
+    # pd_level: first-break-per-direction-per-day logic makes it stateless.
+    "pd_level": 0,
 }
 _STRATEGY_TICKER_SCOPE_COOLDOWN = {"bb_squeeze"}
 _strategy_last_fired: dict[tuple, float] = {}
@@ -3833,6 +3837,8 @@ VWAPR_WINDOW_ET = os.environ.get("VWAPR_WINDOW_ET", "11:00-14:30").strip()
 EMA_PB_TREND_BARS = int(os.environ.get("EMA_PB_TREND_BARS", "30"))
 BB_SQUEEZE_PCTILE = float(os.environ.get("BB_SQUEEZE_PCTILE", "25"))
 BB_VOL_MULT = float(os.environ.get("BB_VOL_MULT", "1.5"))
+# Lighter than ORB's 1.5x — the prev-day level itself is the main filter.
+PD_LEVEL_VOL_MULT = float(os.environ.get("PD_LEVEL_VOL_MULT", "1.2"))
 # ORB+NTZ (break + retest + next-candle entry; see orb_ntz_strategy.py)
 ORB_NTZ_MIN_CONFLUENCE = int(os.environ.get("ORB_NTZ_MIN_CONFLUENCE", "0"))
 ORB_NTZ_REQUIRE_TREND = os.environ.get("ORB_NTZ_REQUIRE_TREND", "").strip() in ("1", "true", "yes")
@@ -3913,6 +3919,7 @@ def _build_intraday_context(bars: list[dict]) -> dict[str, Any] | None:
     df["mins"] = et_t.dt.hour * 60 + et_t.dt.minute
 
     df["ema9"] = df["c"].ewm(span=9, adjust=False).mean()
+    df["ema21"] = df["c"].ewm(span=21, adjust=False).mean()
     df["ema30"] = df["c"].ewm(span=30, adjust=False).mean()
 
     typ = (df["h"] + df["l"] + df["c"]) / 3
@@ -4296,6 +4303,95 @@ def _purgatory_inside_ntz(ticker: str, ctx: dict[str, Any] | None, price: float)
         return None
 
 
+# Previous-day RTH high/low per ticker, cached per ET trading day. The 1-min
+# scan window (12h lookback) never reaches back to yesterday's session, so
+# these come from daily bars — one batched call per day for the watchlist.
+_pd_levels_cache: tuple[str, dict[str, tuple[float, float]]] = ("", {})
+
+
+def _get_prev_day_levels() -> dict[str, tuple[float, float]]:
+    """{ticker: (prev_day_high, prev_day_low)} for the watchlist, from the
+    most recent COMPLETED session's daily bar. Weekends/holidays resolve to
+    the last session, which is what "previous day" means to a trader."""
+    global _pd_levels_cache
+    today_et = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d")
+    cached_day, cached = _pd_levels_cache
+    if cached_day == today_et:
+        return cached
+    tickers = sorted(_purgatory_watchlist)
+    if not tickers or not _alpaca_enabled():
+        return {}
+    try:
+        bars = _fetch_alpaca_bars(tickers, timeframe="1Day", lookback_hours=24 * 8)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Prev-day level fetch failed: %s", exc)
+        return cached  # stale is better than nothing intraday
+    levels: dict[str, tuple[float, float]] = {}
+    for t, rows in bars.items():
+        prev = None
+        for b in rows:
+            try:
+                b_day = pd.Timestamp(b["t"]).tz_convert("America/New_York").strftime("%Y-%m-%d")
+            except (KeyError, TypeError, ValueError):
+                continue
+            if b_day < today_et:
+                prev = b  # rows are chronological; keep the latest completed day
+        if prev is not None:
+            try:
+                levels[t] = (float(prev["h"]), float(prev["l"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    _pd_levels_cache = (today_et, levels)
+    return levels
+
+
+def _check_pd_level_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """Previous-day-level break + hold (the mechanical core of the
+    'PDH/PDL retest' setup): the first 1-min close of the day beyond
+    yesterday's high (or low), with trend agreement (close vs VWAP, EMA9 vs
+    EMA21) and a volume confirm. First-break-only makes it one shot per
+    direction per day — later re-crosses of a chopped level don't chase."""
+    levels = _get_prev_day_levels().get(ticker)
+    if not levels:
+        return None
+    pdh, pdl = levels
+    today = ctx["today"]
+    if len(today) < 21:   # EMA21 warmup inside the session
+        return None
+    cur, prev = today.iloc[-1], today.iloc[-2]
+
+    vol20 = float(cur["vol20"]) if cur["vol20"] == cur["vol20"] else 0.0
+    if vol20 <= 0:
+        return None
+    vol_ratio = float(cur["v"]) / vol20
+
+    direction = None
+    level = None
+    if float(cur["c"]) > pdh and float(prev["c"]) <= pdh:
+        # First close above PDH today must be this bar (no chasing re-crosses)
+        above = today.index[today["c"] > pdh]
+        if len(above) and above[0] == today.index[-1] \
+                and float(cur["c"]) > float(cur["vwap"]) and float(cur["ema9"]) > float(cur["ema21"]) \
+                and vol_ratio >= PD_LEVEL_VOL_MULT:
+            direction, level = "call", pdh
+    elif float(cur["c"]) < pdl and float(prev["c"]) >= pdl:
+        below = today.index[today["c"] < pdl]
+        if len(below) and below[0] == today.index[-1] \
+                and float(cur["c"]) < float(cur["vwap"]) and float(cur["ema9"]) < float(cur["ema21"]) \
+                and vol_ratio >= PD_LEVEL_VOL_MULT:
+            direction, level = "put", pdl
+    if not direction:
+        return None
+
+    return _mk_strategy_signal("pd_level", ticker, direction, cur, {
+        "pdh":       round(pdh, 4),
+        "pdl":       round(pdl, 4),
+        "level":     round(level, 4),
+        "dist_pct":  round((float(cur["c"]) - level) / level * 100.0, 3),
+        "vol_ratio": round(vol_ratio, 2),
+    })
+
+
 # 1-min detectors, dispatched from the scan loop. Purgatory is handled
 # separately (4-min bars, legacy signature).
 _STRATEGY_DETECTORS_1MIN = {
@@ -4304,6 +4400,7 @@ _STRATEGY_DETECTORS_1MIN = {
     "ema_pullback":   _check_ema_pullback_signal,
     "bb_squeeze":     _check_bb_squeeze_signal,
     "orb_ntz":        _check_orb_ntz_signal,
+    "pd_level":       _check_pd_level_signal,
 }
 
 

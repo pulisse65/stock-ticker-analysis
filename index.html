@@ -800,6 +800,7 @@
               <option value="ema_pullback">EMA-PB — Pullback</option>
               <option value="bb_squeeze">BB-SQZ — Squeeze</option>
               <option value="orb_ntz">ORB-NTZ — Break + retest</option>
+            <option value="pd_level">PD-LVL — Prev-day levels</option>
             </select>
             <select id="alerts-stats-side" class="input px-2 py-1 text-xs">
               <option value="">Both sides</option>
@@ -838,6 +839,7 @@
             <option value="ema_pullback">EMA-PB — Pullback</option>
             <option value="bb_squeeze">BB-SQZ — Squeeze</option>
             <option value="orb_ntz">ORB-NTZ — Break + retest</option>
+            <option value="pd_level">PD-LVL — Prev-day levels</option>
           </select>
         </div>
         <div id="alerts-log" class="text-sm text-ink-dim">No signals yet.</div>
@@ -2961,12 +2963,14 @@ function _outcomeBadge(outcome) {
 const STRATEGY_LABELS = {
   purgatory: "PURG", orb: "ORB", vwap_reversion: "VWAP-R",
   ema_pullback: "EMA-PB", bb_squeeze: "BB-SQZ", orb_ntz: "ORB-NTZ",
+  pd_level: "PD-LVL",
 };
 const STRATEGY_NAMES = {
   purgatory: "Purgatory — EMA/VWAP cross", orb: "Opening range breakout",
   vwap_reversion: "VWAP band reversion", ema_pullback: "EMA pullback continuation",
   bb_squeeze: "Bollinger squeeze breakout",
   orb_ntz: "ORB break + retest entry, NTZ-filtered",
+  pd_level: "Prev-day high/low break + hold",
 };
 function _strategyBadge(key) {
   const k = key || "purgatory";
