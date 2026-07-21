@@ -3354,6 +3354,10 @@ async function refreshTradingPnl() {
       card("Closed trades", `${d.closed_trades}`),
       card("Win rate", `${_fmtNum(d.win_rate_pct, 1)}%`, d.win_rate_pct >= 50 ? "val-up" : "val-down"),
       card("Avg / trade", _fmtUsd(d.avg_pnl), _pnlCls(d.avg_pnl)),
+      ...(d.total_pnl_at_mid != null ? [
+        card("P&L at mid", _fmtUsd(d.total_pnl_at_mid), _pnlCls(d.total_pnl_at_mid)),
+        card("Execution drag", _fmtUsd(d.total_execution_drag), _pnlCls(d.total_execution_drag)),
+      ] : []),
     ].join("");
 
     const trades = d.trades || [];
@@ -3368,11 +3372,13 @@ async function refreshTradingPnl() {
             <th class="text-right pb-2 pr-3">Qty</th>
             <th class="text-right pb-2 pr-3">Entry</th>
             <th class="text-right pb-2 pr-3">Exit</th>
+            <th class="text-center pb-2 pr-3" title="How the underlying's move scored this signal — a WIN here with a losing P&L means execution ate the edge">Signal</th>
+            <th class="text-right pb-2 pr-3" title="Realized P&L minus P&L at the quote mids — the cost of the fills">Drag</th>
             <th class="text-right pb-2 pl-3">P&L</th>
           </tr>
         </thead>
         <tbody>${trades.map(t => `
-          <tr class="border-t border-line">
+          <tr class="border-t border-line${(t.signal_outcome === "win" && t.pnl < 0) || (t.signal_outcome === "loss" && t.pnl > 0) ? " bg-amber-500/5" : ""}">
             <td class="py-1.5 pr-3 mono font-semibold text-ink"><a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(t.ticker || "")}">${escapeHTML(t.ticker || "")}</a></td>
             <td class="py-1.5 pr-3 text-center">${_strategyBadge(t.strategy)}</td>
             <td class="py-1.5 pr-3 text-center font-bold ${t.direction === "call" ? "val-up" : "val-down"}">${t.direction === "call" ? "CALL" : "PUT"}</td>
@@ -3380,6 +3386,8 @@ async function refreshTradingPnl() {
             <td class="py-1.5 pr-3 text-right mono">${t.qty ?? "—"}</td>
             <td class="py-1.5 pr-3 text-right mono">${_fmtUsd(t.entry)}</td>
             <td class="py-1.5 pr-3 text-right mono">${_fmtUsd(t.exit)}</td>
+            <td class="py-1.5 pr-3 text-center">${_outcomeBadge(t.signal_outcome)}</td>
+            <td class="py-1.5 pr-3 text-right mono ${t.execution_drag != null ? _pnlCls(t.execution_drag) : "text-ink-faint"}">${t.execution_drag != null ? _fmtUsd(t.execution_drag) : "—"}</td>
             <td class="py-1.5 pl-3 text-right mono font-semibold ${_pnlCls(t.pnl)}">${_fmtUsd(t.pnl)}</td>
           </tr>`).join("")}
         </tbody>
@@ -3390,8 +3398,9 @@ async function refreshTradingPnl() {
             <div class="flex items-center gap-2">
               <span class="mono font-semibold text-ink"><a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(t.ticker || "")}">${escapeHTML(t.ticker || "")}</a></span>
               <span class="font-bold text-xs ${t.direction === "call" ? "val-up" : "val-down"}">${t.direction === "call" ? "CALL" : "PUT"}</span>
+              ${t.signal_outcome ? _outcomeBadge(t.signal_outcome) : ""}
             </div>
-            <div class="text-[11px] text-ink-faint mt-0.5">${_fmtUsd(t.entry)} → ${_fmtUsd(t.exit)} × ${t.qty ?? "—"}</div>
+            <div class="text-[11px] text-ink-faint mt-0.5">${_fmtUsd(t.entry)} → ${_fmtUsd(t.exit)} × ${t.qty ?? "—"}${t.execution_drag != null ? ` · drag ${_fmtUsd(t.execution_drag)}` : ""}</div>
           </div>
           <div class="mono font-semibold ${_pnlCls(t.pnl)}">${_fmtUsd(t.pnl)}</div>
         </div>`).join("")}</div>`;

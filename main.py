@@ -2820,6 +2820,12 @@ ALPACA_TRADING_HOLD_MINUTES = int(os.environ.get("ALPACA_TRADING_HOLD_MINUTES", 
 # entry fill. Caps the -$300 tail losses (AAPL 7/8 put was -35% within 5 min
 # and never recovered). Set <= 0 to disable.
 ALPACA_TRADING_STOP_LOSS_PCT = float(os.environ.get("ALPACA_TRADING_STOP_LOSS_PCT", "30"))
+# Entry spread gate: skip the trade when the option's quoted spread exceeds
+# this % of the mid. Added after the 2026-07-20 QQQ put — the underlying
+# moved favorably but a $1.40 fill vs ~$1.00 fair at entry ate the whole
+# edge. Wide-spread moments are exactly when market orders get robbed.
+# Set <= 0 to disable. No quote available → gate can't run, entry proceeds.
+ALPACA_TRADING_MAX_SPREAD_PCT = float(os.environ.get("ALPACA_TRADING_MAX_SPREAD_PCT", "10"))
 _PURGATORY_ORDERS_TABLE = "purgatory_orders"
 
 
@@ -2872,6 +2878,28 @@ def _alpaca_get_option_latest_quote(option_symbol: str) -> dict | None:
         return (r.json() or {}).get("quotes", {}).get(option_symbol)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _quote_snapshot(option_symbol: str) -> dict | None:
+    """Bid/ask/mid/spread% of the option right now, for stamping onto order
+    rows (stored under raw.quote_at_submit). Lets realized P&L be compared
+    against P&L-at-mid so execution drag is measurable per trade. Returns
+    None when no usable quote exists (common on paper accounts)."""
+    q = _alpaca_get_option_latest_quote(option_symbol) or {}
+    bid = _safe_float(q.get("bp"))
+    ask = _safe_float(q.get("ap"))
+    if not ask or ask <= 0:
+        return None
+    have_bid = bool(bid and bid > 0)
+    mid = (ask + bid) / 2 if have_bid else ask
+    spread_pct = (ask - bid) / mid * 100.0 if (have_bid and mid > 0) else None
+    return {
+        "bid":        bid if have_bid else None,
+        "ask":        ask,
+        "mid":        round(mid, 4),
+        "spread_pct": round(spread_pct, 2) if spread_pct is not None else None,
+        "at":         _now_iso(),
+    }
 
 
 def _select_option_contract(underlying: str, spot: float, direction: str) -> dict | None:
@@ -3015,7 +3043,16 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
         log.info("No option contract available for %s %s @ %s", ticker, direction, spot)
         return None
 
-    premium = _estimate_option_premium(contract)
+    quote = _quote_snapshot(contract["symbol"])
+    spread = (quote or {}).get("spread_pct")
+    if (ALPACA_TRADING_MAX_SPREAD_PCT > 0 and spread is not None
+            and spread > ALPACA_TRADING_MAX_SPREAD_PCT):
+        log.info("Entry skipped for %s %s: option spread %.1f%% > %.1f%% cap (%s bid %.2f / ask %.2f)",
+                 ticker, direction, spread, ALPACA_TRADING_MAX_SPREAD_PCT,
+                 contract["symbol"], quote["bid"], quote["ask"])
+        return None
+
+    premium = (quote or {}).get("mid") or _estimate_option_premium(contract)
     if premium and premium > 0:
         qty = max(1, int(ALPACA_TRADING_NOTIONAL_USD / (premium * 100)))
     else:
@@ -3042,7 +3079,7 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
         "alpaca_status":     order.get("status"),
         "submitted_at":      _now_iso(),
         "paper":             ALPACA_PAPER,
-        "raw":               order,
+        "raw":               {**order, "quote_at_submit": quote} if quote else order,
     })
     log.info("Purgatory ENTRY: %s %s %s x%s (order %s)",
              ticker, direction, contract["symbol"], qty, order.get("id"))
@@ -3106,11 +3143,15 @@ def _sweep_pending_positions() -> int:
         if not opt:
             continue
 
+        quote = _quote_snapshot(opt)
         result = _alpaca_close_position(opt)
         if not result:
             continue
 
         status = result.get("status", "accepted")
+        raw = {"exit_reason": "hold", **result}
+        if quote:
+            raw["quote_at_submit"] = quote
         _persist_order_row({
             "strategy":          entry.get("strategy") or "purgatory",
             "signal_ticker":     entry["signal_ticker"],
@@ -3127,7 +3168,7 @@ def _sweep_pending_positions() -> int:
             "alpaca_status":     status,
             "submitted_at":      _now_iso(),
             "paper":             ALPACA_PAPER,
-            "raw":               result,
+            "raw":               raw,
         })
         n_closed += 1
         log.info("Purgatory EXIT: %s %s %s x%s (status %s)",
@@ -3202,9 +3243,18 @@ def _sweep_stop_losses() -> int:
         q = _alpaca_get_option_latest_quote(opt) or {}
         ap, bp = q.get("ap"), q.get("bp")
         stop_basis = "option_quote"
+        quote = None
         if isinstance(ap, (int, float)) and ap > 0:
             mid = (float(ap) + float(bp)) / 2 if (isinstance(bp, (int, float)) and bp > 0) else float(ap)
             loss_pct = (fill - mid) / fill * 100.0
+            have_bid = isinstance(bp, (int, float)) and bp > 0
+            quote = {
+                "bid":        float(bp) if have_bid else None,
+                "ask":        float(ap),
+                "mid":        round(mid, 4),
+                "spread_pct": round((float(ap) - float(bp)) / mid * 100.0, 2) if (have_bid and mid > 0) else None,
+                "at":         _now_iso(),
+            }
         else:
             if und_closes is None:
                 und_closes = _latest_underlying_closes(
@@ -3241,6 +3291,7 @@ def _sweep_stop_losses() -> int:
                                   "stop_basis": stop_basis,
                                   "loss_pct_at_trigger": round(loss_pct, 2),
                                   "entry_fill": fill, "mid_at_trigger": round(mid, 4),
+                                  **({"quote_at_submit": quote} if quote else {}),
                                   **(result or {})},
         })
         n_stopped += 1
@@ -3258,7 +3309,7 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
     try:
         res = (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("id,alpaca_order_id,alpaca_status,qty")
+            .select("id,alpaca_order_id,alpaca_status,qty,raw")
             .gte("submitted_at", cutoff)
             .execute()
         )
@@ -3280,13 +3331,16 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
         fill_price = _safe_float(remote.get("filled_avg_price"))
         qty = row.get("qty") or 1
         notional = (fill_price * qty * 100) if fill_price is not None else None
+        # Merge, don't replace: raw carries our own annotations (exit_reason,
+        # stop_basis, quote_at_submit) that the remote order JSON would clobber.
+        prior_raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
         try:
             _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({
                 "alpaca_status": remote.get("status"),
                 "fill_price":    fill_price,
                 "notional":      notional,
                 "filled_at":     remote.get("filled_at"),
-                "raw":           remote,
+                "raw":           {**prior_raw, **remote},
             }).eq("id", row["id"]).execute()
             updates += 1
         except Exception as exc:  # noqa: BLE001
@@ -3308,6 +3362,16 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
         elif r["role"] == "exit":
             exits[key] = r
 
+    # Execution-drag accounting: compare fills against the quote mid
+    # captured when each order was submitted. pnl_at_mid is what the
+    # trade returns with frictionless mid fills; drag = realized - mid.
+    def _slim_quote(raw: dict) -> dict | None:
+        q = raw.get("quote_at_submit")
+        if not isinstance(q, dict):
+            return None
+        return {"bid": q.get("bid"), "ask": q.get("ask"),
+                "mid": q.get("mid"), "spread_pct": q.get("spread_pct")}
+
     trades: list[dict] = []
     for key, entry in entries.items():
         ex = exits.get(key)
@@ -3319,19 +3383,35 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
         if ep is None or xp is None:
             continue
         pnl = (xp - ep) * qty * 100
+        entry_raw = entry.get("raw") if isinstance(entry.get("raw"), dict) else {}
         exit_raw = ex.get("raw") if isinstance(ex.get("raw"), dict) else {}
+        eq, xq = _slim_quote(entry_raw), _slim_quote(exit_raw)
+        entry_mid = _safe_float((eq or {}).get("mid"))
+        exit_mid = _safe_float((xq or {}).get("mid"))
+        pnl_at_mid = None
+        if entry_mid and exit_mid:
+            pnl_at_mid = (exit_mid - entry_mid) * qty * 100
+
         trades.append({
-            "strategy":     key[0],
-            "ticker":       entry["signal_ticker"],
-            "direction":    entry["signal_direction"],
-            "bar_time":     entry["signal_bar_time"],
-            "date":         (entry.get("submitted_at") or "")[:10],   # UTC day
-            "qty":          qty,
-            "entry":        ep,
-            "exit":         xp,
-            "pnl":          pnl,
-            "exit_reason":  exit_raw.get("exit_reason") or "hold",
-            "stop_basis":   exit_raw.get("stop_basis"),
+            "strategy":           key[0],
+            "ticker":             entry["signal_ticker"],
+            "direction":          entry["signal_direction"],
+            "bar_time":           entry["signal_bar_time"],
+            "date":               (entry.get("submitted_at") or "")[:10],   # UTC day
+            "qty":                qty,
+            "entry":              ep,
+            "exit":               xp,
+            "pnl":                pnl,
+            "pnl_at_mid":         round(pnl_at_mid, 2) if pnl_at_mid is not None else None,
+            "execution_drag":     round(pnl - pnl_at_mid, 2) if pnl_at_mid is not None else None,
+            "entry_quote":        eq,
+            "exit_quote":         xq,
+            "entry_submitted_at": entry.get("submitted_at"),
+            "entry_filled_at":    entry.get("filled_at"),
+            "exit_submitted_at":  ex.get("submitted_at"),
+            "exit_filled_at":     ex.get("filled_at"),
+            "exit_reason":        exit_raw.get("exit_reason") or "hold",
+            "stop_basis":         exit_raw.get("stop_basis"),
         })
     return trades
 
@@ -3361,12 +3441,41 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
     if not trades:
         return None
 
+    # Join each trade to its signal's scored outcome so signal-says-win /
+    # trade-lost-money divergences (execution problems) surface instead of
+    # hiding between two tabs. Key mirrors the order-row pairing key.
+    outcome_by_key: dict[tuple, str | None] = {}
+    try:
+        sig_res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("strategy,ticker,signal,bar_time,outcome")
+            .gte("bar_time", start)
+            .lt("bar_time", end)
+            .execute()
+        )
+        for s in (sig_res.data or []):
+            k = (s.get("strategy") or "purgatory", s.get("ticker"),
+                 s.get("signal"), s.get("bar_time"))
+            outcome_by_key[k] = s.get("outcome")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Signal-outcome join failed: %s", exc)
+
+    divergences = []
+    for t in trades:
+        t["signal_outcome"] = outcome_by_key.get(
+            (t["strategy"], t["ticker"], t["direction"], t["bar_time"]))
+        if ((t["signal_outcome"] == "win" and t["pnl"] < 0)
+                or (t["signal_outcome"] == "loss" and t["pnl"] > 0)):
+            divergences.append(t)
+
     wins = sum(1 for t in trades if t["pnl"] > 0)
     losses = sum(1 for t in trades if t["pnl"] < 0)
     total = sum(t["pnl"] for t in trades)
     best = max(trades, key=lambda t: t["pnl"])
     worst = min(trades, key=lambda t: t["pnl"])
     n = len(trades)
+    with_mid = [t for t in trades if t["pnl_at_mid"] is not None]
+    total_at_mid = sum(t["pnl_at_mid"] for t in with_mid) if with_mid else None
     return {
         "closed_trades":  n,
         "stopped":        sum(1 for t in trades if t["exit_reason"] == "stop_loss"),
@@ -3376,6 +3485,10 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
         "win_rate_pct":   round(100 * wins / n, 1),
         "total_pnl":      round(total, 2),
         "avg_pnl":        round(total / n, 2),
+        "total_pnl_at_mid":     round(total_at_mid, 2) if total_at_mid is not None else None,
+        "total_execution_drag": round(sum(t["execution_drag"] for t in with_mid), 2) if with_mid else None,
+        "trades_with_quotes":   len(with_mid),
+        "divergences":    divergences,
         "best":           {"ticker": best["ticker"], "pnl": round(best["pnl"], 2)},
         "worst":          {"ticker": worst["ticker"], "pnl": round(worst["pnl"], 2)},
         "trades":         trades,
@@ -5502,13 +5615,36 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
         tag = "Paper" if pnl["paper"] else "LIVE"
         pnl_emoji = "🟢" if pnl["total_pnl"] > 0 else ("🔴" if pnl["total_pnl"] < 0 else "⚪")
         stopped_str = f" · ⛔ {pnl['stopped']} stopped" if pnl.get("stopped") else ""
+        mid_str = ""
+        if pnl.get("total_pnl_at_mid") is not None:
+            mid_str = (f"\n• At quote mid: ${pnl['total_pnl_at_mid']:+,.2f} · "
+                       f"execution drag ${pnl['total_execution_drag']:+,.2f} "
+                       f"({pnl['trades_with_quotes']}/{pnl['closed_trades']} trades quoted)")
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
             f"💰 *Real P&L ({tag})*  {pnl_emoji} *${pnl['total_pnl']:+,.2f}* net\n"
             f"• {pnl['closed_trades']} closed · {pnl['wins']} W / {pnl['losses']} L · "
-            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade{stopped_str}\n"
+            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade{stopped_str}{mid_str}\n"
             f"• 🏆 `{pnl['best']['ticker']}` ${pnl['best']['pnl']:+,.2f}   "
             f"💀 `{pnl['worst']['ticker']}` ${pnl['worst']['pnl']:+,.2f}"
         }})
+
+        # Execution divergences: signal scored one way, the trade paid the
+        # other. Almost always a fill-quality problem — surface it with the
+        # quotes so the drag is visible without any forensics.
+        divs = pnl.get("divergences") or []
+        if divs:
+            d_lines = []
+            for t in divs:
+                q_bits = []
+                if t.get("entry_quote") and t["entry_quote"].get("mid") is not None:
+                    q_bits.append(f"entry ${t['entry']:.2f} vs mid ${t['entry_quote']['mid']:.2f}")
+                if t.get("exit_quote") and t["exit_quote"].get("mid") is not None:
+                    q_bits.append(f"exit ${t['exit']:.2f} vs mid ${t['exit_quote']['mid']:.2f}")
+                q_str = f" ({' · '.join(q_bits)})" if q_bits else ""
+                d_lines.append(f"• `{t['ticker']}` {t['direction'].upper()} — signal "
+                               f"*{t['signal_outcome'].upper()}* but trade ${t['pnl']:+,.2f}{q_str}")
+            blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                "text": "⚠️ *Signal vs P&L divergence* — check fills\n" + "\n".join(d_lines)}})
 
     blocks.append({"type": "context", "elements": [
         {"type": "mrkdwn", "text": "🧠 AI analysis follows in the next message…"}
