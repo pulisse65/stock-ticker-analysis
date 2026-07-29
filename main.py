@@ -969,6 +969,58 @@ def _cache_set(key: tuple, value: Any, ttl: int) -> None:
     _WIDGET_CACHE[key] = (time.time() + ttl, value)
 
 
+# ----------------------------- Memory hygiene -----------------------------
+#
+# This instance lives on Render's 512MB free tier. Exceeding the limit gets
+# the process OOM-killed and restarted — a few minutes of missed scans, and
+# an unattended position if one is open. The scan loop itself is flat
+# (profiled: ~114MB steady over 200 passes); the pressure comes from heap
+# fragmentation across FastAPI's sync-endpoint threadpool and from expired
+# widget-cache entries that _cache_get only evicts on re-read. The scan
+# pass calls the three helpers below every minute so Render's logs show
+# the RSS trend and freed pages actually return to the OS.
+# (Also set MALLOC_ARENA_MAX=2 in the Render env — biggest single lever.)
+
+def _sweep_widget_cache() -> int:
+    """Drop expired widget-cache entries. Without this, a ticker browsed
+    once leaves its payloads in memory forever."""
+    now = time.time()
+    stale = [k for k, (expiry, _) in _WIDGET_CACHE.items() if now > expiry]
+    for k in stale:
+        _WIDGET_CACHE.pop(k, None)
+    return len(stale)
+
+
+def _malloc_trim() -> None:
+    """Hand freed heap pages back to the OS (Linux/glibc only, no-op
+    elsewhere). Python frees to its allocator, but glibc rarely shrinks
+    arenas on its own — that ratchet is what creeps toward the OOM limit."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _rss_mb() -> float | None:
+    """Current resident set size in MB. Linux reads /proc (true current
+    RSS); macOS falls back to peak RSS, which is fine for a trend line."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024, 1)
+    except OSError:
+        pass
+    try:
+        import resource
+        import sys
+        ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(ru / (1024 * 1024) if sys.platform == "darwin" else ru / 1024, 1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _with_timeout(fn: Callable[[], Any], timeout: float, default: Any = None) -> Any:
     """Run a sync callable with a hard wall-clock timeout. Useful for yfinance
     calls which can hang for tens of seconds when Yahoo throttles datacenter
@@ -5043,6 +5095,14 @@ def purgatory_scan():
     except Exception as exc:  # noqa: BLE001
         log.warning("Weekly retro auto-trigger failed: %s", exc)
 
+    # Memory hygiene + probe (see the Memory hygiene section for why)
+    n_evicted = _sweep_widget_cache()
+    _malloc_trim()
+    rss = _rss_mb()
+    if rss is not None:
+        log.info("Scan memory: rss=%.1fMB · widget cache %d entries (%d evicted)",
+                 rss, len(_WIDGET_CACHE), n_evicted)
+
     return {
         "scanned":         len(tickers),
         "tickers":         tickers,
@@ -5053,6 +5113,7 @@ def purgatory_scan():
         "trades_updated":  n_reconciled,
         "retro_fired":     retro_fired,
         "weekly_retro_fired": weekly_fired,
+        "rss_mb":          rss,
         "ts":              _now_iso(),
     }
 
@@ -6262,8 +6323,9 @@ def favicon():
 def healthz():
     """Cheap liveness probe — no Supabase, Alpaca, or disk I/O. Use this as
     the keep-warm / uptime-monitor target so the instance stays awake (and
-    cold boots report healthy fast) without hammering the heavy scan."""
-    return {"ok": True, "ts": _now_iso()}
+    cold boots report healthy fast) without hammering the heavy scan.
+    rss_mb tracks memory against the 512MB free-tier OOM limit."""
+    return {"ok": True, "ts": _now_iso(), "rss_mb": _rss_mb()}
 
 
 @app.get("/")
