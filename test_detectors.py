@@ -203,5 +203,68 @@ check("fires put on first PDL break", sig_dn is not None and sig_dn["signal"] ==
 main._pd_levels_cache = (_today_et, {"OTHER": (1.0, 0.5)})
 check("no fire without prev-day levels", main._check_pd_level_signal("TEST", main._build_intraday_context(base + brk)) is None)
 
+
+
+# ---------------- VWAP-RC (reclaim + retest) ----------------
+print("VWAP-RC:")
+
+# Reclaim CALL: open near 101 drags session VWAP up, price sags below it,
+# then a strong-volume bullish close back through VWAP.
+ph1 = flat_bars(0, 30, px=101.0, amp=0.05)
+ph2 = flat_bars(30, 30, px=100.3, amp=0.05)
+ctx_r = main._build_intraday_context(ph1 + ph2)
+V = float(ctx_r["today"].iloc[-1]["vwap"])
+assert float(ctx_r["today"].iloc[-1]["c"]) < V, "fixture: price should sit below vwap"
+brk = [mk_bar(60, V * 0.999, V * 1.003, V * 0.9985, V * 1.002, 1500)]
+sig = main._check_vwap_reclaim_signal("TEST", main._build_intraday_context(ph1 + ph2 + brk))
+check("reclaim call fires on close through VWAP", sig is not None and sig["signal"] == "call", f"got {sig}")
+if sig:
+    check("entry_type=reclaim + margin recorded", sig["meta"]["entry_type"] == "reclaim"
+          and sig["meta"]["margin_pct"] >= main.VWAPX_MARGIN_PCT, str(sig["meta"]))
+
+# weak volume → no fire
+brk_lo = [mk_bar(60, V * 0.999, V * 1.003, V * 0.9985, V * 1.002, 1000)]
+check("no reclaim on weak volume", main._check_vwap_reclaim_signal("TEST", main._build_intraday_context(ph1 + ph2 + brk_lo)) is None)
+
+# wick-through / marginal close → no fire (the 'wait for a real CLOSE' rule)
+brk_thin = [mk_bar(60, V * 0.999, V * 1.003, V * 0.9985, V * 1.0002, 1500)]
+check("no reclaim on marginal close", main._check_vwap_reclaim_signal("TEST", main._build_intraday_context(ph1 + ph2 + brk_thin)) is None)
+
+# Reclaim PUT mirror: open low, price rides above VWAP, then loses it
+ph1p = flat_bars(0, 30, px=100.0, amp=0.05)
+ph2p = flat_bars(30, 30, px=100.7, amp=0.05)
+ctx_p = main._build_intraday_context(ph1p + ph2p)
+Vp = float(ctx_p["today"].iloc[-1]["vwap"])
+brk_dn = [mk_bar(60, Vp * 1.001, Vp * 1.0015, Vp * 0.997, Vp * 0.998, 1500)]
+sig_p = main._check_vwap_reclaim_signal("TEST", main._build_intraday_context(ph1p + ph2p + brk_dn))
+check("reclaim put fires on close losing VWAP", sig_p is not None and sig_p["signal"] == "put", f"got {sig_p}")
+
+# Retest CALL: steady ramp holds above VWAP, 3-bar pullback tags VWAP
+# (wicks touch, closes hold), then a bounce bar takes out the prior high.
+ramp = []
+for i in range(60):
+    px = 100.0 + i * 0.02
+    ramp.append(mk_bar(i, px, px + 0.03, px - 0.02, px + 0.015, 1000))
+ctx0 = main._build_intraday_context(ramp)
+V0 = float(ctx0["today"].iloc[-1]["vwap"])
+tol = main.VWAPX_RETEST_TOL_PCT / 100.0
+pull = [mk_bar(60 + j, V0 * (1 + tol), V0 * (1 + 3 * tol), V0 * (1 - tol / 2), V0 * (1 + tol), 800) for j in range(3)]
+ctx1 = main._build_intraday_context(ramp + pull)
+V1 = float(ctx1["today"].iloc[-1]["vwap"])
+prev_h = V0 * (1 + 3 * tol)
+bounce_c = max(V1 * (1 + 2 * main.VWAPX_MARGIN_PCT / 100.0), prev_h * 1.0005)
+bounce = [mk_bar(63, V1 * (1 + tol), bounce_c * 1.0005, V1 * (1 + tol / 2), bounce_c, 1000)]
+sig_rt = main._check_vwap_reclaim_signal("TEST", main._build_intraday_context(ramp + pull + bounce))
+check("retest call fires on VWAP-hold bounce", sig_rt is not None and sig_rt["signal"] == "call"
+      and sig_rt["meta"]["entry_type"] == "retest", f"got {sig_rt}")
+
+# pullback that LOSES vwap on a closing basis → no retest fire
+pull_bad = [mk_bar(60 + j, V0, V0 * (1 + tol), V0 * 0.996, V0 * 0.997, 800) for j in range(3)]
+ctx2 = main._build_intraday_context(ramp + pull_bad)
+V2 = float(ctx2["today"].iloc[-1]["vwap"])
+bounce2 = [mk_bar(63, V2, bounce_c * 1.0005, V2 * 0.999, bounce_c, 1000)]
+check("no retest after closes lost VWAP",
+      main._check_vwap_reclaim_signal("TEST", main._build_intraday_context(ramp + pull_bad + bounce2)) is None)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

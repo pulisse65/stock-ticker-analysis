@@ -3856,7 +3856,7 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
 # detectors share one 1-min indicator frame per ticker per pass
 # (_build_intraday_context) — computed once, passed to all four.
 
-_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz", "pd_level")
+_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz", "pd_level", "vwap_reclaim")
 
 _STRATEGY_LABELS = {
     "purgatory":      "PURG",
@@ -3866,6 +3866,7 @@ _STRATEGY_LABELS = {
     "bb_squeeze":     "BB-SQZ",
     "orb_ntz":        "ORB-NTZ",
     "pd_level":       "PD-LVL",
+    "vwap_reclaim":   "VWAP-RC",
 }
 
 # Per-strategy chop-window skips. Deliberately NOT the global _CHOP_WINDOWS:
@@ -3878,6 +3879,7 @@ _STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
     "bb_squeeze":     {"open_first_15", "close_chop"},
     "orb_ntz":        set(),   # engine enforces its own 9:45-11:00 window
     "pd_level":       {"open_first_15", "close_chop"},
+    "vwap_reclaim":   {"open_first_15", "close_chop"},
 }
 
 # Cooldown between signals, per (strategy, ticker, direction) — except
@@ -3890,6 +3892,9 @@ _STRATEGY_COOLDOWN_MIN = {
     "orb_ntz": 0,
     # pd_level: first-break-per-direction-per-day logic makes it stateless.
     "pd_level": 0,
+    # vwap_reclaim: "a couple failed attempts before it actually breaks" is
+    # normal for this setup, so re-fires are allowed — throttled, not blocked.
+    "vwap_reclaim": 30,
 }
 _STRATEGY_TICKER_SCOPE_COOLDOWN = {"bb_squeeze"}
 _strategy_last_fired: dict[tuple, float] = {}
@@ -4004,6 +4009,16 @@ BB_SQUEEZE_PCTILE = float(os.environ.get("BB_SQUEEZE_PCTILE", "25"))
 BB_VOL_MULT = float(os.environ.get("BB_VOL_MULT", "1.5"))
 # Lighter than ORB's 1.5x — the prev-day level itself is the main filter.
 PD_LEVEL_VOL_MULT = float(os.environ.get("PD_LEVEL_VOL_MULT", "1.2"))
+
+# VWAP reclaim knobs. The margin filter is the "wait for a real CLOSE
+# across, not a wick-through" rule: a reclaim only counts when the close
+# clears VWAP by this % of price. Retest tolerance bounds how close the
+# pullback must come back to VWAP (and how much closing violation it may
+# show) before the bounce bar triggers the second entry.
+VWAPX_VOL_MULT = float(os.environ.get("VWAPX_VOL_MULT", "1.2"))
+VWAPX_MARGIN_PCT = float(os.environ.get("VWAPX_MARGIN_PCT", "0.05"))
+VWAPX_RETEST_TOL_PCT = float(os.environ.get("VWAPX_RETEST_TOL_PCT", "0.05"))
+VWAPX_MIN_BARS_HELD = int(os.environ.get("VWAPX_MIN_BARS_HELD", "10"))
 # ORB+NTZ (break + retest + next-candle entry; see orb_ntz_strategy.py)
 ORB_NTZ_MIN_CONFLUENCE = int(os.environ.get("ORB_NTZ_MIN_CONFLUENCE", "0"))
 ORB_NTZ_REQUIRE_TREND = os.environ.get("ORB_NTZ_REQUIRE_TREND", "").strip() in ("1", "true", "yes")
@@ -4557,6 +4572,71 @@ def _check_pd_level_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] |
     })
 
 
+def _check_vwap_reclaim_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """VWAP reclaim + retest continuation, two entries per the setup:
+
+    1. RECLAIM — a 1-min close crossing VWAP with momentum: the close must
+       clear VWAP by VWAPX_MARGIN_PCT (a real close-through, not a wick), on
+       a directional bar with >= VWAPX_VOL_MULT volume. Failed attempts are
+       expected for this setup, so re-fires are cooldown-throttled rather
+       than first-only.
+    2. RETEST — price has held the VWAP side for >= VWAPX_MIN_BARS_HELD
+       closes, pulls back to touch VWAP (wicks through are fine, closes must
+       hold within tolerance), then a bounce bar closes away from VWAP and
+       takes out the prior bar's extreme.
+
+    PUT side is the full mirror (lose VWAP / retest from below)."""
+    today = ctx["today"]
+    if len(today) < VWAPX_MIN_BARS_HELD + 3:
+        return None
+    cur, prev = today.iloc[-1], today.iloc[-2]
+    c, o, vwap = float(cur["c"]), float(cur["o"]), float(cur["vwap"])
+    prev_c, prev_vwap = float(prev["c"]), float(prev["vwap"])
+
+    vol20 = float(cur["vol20"]) if cur["vol20"] == cur["vol20"] else 0.0
+    if vol20 <= 0:
+        return None
+    vol_ratio = float(cur["v"]) / vol20
+
+    margin_pct = (c - vwap) / vwap * 100.0        # signed: + above, - below
+    tol = VWAPX_RETEST_TOL_PCT
+
+    direction = None
+    entry_type = None
+
+    # --- Entry 1: the reclaim cross ---
+    if vol_ratio >= VWAPX_VOL_MULT:
+        if prev_c <= prev_vwap and margin_pct >= VWAPX_MARGIN_PCT and c > o:
+            direction, entry_type = "call", "reclaim"
+        elif prev_c >= prev_vwap and margin_pct <= -VWAPX_MARGIN_PCT and c < o:
+            direction, entry_type = "put", "reclaim"
+
+    # --- Entry 2: the retest bounce ---
+    if direction is None:
+        held = today.iloc[-(VWAPX_MIN_BARS_HELD + 3):]
+        closes_above = bool((held["c"] >= held["vwap"] * (1 - tol / 100.0)).all())
+        closes_below = bool((held["c"] <= held["vwap"] * (1 + tol / 100.0)).all())
+        recent = today.iloc[-4:-1]   # the 3 bars before cur: the pullback
+        if closes_above and margin_pct >= VWAPX_MARGIN_PCT and c > o and float(c) > float(prev["h"]):
+            touched = bool((recent["l"] <= recent["vwap"] * (1 + tol / 100.0)).any())
+            if touched:
+                direction, entry_type = "call", "retest"
+        elif closes_below and margin_pct <= -VWAPX_MARGIN_PCT and c < o and float(c) < float(prev["l"]):
+            touched = bool((recent["h"] >= recent["vwap"] * (1 - tol / 100.0)).any())
+            if touched:
+                direction, entry_type = "put", "retest"
+
+    if not direction:
+        return None
+
+    return _mk_strategy_signal("vwap_reclaim", ticker, direction, cur, {
+        "entry_type": entry_type,
+        "vwap":       round(vwap, 4),
+        "margin_pct": round(margin_pct, 3),
+        "vol_ratio":  round(vol_ratio, 2),
+    })
+
+
 # 1-min detectors, dispatched from the scan loop. Purgatory is handled
 # separately (4-min bars, legacy signature).
 _STRATEGY_DETECTORS_1MIN = {
@@ -4566,6 +4646,7 @@ _STRATEGY_DETECTORS_1MIN = {
     "bb_squeeze":     _check_bb_squeeze_signal,
     "orb_ntz":        _check_orb_ntz_signal,
     "pd_level":       _check_pd_level_signal,
+    "vwap_reclaim":   _check_vwap_reclaim_signal,
 }
 
 
