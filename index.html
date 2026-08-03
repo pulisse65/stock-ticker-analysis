@@ -739,7 +739,7 @@
         <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
           <div>
             <h2 class="font-semibold text-ink">🔔 Signal alerts</h2>
-            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">Five intraday strategies scan the watchlist: Purgatory (EMA/VWAP cross), ORB (opening-range breakout), VWAP-R (band-fade reversion), EMA-PB (pullback continuation), and BB-SQZ (squeeze breakout). Each fresh signal posts to Slack. New strategies run signals-only until their stats earn auto-trading. Educational, not investment advice.</p>
+            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">A roster of intraday strategies scans the watchlist every pass — tap <button type="button" class="strategy-guide-open underline decoration-dotted hover:text-ink">📖 guide</button> to see what each one looks for. Fresh signals post to Slack; new strategies run signals-only until their stats earn auto-trading. Educational, not investment advice.</p>
           </div>
           <div class="flex items-center gap-2">
             <button id="alerts-scan-btn" type="button" class="btn-primary px-3 py-1.5 text-sm">Scan now</button>
@@ -869,7 +869,10 @@
 
         <!-- Strategy roster: which detectors run, which may trade, 30d record -->
         <div class="mt-3">
-          <h4 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-2">Strategies</h4>
+          <div class="flex items-center gap-2 mb-2">
+            <h4 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Strategies</h4>
+            <button type="button" class="strategy-guide-open text-[11px] text-ink-faint hover:text-ink underline decoration-dotted">ⓘ guide</button>
+          </div>
           <div id="trading-strategies" class="text-sm text-ink-dim">—</div>
         </div>
       </section>
@@ -1038,6 +1041,22 @@
   <footer class="max-w-7xl mx-auto px-4 mt-12 mb-6 text-xs text-ink-faint text-center">
     Data via Yahoo Finance, Reddit, Google News, and TradingView. Educational use only — not investment advice.
   </footer>
+
+  <!-- Floating rich tooltip for strategy badges (single element, positioned by JS) -->
+  <div id="strat-tip" class="hidden fixed z-50 max-w-sm p-3 rounded-lg border border-line text-xs shadow-lg pointer-events-none"
+       style="background: var(--tooltip-bg, var(--bg-card));"></div>
+
+  <!-- Strategy guide modal -->
+  <div id="strategy-guide-modal" class="hidden fixed inset-0 z-40 overflow-y-auto" style="background: rgba(0,0,0,0.55);">
+    <div class="card max-w-2xl mx-auto my-10 p-5 relative">
+      <div class="flex items-start justify-between gap-3 mb-1">
+        <h2 class="font-semibold text-ink">📖 Strategy guide</h2>
+        <button id="strategy-guide-close" type="button" class="text-ink-faint hover:text-ink text-lg leading-none px-1" title="Close">✕</button>
+      </div>
+      <p class="text-xs text-ink-faint mb-4">What each detector looks at. Hover any strategy badge in the tables for the same summary.</p>
+      <div id="strategy-guide-body"></div>
+    </div>
+  </div>
 
 <script>
 // ===================== Theme palette (live-reads from CSS vars) =====================
@@ -2975,10 +2994,70 @@ const STRATEGY_NAMES = {
   pd_level: "Prev-day high/low break + hold",
   vwap_reclaim: "VWAP reclaim + retest continuation",
 };
-function _strategyBadge(key) {
+
+// What each detector looks at — shown in the badge hover tooltip and the
+// 📖 guide modal. Keep these in sync with the backend detector rules.
+const STRATEGY_GUIDE = {
+  purgatory: "4-minute bars. Fires on a fresh cross of EMA 5/9 above (calls) or below (puts) both VWAP and EMA 30. Needs ≥0.10% breakout depth past the opposing line; skips trend days (|open→now| > 0.5%) and the chop windows (first 15 min, lunch, 13:00–14:30, close). The only strategy currently placing paper orders.",
+  orb: "First-15-minute range (9:30–9:45 ET). Trades the first 1-minute close beyond the range on ≥1.5× volume; range must span 0.10–1.50% of price; entries until 11:00 ET. Disabled — superseded by ORB-NTZ, which adds a retest requirement.",
+  vwap_reversion: "Mean reversion — the counter-trend strategy. Fades a fresh 1-minute close beyond VWAP ± 2σ back toward VWAP. Active only in the 11:00–14:30 ET chop, and never on trend days (|open→now| > 0.5%), reversion's known failure mode.",
+  ema_pullback: "Trend continuation: EMA9 > EMA30 > VWAP held for ≥30 straight bars, then an orderly low-volume pullback below EMA9 that holds EMA30, entered when price recrosses EMA9 and takes out the prior bar's high. Put side is the mirror.",
+  bb_squeeze: "Volatility compression: Bollinger(20,2) bandwidth pinned in the lowest 25% of its trailing 120 bars for ≥10 straight bars, then a ≥1.5× volume close outside the band that agrees with the VWAP side. Rarely fires, rarely loses.",
+  orb_ntz: "Disciplined ORB: all signals suppressed inside a no-trade zone built from premarket and prev-day levels. Needs a close beyond the 9:30–9:45 range, then a pullback that retests the broken level; fires after the retest with 200-SMA trend agreement and confluence scoring.",
+  pd_level: "Yesterday's levels: the first 1-minute close of the day beyond the previous session's high (calls) or low (puts), with trend agreement (close vs VWAP, EMA9 vs EMA21) and ≥1.2× volume. One shot per direction per day — re-crosses of a chopped level don't chase.",
+  vwap_reclaim: "Two entries around VWAP. Reclaim: a 1-minute close crossing VWAP by ≥0.05% on ≥1.2× volume — a real close-through, not a wick. Retest: after ≥10 closes holding the VWAP side, a pullback that tags VWAP and bounces past the prior bar's extreme. Failed attempts are expected, so it may re-fire after a 30-minute cooldown.",
+};
+const STRATEGY_GUIDE_FOOTER =
+  "Lifecycle: new strategies run signals-only — alerts and scoring, no orders. Outcomes are scored 5–30 minutes after each alert from the first tradeable price, net of estimated spread. Promotion to auto-trading requires ≥30 scored signals, ≥50% win rate, and net avg > +0.05% @15m. A strategy whose trailing 30-day record breaches the kill gate (<35% win rate or net < −0.05% on ≥30 scored) is auto-muted until its record recovers.";
+
+// --- Rich tooltip: one floating element, event delegation over [data-strat] ---
+document.addEventListener("mouseover", (e) => {
+  const tip = document.getElementById("strat-tip");
+  if (!tip) return;
+  const el = e.target.closest ? e.target.closest("[data-strat]") : null;
+  if (!el || !STRATEGY_GUIDE[el.dataset.strat]) { tip.classList.add("hidden"); return; }
+  const k = el.dataset.strat;
+  tip.innerHTML = `
+    <div class="font-bold text-ink mb-1">${escapeHTML(STRATEGY_LABELS[k] || k)} · ${escapeHTML(STRATEGY_NAMES[k] || "")}</div>
+    <div class="text-ink-dim leading-relaxed">${escapeHTML(STRATEGY_GUIDE[k])}</div>`;
+  tip.classList.remove("hidden");
+  const r = el.getBoundingClientRect();
+  tip.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - tip.offsetWidth - 12))}px`;
+  let top = r.bottom + 8;
+  if (top + tip.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - tip.offsetHeight - 8);
+  tip.style.top = `${top}px`;
+});
+document.addEventListener("scroll", () => document.getElementById("strat-tip")?.classList.add("hidden"), true);
+
+// --- Guide modal ---
+function openStrategyGuide() {
+  const body = document.getElementById("strategy-guide-body");
+  body.innerHTML = Object.keys(STRATEGY_GUIDE).map(k => `
+    <div class="border-t border-line pt-3 mt-3 first:border-t-0 first:pt-0 first:mt-0">
+      <div class="flex items-center gap-2 mb-1">
+        ${_strategyBadge(k, false)}
+        <span class="font-semibold text-ink text-sm">${escapeHTML(STRATEGY_NAMES[k] || k)}</span>
+      </div>
+      <div class="text-sm text-ink-dim leading-relaxed">${escapeHTML(STRATEGY_GUIDE[k])}</div>
+    </div>`).join("") +
+    `<div class="border-t border-line pt-3 mt-4 text-xs text-ink-faint leading-relaxed">${escapeHTML(STRATEGY_GUIDE_FOOTER)}</div>`;
+  document.getElementById("strategy-guide-modal").classList.remove("hidden");
+}
+function closeStrategyGuide() {
+  document.getElementById("strategy-guide-modal").classList.add("hidden");
+}
+document.addEventListener("click", (e) => {
+  if (e.target.closest && e.target.closest(".strategy-guide-open")) { openStrategyGuide(); return; }
+  if (e.target.id === "strategy-guide-modal" || (e.target.closest && e.target.closest("#strategy-guide-close"))) closeStrategyGuide();
+});
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeStrategyGuide(); });
+function _strategyBadge(key, tip = true) {
   const k = key || "purgatory";
   const label = STRATEGY_LABELS[k] || k.toUpperCase();
-  return `<span class="text-[10px] font-bold tracking-wider px-1.5 py-0.5 rounded-full chip mono" title="${escapeHTML(STRATEGY_NAMES[k] || k)}">${escapeHTML(label)}</span>`;
+  // tip=true attaches the rich hover tooltip (see [data-strat] delegation);
+  // pass false inside the guide modal where the text is already visible.
+  const attrs = tip ? ` data-strat="${escapeHTML(k)}" style="cursor: help;"` : "";
+  return `<span class="text-[10px] font-bold tracking-wider px-1.5 py-0.5 rounded-full chip mono"${attrs}>${escapeHTML(label)}</span>`;
 }
 
 function renderAlertsStrategies(strats) {
@@ -2993,7 +3072,8 @@ function renderAlertsStrategies(strats) {
     const muteNote = s.muted && s.mute_stats
       ? ` — auto-muted by the kill gate (wr ${s.mute_stats.win_rate_pct}% over ${s.mute_stats.n} honest-scored)` : "";
     return `<span class="px-2.5 py-1 rounded-full ${tone}" title="${escapeHTML(STRATEGY_NAMES[s.strategy] || s.strategy)} — ${mode}${muteNote}${s.signals_30d ? `, ${s.signals_30d} scored signals last 30d` : ", no scored signals yet"}">${escapeHTML(s.label || s.strategy)}: ${mode}${rec}</span>`;
-  }).join("");
+  }).join("")
+  + `<button type="button" class="strategy-guide-open px-2.5 py-1 rounded-full v-neutral hover:text-ink" title="What each strategy looks for">📖 guide</button>`;
 }
 
 async function refreshAlertsLog() {
