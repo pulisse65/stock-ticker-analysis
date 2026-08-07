@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hmac
 import json
 import logging
 import math
@@ -3856,7 +3857,7 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
 # detectors share one 1-min indicator frame per ticker per pass
 # (_build_intraday_context) — computed once, passed to all four.
 
-_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz", "pd_level", "vwap_reclaim")
+_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz", "pd_level", "vwap_reclaim", "kronos")
 
 _STRATEGY_LABELS = {
     "purgatory":      "PURG",
@@ -3867,6 +3868,7 @@ _STRATEGY_LABELS = {
     "orb_ntz":        "ORB-NTZ",
     "pd_level":       "PD-LVL",
     "vwap_reclaim":   "VWAP-RC",
+    "kronos":         "KRONOS",
 }
 
 # Per-strategy chop-window skips. Deliberately NOT the global _CHOP_WINDOWS:
@@ -3880,6 +3882,10 @@ _STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
     "orb_ntz":        set(),   # engine enforces its own 9:45-11:00 window
     "pd_level":       {"open_first_15", "close_chop"},
     "vwap_reclaim":   {"open_first_15", "close_chop"},
+    # kronos: an off-box ML forecaster posting via /purgatory/external-signal.
+    # Opening chaos and the last-minutes scoring cliff apply to it like any
+    # other 15-min-horizon signal.
+    "kronos":         {"open_first_15", "close_chop"},
 }
 
 # Cooldown between signals, per (strategy, ticker, direction) — except
@@ -3895,6 +3901,9 @@ _STRATEGY_COOLDOWN_MIN = {
     # vwap_reclaim: "a couple failed attempts before it actually breaks" is
     # normal for this setup, so re-fires are allowed — throttled, not blocked.
     "vwap_reclaim": 30,
+    # kronos: the runner has its own cadence, but a server-side throttle
+    # protects against a buggy or duplicate runner spamming alerts.
+    "kronos": 30,
 }
 _STRATEGY_TICKER_SCOPE_COOLDOWN = {"bb_squeeze"}
 _strategy_last_fired: dict[tuple, float] = {}
@@ -5030,6 +5039,47 @@ def purgatory_watchlist_remove(ticker: str):
     return {"watchlist": sorted(_purgatory_watchlist)}
 
 
+def _fire_signal(sig: dict[str, Any]) -> bool:
+    """The common fire path, shared by the scan loop and the external-signal
+    endpoint: window/pair/cooldown filters, bar-time dedupe, Slack alert,
+    auto-trade hook (self-gated on STRATEGIES_TRADING), in-memory ring
+    buffer, Supabase persist. Returns True if the signal alerted."""
+    t = sig["ticker"]
+    if not _passes_common_strategy_filters(sig):
+        return False
+    # Dedupe by (strategy, ticker, signal-type, bar_time)
+    key = (sig["strategy"], t, sig["signal"], sig["bar_time"])
+    if key in _purgatory_alerted:
+        return False
+    _purgatory_alerted[key] = time.time()
+    _strategy_mark_fired(sig["strategy"], t, sig["signal"])
+    sig["alerted_at"] = _now_iso()
+
+    # Recent stats for this strategy+ticker+direction enrich the alert
+    stats = _recent_stats_for_ticker_direction(t, sig["signal"], n=10,
+                                               strategy=sig["strategy"])
+    sig["recent_stats"] = stats
+
+    sig["slack_sent"] = _send_slack_alert(sig, stats=stats)
+
+    # Auto-trade the signal (paper by default; only strategies in
+    # STRATEGIES_TRADING place orders). Wrapped so a broker error
+    # can't block persistence or the rest of the scan.
+    try:
+        _maybe_place_trade_for_signal(sig)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Auto-trade entry failed for %s %s %s: %s",
+                    sig["strategy"], t, sig["signal"], exc)
+
+    _purgatory_signals.append(sig)
+    if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
+        del _purgatory_signals[:-_PURGATORY_MAX_SIGNALS]
+
+    # Persist to Supabase
+    _persist_signal(sig)
+    return True
+
+
 @app.post("/purgatory/scan")
 def purgatory_scan():
     """Run one scan pass for every watched ticker, then back-fill outcomes
@@ -5104,40 +5154,10 @@ def purgatory_scan():
                         candidates.append(s2)
 
             for sig in candidates:
-                if not _passes_common_strategy_filters(sig):
+                if not _fire_signal(sig):
                     continue
-                # Dedupe by (strategy, ticker, signal-type, bar_time)
-                key = (sig["strategy"], t, sig["signal"], sig["bar_time"])
-                if key in _purgatory_alerted:
-                    continue
-                _purgatory_alerted[key] = time.time()
-                _strategy_mark_fired(sig["strategy"], t, sig["signal"])
-                sig["alerted_at"] = _now_iso()
-
-                # Recent stats for this strategy+ticker+direction enrich the alert
-                stats = _recent_stats_for_ticker_direction(t, sig["signal"], n=10,
-                                                           strategy=sig["strategy"])
-                sig["recent_stats"] = stats
-
-                sig["slack_sent"] = _send_slack_alert(sig, stats=stats)
-
-                # Auto-trade the signal (paper by default; only strategies in
-                # STRATEGIES_TRADING place orders). Wrapped so a broker error
-                # can't block persistence or the rest of the scan.
-                try:
-                    _maybe_place_trade_for_signal(sig)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("Auto-trade entry failed for %s %s %s: %s",
-                                sig["strategy"], t, sig["signal"], exc)
-
                 new_signals.append(sig)
                 by_strategy[sig["strategy"]] = by_strategy.get(sig["strategy"], 0) + 1
-                _purgatory_signals.append(sig)
-                if len(_purgatory_signals) > _PURGATORY_MAX_SIGNALS:
-                    del _purgatory_signals[:-_PURGATORY_MAX_SIGNALS]
-
-                # Persist to Supabase
-                _persist_signal(sig)
 
     # Back-fill outcomes for matured signals (>= 25 min old, no outcome yet).
     # Runs every scan so the data piles up over the trading day.
@@ -5196,6 +5216,113 @@ def purgatory_scan():
         "weekly_retro_fired": weekly_fired,
         "rss_mb":          rss,
         "ts":              _now_iso(),
+    }
+
+
+# --- External signal ingest ---
+#
+# Off-box signal sources (currently the Kronos forecaster running on the
+# user's Mac — see kronos_runner.py) POST here instead of living inside
+# the scan loop. Ingested signals ride the exact same _fire_signal path as
+# server-side detectors: same skip windows, cooldowns, kill gate, honest
+# scorer, and promotion criteria. Auth is a shared secret because this
+# endpoint can trigger Slack alerts and (if ever promoted) real orders.
+EXTERNAL_SIGNAL_TOKEN = os.environ.get("EXTERNAL_SIGNAL_TOKEN", "").strip()
+
+# Strategies whose signals are produced off-box. Server-side detector
+# strategies can't be injected externally — that would bypass their
+# detectors' own filters and poison their scored records.
+_EXTERNAL_STRATEGIES = {"kronos"}
+
+
+class _ExternalSignalRequest(BaseModel):
+    strategy: str
+    ticker: str
+    signal: str                                  # "call" | "put"
+    price: float
+    bar_time: str | None = None                  # ISO; defaults to now (minute floor)
+    meta: dict[str, Any] | None = None
+
+
+def _soft_reject(reason: str) -> dict[str, Any]:
+    return {"accepted": False, "reason": reason}
+
+
+@app.post("/purgatory/external-signal")
+def purgatory_external_signal(req: _ExternalSignalRequest, request: Request):
+    """Ingest one signal from an external runner. Hard 4xx = client bug
+    (bad token, malformed signal); 200 with accepted=false = valid signal
+    filtered by normal gates (cooldown, kill gate, off-hours, ...) — the
+    runner logs those without alarming."""
+    if not EXTERNAL_SIGNAL_TOKEN:
+        raise HTTPException(503, "External signals disabled: set EXTERNAL_SIGNAL_TOKEN.")
+    supplied = request.headers.get("x-signal-token", "")
+    if not hmac.compare_digest(supplied, EXTERNAL_SIGNAL_TOKEN):
+        raise HTTPException(401, "Bad or missing X-Signal-Token header.")
+
+    strategy = req.strategy.strip().lower()
+    ticker = req.ticker.strip().upper()
+    direction = req.signal.strip().lower()
+    if strategy not in _EXTERNAL_STRATEGIES:
+        raise HTTPException(400, f"Unknown external strategy '{strategy}'. Allowed: {sorted(_EXTERNAL_STRATEGIES)}")
+    if direction not in ("call", "put"):
+        raise HTTPException(400, "signal must be 'call' or 'put'.")
+    if not math.isfinite(req.price) or req.price <= 0:
+        raise HTTPException(400, "price must be a positive number.")
+
+    now = pd.Timestamp.now(tz="UTC")
+    if req.bar_time:
+        try:
+            bt = pd.Timestamp(req.bar_time)
+            bt = bt.tz_localize("UTC") if bt.tzinfo is None else bt.tz_convert("UTC")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"Unparseable bar_time: {exc}") from exc
+    else:
+        bt = now.floor("min")
+    # Freshness guard: a replayed/backfilled signal must not alert Slack
+    # as if it were live, and the scorer's entry anchor would be fiction.
+    if (now - bt) > pd.Timedelta(minutes=10):
+        return _soft_reject("stale bar_time (>10 min old)")
+    if (bt - now) > pd.Timedelta(minutes=2):
+        return _soft_reject("bar_time is in the future")
+
+    bar_time_iso = bt.isoformat()
+    window = _bar_window_category(bar_time_iso)
+    if window in ("pre_market", "after_hours", "unknown"):
+        return _soft_reject(f"outside regular trading hours ({window})")
+
+    if strategy not in STRATEGIES_ENABLED:
+        return _soft_reject(f"strategy '{strategy}' not in STRATEGIES_ENABLED")
+    try:
+        muted = _get_muted_strategies()
+    except Exception:  # noqa: BLE001
+        muted = {}
+    if strategy in muted:
+        return _soft_reject(f"strategy '{strategy}' is benched by the kill gate")
+    if ticker not in _purgatory_watchlist:
+        return _soft_reject(f"{ticker} is not on the watchlist")
+
+    meta = dict(list((req.meta or {}).items())[:12])   # Slack caps fields; keep rows sane
+    sig = {
+        "strategy": strategy,
+        "ticker":   ticker,
+        "signal":   direction,
+        "bar_time": bar_time_iso,
+        "price":    float(req.price),
+        "window":   window,
+        "meta":     meta,
+    }
+    if not _fire_signal(sig):
+        return _soft_reject("filtered (skip window, disabled pair, cooldown, or duplicate bar_time)")
+    return {
+        "accepted":   True,
+        "reason":     None,
+        "strategy":   strategy,
+        "ticker":     ticker,
+        "signal":     direction,
+        "bar_time":   bar_time_iso,
+        "window":     window,
+        "slack_sent": sig.get("slack_sent", False),
     }
 
 

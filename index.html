@@ -802,6 +802,7 @@
               <option value="orb_ntz">ORB-NTZ — Break + retest</option>
             <option value="pd_level">PD-LVL — Prev-day levels</option>
             <option value="vwap_reclaim">VWAP-RC — VWAP reclaim</option>
+            <option value="kronos">KRONOS — ML forecast</option>
             </select>
             <select id="alerts-stats-side" class="input px-2 py-1 text-xs">
               <option value="">Both sides</option>
@@ -842,6 +843,7 @@
             <option value="orb_ntz">ORB-NTZ — Break + retest</option>
             <option value="pd_level">PD-LVL — Prev-day levels</option>
             <option value="vwap_reclaim">VWAP-RC — VWAP reclaim</option>
+            <option value="kronos">KRONOS — ML forecast</option>
           </select>
         </div>
         <div id="alerts-log" class="text-sm text-ink-dim">No signals yet.</div>
@@ -2984,7 +2986,7 @@ function _outcomeBadge(outcome) {
 const STRATEGY_LABELS = {
   purgatory: "PURG", orb: "ORB", vwap_reversion: "VWAP-R",
   ema_pullback: "EMA-PB", bb_squeeze: "BB-SQZ", orb_ntz: "ORB-NTZ",
-  pd_level: "PD-LVL", vwap_reclaim: "VWAP-RC",
+  pd_level: "PD-LVL", vwap_reclaim: "VWAP-RC", kronos: "KRONOS",
 };
 const STRATEGY_NAMES = {
   purgatory: "Purgatory — EMA/VWAP cross", orb: "Opening range breakout",
@@ -2993,6 +2995,7 @@ const STRATEGY_NAMES = {
   orb_ntz: "ORB break + retest entry, NTZ-filtered",
   pd_level: "Prev-day high/low break + hold",
   vwap_reclaim: "VWAP reclaim + retest continuation",
+  kronos: "Kronos ML forecast (off-box)",
 };
 
 // What each detector looks at — shown in the badge hover tooltip and the
@@ -3006,6 +3009,7 @@ const STRATEGY_GUIDE = {
   orb_ntz: "Disciplined ORB: all signals suppressed inside a no-trade zone built from premarket and prev-day levels. Needs a close beyond the 9:30–9:45 range, then a pullback that retests the broken level; fires after the retest with 200-SMA trend agreement and confluence scoring.",
   pd_level: "Yesterday's levels: the first 1-minute close of the day beyond the previous session's high (calls) or low (puts), with trend agreement (close vs VWAP, EMA9 vs EMA21) and ≥1.2× volume. One shot per direction per day — re-crosses of a chopped level don't chase.",
   vwap_reclaim: "Two entries around VWAP. Reclaim: a 1-minute close crossing VWAP by ≥0.05% on ≥1.2× volume — a real close-through, not a wick. Retest: after ≥10 closes holding the VWAP side, a pullback that tags VWAP and bounces past the prior bar's extreme. Failed attempts are expected, so it may re-fire after a 30-minute cooldown.",
+  kronos: "Machine-learning forecast, not a chart pattern: the open-source Kronos model (a transformer pretrained on ~12B candles) runs off-box, reads the last ~33 hours of 5-minute bars, and predicts the next 30 minutes. Fires when the averaged forecast path moves ≥0.25% within 15 minutes with the 30-minute path agreeing. Same scoring, cooldowns, and kill gate as every other strategy.",
 };
 const STRATEGY_GUIDE_FOOTER =
   "Lifecycle: new strategies run signals-only — alerts and scoring, no orders. Outcomes are scored 5–30 minutes after each alert from the first tradeable price, net of estimated spread. Promotion to auto-trading requires ≥30 scored signals, ≥50% win rate, and net avg > +0.05% @15m. A strategy whose trailing 30-day record breaches the kill gate (<35% win rate or net < −0.05% on ≥30 scored) is auto-muted until its record recovers.";
