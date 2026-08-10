@@ -13,6 +13,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 from urllib.parse import urlencode
 
@@ -2810,9 +2811,14 @@ def _save_purgatory_state(watchlist: set[str]) -> None:
         log.warning("Local purgatory JSON write failed: %s", exc)
 
 
-def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hours: int = 12) -> dict[str, list[dict]]:
+def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hours: int = 12,
+                       start: str | None = None, end: str | None = None) -> dict[str, list[dict]]:
     """Fetch recent bars for multiple symbols in one request. Returns
     {ticker: [bar, ...]} where each bar has t, o, h, l, c, v, vw.
+
+    Pass explicit `start`/`end` ISO timestamps to window a historical range
+    (the plan scorer replays old signal days); otherwise `lookback_hours`
+    back from now.
 
     Uses IEX feed which is free on Alpaca's basic plan and gives real-time
     data (one exchange, not SIP, but enough for liquid names like SPY/AVGO/TSLA)."""
@@ -2821,7 +2827,8 @@ def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hou
     if not symbols:
         return {}
 
-    start = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
+    if start is None:
+        start = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).isoformat()
     headers = {
         "APCA-API-KEY-ID": ALPACA_API_KEY,
         "APCA-API-SECRET-KEY": ALPACA_API_SECRET,
@@ -2833,6 +2840,8 @@ def _fetch_alpaca_bars(symbols: list[str], timeframe: str = "4Min", lookback_hou
         "feed": "iex",
         "limit": "10000",
     }
+    if end is not None:
+        params["end"] = end
 
     r = requests.get(f"{ALPACA_DATA_BASE}/stocks/bars", headers=headers, params=params, timeout=15)
     r.raise_for_status()
@@ -3970,7 +3979,7 @@ def _get_muted_strategies() -> dict[str, dict[str, Any]]:
         since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
         res = (
             _supabase_client.table("purgatory_signals")
-            .select("strategy, outcome, favorable_15m")
+            .select("strategy, outcome, favorable_15m, meta")
             .gte("bar_time", since)
             .not_.is_("outcome", "null")
             .eq("scored_from", "alerted_at")
@@ -3990,6 +3999,23 @@ def _get_muted_strategies() -> dict[str, dict[str, Any]]:
     for k, g in groups.items():
         if k in STRATEGIES_TRADING or k in STRATEGIES_NEVER_MUTE:
             continue
+        if k in _PLAN_SCORED_STRATEGIES:
+            # Judge on the strategy's own exit plan (meta.plan), not the
+            # +15m checkpoint — the checkpoint grades a hold style these
+            # signals were never designed for. Until enough plan scores
+            # exist, fall back to the generic numbers below.
+            plans = [r["meta"]["plan"] for r in g
+                     if isinstance(r.get("meta"), dict) and isinstance(r["meta"].get("plan"), dict)]
+            if len(plans) >= STRATEGY_MUTE_MIN_N:
+                n = len(plans)
+                wr = sum(1 for p in plans if p.get("outcome") == "win") / n * 100.0
+                nets = [float(p["net_pct"]) for p in plans if p.get("net_pct") is not None]
+                net = sum(nets) / len(nets) if nets else None
+                if _breaches_kill_gate(n, wr, net):
+                    muted[k] = {"n": n, "win_rate_pct": round(wr, 1),
+                                "net_avg_f15": round(net, 3) if net is not None else None,
+                                "scoring": "plan"}
+                continue
         n = len(g)
         wins = sum(1 for r in g if r.get("outcome") == "win")
         wr = wins / n * 100.0
@@ -4874,6 +4900,143 @@ def _backfill_outcomes_for_matured_signals() -> int:
     return n_backfilled
 
 
+# --- Plan-based scoring (strategies that ship their own exit plan) ---
+#
+# The generic scorer grades every signal at fixed +5..30m checkpoints —
+# fair for detectors traded with the standard hold, but ORB-NTZ signals
+# carry their own stop + pivot targets in meta and are designed to develop
+# over 30-60+ minutes. Grading those at +15m muted a 56.7%-win-rate
+# strategy for "negative expectancy" it may not have. This pass replays
+# each signal against its own plan (stop / first target / end-of-day
+# close, whichever comes first) and stores the verdict in meta.plan;
+# the kill gate judges plan-scored strategies on these numbers instead.
+
+_PLAN_SCORED_STRATEGIES = {"orb_ntz"}
+_PLAN_BACKFILL_PER_PASS = 10       # signals per scan pass — keeps the
+                                   # historical catch-up gentle on a 512MB box
+
+
+def _simulate_signal_plan(side: str, entry: float, stop: float, target: float,
+                          bars: list[dict], eod_passed: bool) -> dict[str, Any] | None:
+    """Walk 1-min bars (strictly after the entry bar) until the plan
+    resolves: stop hit, first target hit, or end-of-day close. Conservative
+    same-bar rule: when one bar spans both levels, the stop wins. Gaps fill
+    at the worse of the level and the bar open for stops; targets never get
+    gap credit. Returns None while unresolved and the session is still
+    open (retry next scan)."""
+    fav = 1.0 if side == "call" else -1.0   # favorable direction multiplier
+    exit_price = exit_reason = exit_t = None
+    for b in bars:
+        o, h, l = float(b["o"]), float(b["h"]), float(b["l"])
+        stop_hit = (l <= stop) if side == "call" else (h >= stop)
+        tgt_hit = (h >= target) if side == "call" else (l <= target)
+        if stop_hit:
+            exit_price = min(stop, o) if side == "call" else max(stop, o)
+            exit_reason = "stop"
+        elif tgt_hit:
+            exit_price = target
+            exit_reason = "target"
+        if exit_price is not None:
+            exit_t = b["t"]
+            break
+    if exit_price is None:
+        if not eod_passed:
+            return None                    # still live — score next pass
+        if not bars:
+            return None                    # no data at all; give up next GC
+        exit_price = float(bars[-1]["c"])
+        exit_reason = "eod"
+        exit_t = bars[-1]["t"]
+    pct = fav * (exit_price - entry) / entry * 100.0
+    net = pct - SIGNAL_SPREAD_COST_PCT
+    outcome = "win" if net > 0.10 else ("flat" if net > -0.10 else "loss")
+    return {
+        "outcome":     outcome,
+        "exit_reason": exit_reason,
+        "exit_price":  round(exit_price, 4),
+        "exit_t":      exit_t,
+        "pct":         round(pct, 4),
+        "net_pct":     round(net, 4),
+        "scored_at":   _now_iso(),
+    }
+
+
+def _backfill_plan_outcomes() -> int:
+    """Score up to _PLAN_BACKFILL_PER_PASS plan-strategy signals that don't
+    have meta.plan yet, newest first (fills the kill gate's 30d window
+    fastest). One bar fetch per (ticker, ET day) covers every signal in
+    that group. Returns the number scored this pass."""
+    if _supabase_client is None or not _alpaca_enabled():
+        return 0
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=35)).isoformat()
+        res = (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("id, ticker, signal, bar_time, alerted_at, meta")
+            .in_("strategy", sorted(_PLAN_SCORED_STRATEGIES))
+            .gte("bar_time", since)
+            .is_("meta->plan", "null")
+            .order("bar_time", desc=True)
+            .limit(_PLAN_BACKFILL_PER_PASS)
+            .execute()
+        )
+        pending = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Plan-outcome query failed: %s", exc)
+        return 0
+    if not pending:
+        return 0
+
+    et_now = datetime.now(ZoneInfo("America/New_York"))
+    n_scored = 0
+    bars_cache: dict[tuple[str, str], list[dict]] = {}
+    for s in pending:
+        meta = s.get("meta") if isinstance(s.get("meta"), dict) else {}
+        stop = _safe_float(meta.get("stop"))
+        targets = meta.get("targets") or []
+        target = _safe_float(targets[0]) if targets else None
+        anchor = _parse_signal_ts(s.get("alerted_at")) or _parse_signal_ts(s.get("bar_time"))
+        if stop is None or target is None or anchor is None:
+            continue
+
+        anchor_et = anchor.astimezone(ZoneInfo("America/New_York"))
+        day_key = (s["ticker"], anchor_et.date().isoformat())
+        if day_key not in bars_cache:
+            eod_utc = anchor_et.replace(hour=16, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            try:
+                fetched = _fetch_alpaca_bars(
+                    [s["ticker"]], timeframe="1Min",
+                    start=anchor.isoformat(),
+                    end=min(eod_utc, datetime.now(timezone.utc)).isoformat(),
+                )
+                bars_cache[day_key] = fetched.get(s["ticker"]) or []
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Plan-outcome bar fetch failed for %s: %s", day_key, exc)
+                bars_cache[day_key] = []
+
+        day_bars = [b for b in bars_cache[day_key]
+                    if (_parse_signal_ts(b["t"]) or anchor) > anchor]
+        if not day_bars:
+            continue
+        entry = float(day_bars[0]["c"])   # first tradeable close after the alert
+
+        eod_passed = (anchor_et.date() < et_now.date()
+                      or et_now.hour * 60 + et_now.minute >= 965)   # 16:05 ET
+        plan = _simulate_signal_plan(s["signal"], entry, stop, target,
+                                     day_bars[1:], eod_passed)
+        if plan is None:
+            continue                       # unresolved, session still open
+        plan["entry_exec"] = round(entry, 4)
+        try:
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE).update(
+                {"meta": {**meta, "plan": plan}}
+            ).eq("id", s["id"]).execute()
+            n_scored += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Plan-outcome update failed for signal %s: %s", s.get("id"), exc)
+    return n_scored
+
+
 def _recent_stats_for_ticker_direction(ticker: str, direction: str, n: int = 10,
                                        strategy: str = "purgatory") -> dict[str, Any] | None:
     """Return win-rate + average favorable for the last N signals on
@@ -5162,6 +5325,15 @@ def purgatory_scan():
     # Back-fill outcomes for matured signals (>= 25 min old, no outcome yet).
     # Runs every scan so the data piles up over the trading day.
     n_backfilled = _backfill_outcomes_for_matured_signals()
+
+    # Plan-based scoring for strategies that carry their own exit plan
+    # (stop/target/EOD replay — see _backfill_plan_outcomes)
+    try:
+        n_plan_scored = _backfill_plan_outcomes()
+        if n_plan_scored:
+            log.info("Plan scorer: %d signal(s) scored this pass", n_plan_scored)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Plan-outcome backfill failed: %s", exc)
 
     # Auto-trader housekeeping: pull fresh fill statuses, then close any
     # positions past the hold-time cutoff. Both no-ops when trading is off.
