@@ -4719,8 +4719,10 @@ def _persist_signal(signal: dict[str, Any]) -> str | None:
     return None
 
 
-def _fetch_persisted_signals(limit: int = 100, strategy: str | None = None) -> list[dict[str, Any]]:
-    """Pull recent signals from Supabase. Returns newest first."""
+def _fetch_persisted_signals(limit: int = 100, strategy: str | None = None,
+                             offset: int = 0) -> list[dict[str, Any]]:
+    """Pull recent signals from Supabase. Returns newest first. `offset`
+    enables paging through the full history for retro analysis."""
     if _supabase_client is None:
         return []
     try:
@@ -4728,7 +4730,7 @@ def _fetch_persisted_signals(limit: int = 100, strategy: str | None = None) -> l
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("*")
             .order("alerted_at", desc=True)
-            .limit(limit)
+            .range(offset, offset + limit - 1)
         )
         if strategy:
             q = q.eq("strategy", strategy)
@@ -5499,12 +5501,14 @@ def purgatory_external_signal(req: _ExternalSignalRequest, request: Request):
 
 
 @app.get("/purgatory/signals")
-def purgatory_signals_get(limit: int = 50, strategy: str | None = None):
+def purgatory_signals_get(limit: int = 50, strategy: str | None = None, offset: int = 0):
     """Recent signals. Prefers Supabase (survives redeploys, includes
     back-filled outcomes); falls back to in-memory list. Optional
-    ?strategy= narrows to one strategy."""
-    limit = max(1, min(int(limit), _PURGATORY_MAX_SIGNALS))
-    persisted = _fetch_persisted_signals(limit=limit, strategy=strategy)
+    ?strategy= narrows to one strategy; ?offset= pages through history
+    (Supabase path only) for retro analysis."""
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+    persisted = _fetch_persisted_signals(limit=limit, strategy=strategy, offset=offset)
     if persisted:
         # Normalize keys to match the frontend's expectations
         normalized = []
@@ -5522,6 +5526,7 @@ def purgatory_signals_get(limit: int = 50, strategy: str | None = None):
                 "meta":          s.get("meta"),
                 "alerted_at":    s.get("alerted_at"),
                 "slack_sent":    s.get("slack_sent"),
+                "scored_from":   s.get("scored_from"),
                 "outcome":       s.get("outcome"),
                 "favorable_5m":  s.get("favorable_5m"),
                 "favorable_10m": s.get("favorable_10m"),
