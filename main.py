@@ -2875,6 +2875,43 @@ ALPACA_TRADING_BASE = (
 )
 ALPACA_OPTIONS_DATA_BASE = "https://data.alpaca.markets/v1beta1/options"
 ALPACA_TRADING_NOTIONAL_USD = float(os.environ.get("ALPACA_TRADING_NOTIONAL_USD", "500"))
+
+# --- Live (real-money) account: an ADDITIVE second trading client. ---
+# The primary client above keeps paper-trading every STRATEGIES_TRADING
+# signal for data collection. When live keys are set AND a signal's
+# (strategy, ticker, direction) is in LIVE_TRADING_PAIRS (defined below,
+# after the pair parser), the same signal ALSO places a real order on
+# api.alpaca.markets. Every order row is tagged paper=true/false and all
+# downstream plumbing (sweeps, stop-losses, fill reconcile, P&L) routes
+# by that tag, so the two accounts never cross.
+ALPACA_LIVE_API_KEY = os.environ.get("ALPACA_LIVE_API_KEY", "").strip()
+ALPACA_LIVE_API_SECRET = os.environ.get("ALPACA_LIVE_API_SECRET", "").strip()
+ALPACA_LIVE_TRADING_BASE = "https://api.alpaca.markets"
+# Live sizing is deliberately its own knob — real-account bankroll and the
+# paper account's fictional $100k should never share a default silently.
+ALPACA_LIVE_NOTIONAL_USD = float(os.environ.get("ALPACA_LIVE_NOTIONAL_USD", "500"))
+
+
+def _live_keys_present() -> bool:
+    return bool(ALPACA_LIVE_API_KEY and ALPACA_LIVE_API_SECRET)
+
+
+def _live_trading_enabled() -> bool:
+    """Live orders flow only when trading is on, live keys exist, and at
+    least one pair has been explicitly promoted via LIVE_TRADING_PAIRS."""
+    return ALPACA_TRADING_ENABLED and _live_keys_present() and bool(LIVE_TRADING_PAIRS)
+
+
+def _post_slack_text(text: str) -> bool:
+    """Plain-text Slack post for trade lifecycle events (live entries/exits).
+    Separate from the rich signal-alert formatter."""
+    if not _slack_enabled():
+        return False
+    try:
+        r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=5)
+        return r.status_code < 400
+    except Exception:  # noqa: BLE001
+        return False
 # Default cut 30 → 15 after the 2026-07-08 retro: favorable moves peak at
 # 10-15m and mean-revert by 30m (QQQ/IWM/AVGO all gave back gains held past 15m).
 ALPACA_TRADING_HOLD_MINUTES = int(os.environ.get("ALPACA_TRADING_HOLD_MINUTES", "15"))
@@ -2899,11 +2936,27 @@ def _alpaca_trading_headers() -> dict[str, str]:
     }
 
 
+def _trading_api(paper: bool) -> tuple[str, dict[str, str]]:
+    """(base_url, headers) for the account a given order row lives on.
+    paper=True → the primary client (paper-api by default). paper=False →
+    the live account when live keys exist, else the primary client's
+    legacy ALPACA_PAPER=0 single-account mode."""
+    if paper or not _live_keys_present():
+        base = "https://paper-api.alpaca.markets" if paper else ALPACA_TRADING_BASE
+        return base, _alpaca_trading_headers()
+    return ALPACA_LIVE_TRADING_BASE, {
+        "APCA-API-KEY-ID": ALPACA_LIVE_API_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_LIVE_API_SECRET,
+        "Content-Type": "application/json",
+    }
+
+
 def _alpaca_list_option_contracts(
     underlying: str,
     option_type: str,
     expiration_gte: str,
     expiration_lte: str,
+    paper: bool = True,
 ) -> list[dict]:
     """List active option contracts. Returns [] on failure."""
     params = {
@@ -2914,10 +2967,11 @@ def _alpaca_list_option_contracts(
         "expiration_date_lte":   expiration_lte,
         "limit":                 "500",
     }
+    base, headers = _trading_api(paper)
     try:
         r = requests.get(
-            f"{ALPACA_TRADING_BASE}/v2/options/contracts",
-            headers=_alpaca_trading_headers(),
+            f"{base}/v2/options/contracts",
+            headers=headers,
             params=params,
             timeout=15,
         )
@@ -3025,7 +3079,8 @@ def _persist_order_row(row: dict[str, Any]) -> None:
         log.warning("Order row persist failed: %s", exc)
 
 
-def _alpaca_submit_market_order(option_symbol: str, qty: int, side: str) -> dict | None:
+def _alpaca_submit_market_order(option_symbol: str, qty: int, side: str,
+                                paper: bool = True) -> dict | None:
     body = {
         "symbol":         option_symbol,
         "qty":            str(qty),
@@ -3033,16 +3088,18 @@ def _alpaca_submit_market_order(option_symbol: str, qty: int, side: str) -> dict
         "type":           "market",
         "time_in_force":  "day",
     }
+    base, headers = _trading_api(paper)
     try:
         r = requests.post(
-            f"{ALPACA_TRADING_BASE}/v2/orders",
-            headers=_alpaca_trading_headers(),
+            f"{base}/v2/orders",
+            headers=headers,
             json=body,
             timeout=15,
         )
         if r.status_code >= 400:
-            log.warning("Order rejected (%s) for %s %s x%s: %s",
-                        r.status_code, side, option_symbol, qty, r.text[:200])
+            log.warning("Order rejected (%s, %s) for %s %s x%s: %s",
+                        r.status_code, "paper" if paper else "LIVE",
+                        side, option_symbol, qty, r.text[:200])
             return None
         return r.json()
     except Exception as exc:  # noqa: BLE001
@@ -3050,20 +3107,22 @@ def _alpaca_submit_market_order(option_symbol: str, qty: int, side: str) -> dict
         return None
 
 
-def _alpaca_close_position(option_symbol: str) -> dict | None:
+def _alpaca_close_position(option_symbol: str, paper: bool = True) -> dict | None:
     """DELETE /v2/positions/{symbol}. Returns a synthetic 'no_position' dict
     on 404 so callers can log the exit attempt without re-trying forever."""
+    base, headers = _trading_api(paper)
     try:
         r = requests.delete(
-            f"{ALPACA_TRADING_BASE}/v2/positions/{option_symbol}",
-            headers=_alpaca_trading_headers(),
+            f"{base}/v2/positions/{option_symbol}",
+            headers=headers,
             timeout=15,
         )
         if r.status_code == 404:
             return {"status": "no_position"}
         if r.status_code >= 400:
-            log.warning("Close position failed (%s) for %s: %s",
-                        r.status_code, option_symbol, r.text[:200])
+            log.warning("Close position failed (%s, %s) for %s: %s",
+                        r.status_code, "paper" if paper else "LIVE",
+                        option_symbol, r.text[:200])
             return None
         return r.json()
     except Exception as exc:  # noqa: BLE001
@@ -3071,11 +3130,12 @@ def _alpaca_close_position(option_symbol: str) -> dict | None:
         return None
 
 
-def _alpaca_get_order(order_id: str) -> dict | None:
+def _alpaca_get_order(order_id: str, paper: bool = True) -> dict | None:
+    base, headers = _trading_api(paper)
     try:
         r = requests.get(
-            f"{ALPACA_TRADING_BASE}/v2/orders/{order_id}",
-            headers=_alpaca_trading_headers(),
+            f"{base}/v2/orders/{order_id}",
+            headers=headers,
             timeout=10,
         )
         r.raise_for_status()
@@ -3085,8 +3145,10 @@ def _alpaca_get_order(order_id: str) -> dict | None:
 
 
 def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
-    """Enter a position for this signal. No-op if trading is off or Alpaca
-    isn't configured. Returns the Alpaca order response on success."""
+    """Enter position(s) for this signal. The primary (paper) account trades
+    every STRATEGIES_TRADING signal for data collection; the live account
+    additionally trades pairs in LIVE_TRADING_PAIRS. No-op if trading is
+    off or Alpaca isn't configured. Returns the primary order on success."""
     if not ALPACA_TRADING_ENABLED:
         return None
     if not _alpaca_enabled():
@@ -3099,11 +3161,6 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
     ticker = signal["ticker"]
     direction = signal["signal"]     # 'call' | 'put'
     spot = float(signal["price"])
-
-    if TRADING_PAIRS_ALLOWLIST and (strategy, ticker, direction) not in TRADING_PAIRS_ALLOWLIST:
-        log.info("Trade skipped (%s %s %s): not in TRADING_PAIRS_ALLOWLIST",
-                 strategy, ticker, direction)
-        return None
 
     contract = _select_option_contract(ticker, spot, direction)
     if not contract:
@@ -3120,36 +3177,53 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
         return None
 
     premium = (quote or {}).get("mid") or _estimate_option_premium(contract)
-    if premium and premium > 0:
-        qty = max(1, int(ALPACA_TRADING_NOTIONAL_USD / (premium * 100)))
-    else:
-        qty = 1   # premium unknown → conservative single contract
 
-    order = _alpaca_submit_market_order(contract["symbol"], qty, "buy")
-    if not order:
-        return None
+    def _enter(paper: bool, notional: float) -> dict | None:
+        if premium and premium > 0:
+            qty = max(1, int(notional / (premium * 100)))
+        else:
+            qty = 1   # premium unknown → conservative single contract
+        order = _alpaca_submit_market_order(contract["symbol"], qty, "buy", paper=paper)
+        if not order:
+            return None
+        _persist_order_row({
+            "strategy":          strategy,
+            "signal_ticker":     ticker,
+            "signal_direction":  direction,
+            "signal_bar_time":   signal["bar_time"],
+            "option_symbol":     contract["symbol"],
+            "option_strike":     _safe_float(contract.get("strike_price")),
+            "option_expiration": contract.get("expiration_date"),
+            "option_type":       direction,
+            "underlying_price":  spot,
+            "side":              "buy",
+            "role":              "entry",
+            "qty":               qty,
+            "alpaca_order_id":   order.get("id"),
+            "alpaca_status":     order.get("status"),
+            "submitted_at":      _now_iso(),
+            "paper":             paper,
+            "raw":               {**order, "quote_at_submit": quote} if quote else order,
+        })
+        log.info("%s ENTRY: %s %s %s x%s (order %s)",
+                 "Paper" if paper else "LIVE", ticker, direction,
+                 contract["symbol"], qty, order.get("id"))
+        return order
 
-    _persist_order_row({
-        "strategy":          strategy,
-        "signal_ticker":     ticker,
-        "signal_direction":  direction,
-        "signal_bar_time":   signal["bar_time"],
-        "option_symbol":     contract["symbol"],
-        "option_strike":     _safe_float(contract.get("strike_price")),
-        "option_expiration": contract.get("expiration_date"),
-        "option_type":       direction,
-        "underlying_price":  spot,
-        "side":              "buy",
-        "role":              "entry",
-        "qty":               qty,
-        "alpaca_order_id":   order.get("id"),
-        "alpaca_status":     order.get("status"),
-        "submitted_at":      _now_iso(),
-        "paper":             ALPACA_PAPER,
-        "raw":               {**order, "quote_at_submit": quote} if quote else order,
-    })
-    log.info("Purgatory ENTRY: %s %s %s x%s (order %s)",
-             ticker, direction, contract["symbol"], qty, order.get("id"))
+    # Primary leg — tagged with the primary account's actual mode, so the
+    # legacy ALPACA_PAPER=0 single-account setup keeps working unchanged.
+    order = _enter(paper=ALPACA_PAPER, notional=ALPACA_TRADING_NOTIONAL_USD)
+
+    # Live leg — additive, only when the primary is paper (never double-fire
+    # a live account) and this exact pair has been promoted to real money.
+    if (ALPACA_PAPER and _live_trading_enabled()
+            and (strategy, ticker, direction) in LIVE_TRADING_PAIRS):
+        live_order = _enter(paper=False, notional=ALPACA_LIVE_NOTIONAL_USD)
+        if live_order:
+            _post_slack_text(
+                f"💵 *LIVE ENTRY* — {ticker} {direction.upper()} "
+                f"({contract['symbol']}), ~${ALPACA_LIVE_NOTIONAL_USD:.0f} notional. "
+                f"Exit in {ALPACA_TRADING_HOLD_MINUTES} min or at -{ALPACA_TRADING_STOP_LOSS_PCT:.0f}% stop.")
     return order
 
 
@@ -3183,13 +3257,17 @@ def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
             .eq("role", "exit")
             .execute()
         )
+        # paper joins the key: the live and paper legs of one signal are
+        # separate positions and must open/close independently.
         closed = {
-            (r.get("strategy") or "purgatory", r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
+            (r.get("strategy") or "purgatory", r["signal_ticker"], r["signal_direction"],
+             r["signal_bar_time"], bool(r.get("paper", True)))
             for r in (exits_res.data or [])
         }
         return [
             e for e in entries
-            if (e.get("strategy") or "purgatory", e["signal_ticker"], e["signal_direction"], e["signal_bar_time"]) not in closed
+            if (e.get("strategy") or "purgatory", e["signal_ticker"], e["signal_direction"],
+                e["signal_bar_time"], bool(e.get("paper", True))) not in closed
         ]
     except Exception as exc:  # noqa: BLE001
         log.warning("Sweep query failed: %s", exc)
@@ -3209,9 +3287,10 @@ def _sweep_pending_positions() -> int:
         qty = entry.get("qty") or 1
         if not opt:
             continue
+        paper = bool(entry.get("paper", True))
 
         quote = _quote_snapshot(opt)
-        result = _alpaca_close_position(opt)
+        result = _alpaca_close_position(opt, paper=paper)
         if not result:
             continue
 
@@ -3234,12 +3313,16 @@ def _sweep_pending_positions() -> int:
             "alpaca_order_id":   result.get("id"),
             "alpaca_status":     status,
             "submitted_at":      _now_iso(),
-            "paper":             ALPACA_PAPER,
+            "paper":             paper,
             "raw":               raw,
         })
         n_closed += 1
-        log.info("Purgatory EXIT: %s %s %s x%s (status %s)",
+        log.info("%s EXIT: %s %s %s x%s (status %s)",
+                 "Paper" if paper else "LIVE",
                  entry["signal_ticker"], entry["signal_direction"], opt, qty, status)
+        if not paper:
+            _post_slack_text(f"💵 *LIVE EXIT* (hold timer) — {entry['signal_ticker']} "
+                             f"{entry['signal_direction'].upper()} ({opt}) closed.")
     return n_closed
 
 
@@ -3335,7 +3418,8 @@ def _sweep_stop_losses() -> int:
         if loss_pct < ALPACA_TRADING_STOP_LOSS_PCT:
             continue
 
-        result = _alpaca_close_position(opt)
+        paper = bool(entry.get("paper", True))
+        result = _alpaca_close_position(opt, paper=paper)
         if not result:
             continue
         _persist_order_row({
@@ -3353,7 +3437,7 @@ def _sweep_stop_losses() -> int:
             "alpaca_order_id":   result.get("id"),
             "alpaca_status":     result.get("status", "accepted"),
             "submitted_at":      _now_iso(),
-            "paper":             ALPACA_PAPER,
+            "paper":             paper,
             "raw":               {"exit_reason": "stop_loss",
                                   "stop_basis": stop_basis,
                                   "loss_pct_at_trigger": round(loss_pct, 2),
@@ -3362,8 +3446,13 @@ def _sweep_stop_losses() -> int:
                                   **(result or {})},
         })
         n_stopped += 1
-        log.info("Purgatory STOP-LOSS EXIT: %s %s %s x%s (-%.1f%% vs entry, basis %s)",
+        log.info("%s STOP-LOSS EXIT: %s %s %s x%s (-%.1f%% vs entry, basis %s)",
+                 "Paper" if paper else "LIVE",
                  entry["signal_ticker"], entry["signal_direction"], opt, qty, loss_pct, stop_basis)
+        if not paper:
+            _post_slack_text(f"🛑 *LIVE STOP-LOSS* — {entry['signal_ticker']} "
+                             f"{entry['signal_direction'].upper()} ({opt}) closed at "
+                             f"-{loss_pct:.1f}% vs entry (basis: {stop_basis}).")
     return n_stopped
 
 
@@ -3376,7 +3465,7 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
     try:
         res = (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("id,alpaca_order_id,alpaca_status,qty,raw")
+            .select("id,alpaca_order_id,alpaca_status,qty,raw,paper")
             .gte("submitted_at", cutoff)
             .execute()
         )
@@ -3392,7 +3481,7 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
         order_id = row.get("alpaca_order_id")
         if not order_id:
             continue
-        remote = _alpaca_get_order(order_id)
+        remote = _alpaca_get_order(order_id, paper=bool(row.get("paper", True)))
         if not remote:
             continue
         fill_price = _safe_float(remote.get("filled_avg_price"))
@@ -3416,14 +3505,17 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
 
 
 def _match_order_rows(rows: list[dict]) -> list[dict]:
-    """Pair entry↔exit order rows by (strategy, ticker, direction, bar_time)
-    and compute per-trade realized P&L. Shared by the daily summary and the
-    all-time P&L series."""
+    """Pair entry↔exit order rows by (strategy, ticker, direction, bar_time,
+    account) and compute per-trade realized P&L. Shared by the daily summary
+    and the all-time P&L series. The account joins the key because one
+    signal can carry both a paper leg and a live leg — separate positions
+    with separate fills that must never cross-match."""
     entries: dict[tuple, dict] = {}
     exits: dict[tuple, dict] = {}
     for r in rows:
         key = (r.get("strategy") or "purgatory",
-               r["signal_ticker"], r["signal_direction"], r["signal_bar_time"])
+               r["signal_ticker"], r["signal_direction"], r["signal_bar_time"],
+               bool(r.get("paper", True)))
         if r["role"] == "entry":
             entries[key] = r
         elif r["role"] == "exit":
@@ -3461,6 +3553,7 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
 
         trades.append({
             "strategy":           key[0],
+            "account":            "paper" if key[4] else "live",
             "ticker":             entry["signal_ticker"],
             "direction":          entry["signal_direction"],
             "bar_time":           entry["signal_bar_time"],
@@ -3483,9 +3576,11 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
     return trades
 
 
-def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
+def _compute_daily_realized_pnl(date_str: str, account: str | None = None) -> dict[str, Any] | None:
     """Match entry→exit pairs submitted on `date_str` (UTC day window; the
-    US session sits entirely inside one UTC day) and compute realized P&L."""
+    US session sits entirely inside one UTC day) and compute realized P&L.
+    `account` filters to 'live' or 'paper'; None includes both (with a
+    by_account breakdown)."""
     if _supabase_client is None:
         return None
     try:
@@ -3505,6 +3600,8 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
         return None
 
     trades = _match_order_rows(rows)
+    if account in ("live", "paper"):
+        trades = [t for t in trades if t["account"] == account]
     if not trades:
         return None
 
@@ -3543,6 +3640,19 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
     n = len(trades)
     with_mid = [t for t in trades if t["pnl_at_mid"] is not None]
     total_at_mid = sum(t["pnl_at_mid"] for t in with_mid) if with_mid else None
+
+    by_account: dict[str, dict[str, Any]] = {}
+    for acct in ("live", "paper"):
+        sub = [t for t in trades if t["account"] == acct]
+        if sub:
+            by_account[acct] = {
+                "closed_trades": len(sub),
+                "wins":          sum(1 for t in sub if t["pnl"] > 0),
+                "losses":        sum(1 for t in sub if t["pnl"] < 0),
+                "stopped":       sum(1 for t in sub if t["exit_reason"] == "stop_loss"),
+                "total_pnl":     round(sum(t["pnl"] for t in sub), 2),
+            }
+
     return {
         "closed_trades":  n,
         "stopped":        sum(1 for t in trades if t["exit_reason"] == "stop_loss"),
@@ -3559,6 +3669,7 @@ def _compute_daily_realized_pnl(date_str: str) -> dict[str, Any] | None:
         "best":           {"ticker": best["ticker"], "pnl": round(best["pnl"], 2)},
         "worst":          {"ticker": worst["ticker"], "pnl": round(worst["pnl"], 2)},
         "trades":         trades,
+        "by_account":     by_account,
         "paper":          ALPACA_PAPER,
     }
 
@@ -3612,15 +3723,28 @@ PURGATORY_DISABLED_PAIRS = _parse_manual_disabled_pairs(
     os.environ.get("PURGATORY_DISABLED_PAIRS", "AVGO:call,AVGO:put")
 )
 
-# Live-trading scalpel: when set, orders are placed ONLY for pairs on this
-# allowlist — every other trading-strategy signal stays alert+scoring-only.
-# Same triple format as disabled pairs ("purgatory:TSLA:call,..."). Empty
-# (the default) means no restriction, preserving existing behavior. This
-# exists so a real-money rollout can start with a single proven pair
-# instead of inheriting every signal the strategy fires.
-TRADING_PAIRS_ALLOWLIST = _parse_manual_disabled_pairs(
-    os.environ.get("TRADING_PAIRS_ALLOWLIST", "")
+# Pairs promoted to the live (real-money) account, e.g. "purgatory:TSLA:call".
+# The paper account keeps trading every STRATEGIES_TRADING signal regardless —
+# live is additive, scoped to exactly these triples, and inert while empty.
+# (Supersedes the short-lived TRADING_PAIRS_ALLOWLIST, which gated the single
+# shared client before the accounts were separated.)
+LIVE_TRADING_PAIRS = _parse_manual_disabled_pairs(
+    os.environ.get("LIVE_TRADING_PAIRS", "")
 )
+
+# Slack signal-alert scope: "all" (every signal — the default), "trading"
+# (only STRATEGIES_TRADING signals), or "live" (only signals that map to a
+# LIVE_TRADING_PAIRS entry). Paper data collection keeps running silently
+# in the narrower scopes; retros and live trade notifications always post.
+SLACK_SIGNAL_SCOPE = os.environ.get("SLACK_SIGNAL_SCOPE", "all").strip().lower()
+
+
+def _slack_scope_allows(sig: dict[str, Any]) -> bool:
+    if SLACK_SIGNAL_SCOPE == "trading":
+        return sig["strategy"] in STRATEGIES_TRADING
+    if SLACK_SIGNAL_SCOPE == "live":
+        return (sig["strategy"], sig["ticker"], sig["signal"]) in LIVE_TRADING_PAIRS
+    return True
 
 
 def _bar_window_category(bar_time_iso: str) -> str:
@@ -5246,7 +5370,9 @@ def _fire_signal(sig: dict[str, Any]) -> bool:
                                                strategy=sig["strategy"])
     sig["recent_stats"] = stats
 
-    sig["slack_sent"] = _send_slack_alert(sig, stats=stats)
+    # SLACK_SIGNAL_SCOPE can quiet data-collection alerts (paper/signals-only)
+    # while live-pair signals still ping. Muted signals persist + score as usual.
+    sig["slack_sent"] = _send_slack_alert(sig, stats=stats) if _slack_scope_allows(sig) else False
 
     # Auto-trade the signal (paper by default; only strategies in
     # STRATEGIES_TRADING place orders). Wrapped so a broker error
@@ -5625,10 +5751,11 @@ def purgatory_stats(days: int = 30, strategy: str | None = None):
 
 
 @app.get("/purgatory/orders")
-def purgatory_orders_get(date: str | None = None):
+def purgatory_orders_get(date: str | None = None, account: str | None = None):
     """Auto-trader results for a UTC date (defaults to today). Reconciles
     open fill statuses first, then returns matched entry/exit pairs with
-    per-trade P&L. Empty payload if the trader hasn't done anything yet."""
+    per-trade P&L. ?account=live|paper narrows to one account. Empty
+    payload if the trader hasn't done anything yet."""
     if not date:
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     n_updated = 0
@@ -5636,7 +5763,7 @@ def purgatory_orders_get(date: str | None = None):
         n_updated = _reconcile_open_order_fills()
     except Exception as exc:  # noqa: BLE001
         log.warning("Reconcile before /purgatory/orders failed: %s", exc)
-    pnl = _compute_daily_realized_pnl(date)
+    pnl = _compute_daily_realized_pnl(date, account=account)
     if not pnl:
         return {
             "date":            date,
@@ -5650,10 +5777,11 @@ def purgatory_orders_get(date: str | None = None):
 
 
 @app.get("/purgatory/pnl")
-def purgatory_pnl():
+def purgatory_pnl(account: str | None = None):
     """All-time realized P&L: per-day series (with running cumulative) plus
     rollups for today / trailing 7d / 30d / 180d / all time. Drives the
-    Trading tab's performance chart and stat tiles."""
+    Trading tab's performance chart and stat tiles. ?account=live|paper
+    narrows to one account (default: both)."""
     if _supabase_client is None:
         raise HTTPException(503, "P&L history requires Supabase.")
     try:
@@ -5668,6 +5796,8 @@ def purgatory_pnl():
         raise HTTPException(502, f"Supabase P&L query failed: {exc}") from exc
 
     trades = _match_order_rows(rows)
+    if account in ("live", "paper"):
+        trades = [t for t in trades if t["account"] == account]
 
     by_day: dict[str, dict[str, Any]] = {}
     for t in trades:
@@ -5765,8 +5895,14 @@ def purgatory_status():
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
-        "trading_pairs_allowlist": [{"strategy": s, "ticker": t, "direction": d}
-                                    for s, t, d in sorted(TRADING_PAIRS_ALLOWLIST)],
+        "live_trading": {
+            "keys_configured": _live_keys_present(),
+            "active":          ALPACA_PAPER and _live_trading_enabled(),
+            "pairs":           [{"strategy": s, "ticker": t, "direction": d}
+                                for s, t, d in sorted(LIVE_TRADING_PAIRS)],
+            "notional_usd":    ALPACA_LIVE_NOTIONAL_USD,
+        },
+        "slack_signal_scope":      SLACK_SIGNAL_SCOPE,
         "signal_spread_cost_pct":  SIGNAL_SPREAD_COST_PCT,
         "strategies":              _strategy_status_block(),
         "manual_disabled_pairs":   [{"strategy": s, "ticker": t, "direction": d}
@@ -6081,9 +6217,22 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
         log.warning("Realized P&L computation failed: %s", exc)
         pnl = None
     if pnl and pnl["closed_trades"] > 0:
-        tag = "Paper" if pnl["paper"] else "LIVE"
+        by_acct = pnl.get("by_account") or {}
+        # With both accounts trading, headline each separately; otherwise
+        # keep the legacy single-line format.
+        if "live" in by_acct and "paper" in by_acct:
+            tag = "Live + Paper"
+        else:
+            tag = "LIVE" if "live" in by_acct else "Paper"
         pnl_emoji = "🟢" if pnl["total_pnl"] > 0 else ("🔴" if pnl["total_pnl"] < 0 else "⚪")
         stopped_str = f" · ⛔ {pnl['stopped']} stopped" if pnl.get("stopped") else ""
+        acct_str = ""
+        if "live" in by_acct and "paper" in by_acct:
+            lv, pp = by_acct["live"], by_acct["paper"]
+            acct_str = (f"\n• 💵 Live: *${lv['total_pnl']:+,.2f}* "
+                        f"({lv['closed_trades']} closed, {lv['wins']}W/{lv['losses']}L)"
+                        f"   📋 Paper: ${pp['total_pnl']:+,.2f} "
+                        f"({pp['closed_trades']} closed, {pp['wins']}W/{pp['losses']}L)")
         mid_str = ""
         if pnl.get("total_pnl_at_mid") is not None:
             mid_str = (f"\n• At quote mid: ${pnl['total_pnl_at_mid']:+,.2f} · "
@@ -6092,7 +6241,7 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
             f"💰 *Real P&L ({tag})*  {pnl_emoji} *${pnl['total_pnl']:+,.2f}* net\n"
             f"• {pnl['closed_trades']} closed · {pnl['wins']} W / {pnl['losses']} L · "
-            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade{stopped_str}{mid_str}\n"
+            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade{stopped_str}{acct_str}{mid_str}\n"
             f"• 🏆 `{pnl['best']['ticker']}` ${pnl['best']['pnl']:+,.2f}   "
             f"💀 `{pnl['worst']['ticker']}` ${pnl['worst']['pnl']:+,.2f}"
         }})

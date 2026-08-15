@@ -883,7 +883,14 @@
       <section class="card p-4">
         <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
           <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">P&amp;L performance</h3>
-          <span id="trading-perf-meta" class="text-xs text-ink-faint"></span>
+          <div class="flex items-center gap-3">
+            <select id="trading-account" class="input px-2 py-1 text-xs" title="Filters both P&L sections — live money and paper rehearsal never mix">
+              <option value="all">All accounts</option>
+              <option value="live">💵 Live only</option>
+              <option value="paper">Paper only</option>
+            </select>
+            <span id="trading-perf-meta" class="text-xs text-ink-faint"></span>
+          </div>
         </div>
         <div id="trading-perf-tiles" class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-4"></div>
         <div class="relative h-56"><canvas id="trading-pnl-chart"></canvas></div>
@@ -3377,8 +3384,15 @@ async function refreshTradingStatus() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
     _setPill("trading-enabled-pill", `Trader: ${d.trading_enabled ? "on" : "off"}`, d.trading_enabled ? "good" : "neutral");
-    _setPill("trading-mode-pill", `Mode: ${d.trading_paper ? "paper" : "LIVE"}`, d.trading_paper ? "good" : "bad");
-    _setPill("trading-notional-pill", `Size: $${d.trading_notional_usd ?? "—"}/trade`, "neutral");
+    const lv = d.live_trading || {};
+    const liveMode = lv.active
+      ? `paper + 💵 LIVE (${(lv.pairs || []).map(p => `${p.ticker} ${p.direction}s`).join(", ") || "no pairs"})`
+      : (d.trading_paper ? "paper" : "LIVE");
+    _setPill("trading-mode-pill", `Mode: ${liveMode}`, lv.active ? "bad" : (d.trading_paper ? "good" : "bad"));
+    const sizeStr = lv.active
+      ? `$${d.trading_notional_usd ?? "—"} paper · $${lv.notional_usd ?? "—"} live`
+      : `$${d.trading_notional_usd ?? "—"}/trade`;
+    _setPill("trading-notional-pill", `Size: ${sizeStr}`, "neutral");
     _setPill("trading-hold-pill", `Hold: ${d.trading_hold_minutes ?? "—"} min`, "neutral");
     renderTradingStrategies(d.strategies || []);
     const upd = document.getElementById("trading-updated");
@@ -3414,12 +3428,22 @@ function renderTradingStrategies(strats) {
   }).join("")}</div>`;
 }
 
+function _tradingAccount() {
+  const v = localStorage.getItem("trading.account") || "all";
+  return ["all", "live", "paper"].includes(v) ? v : "all";
+}
+
 async function refreshTradingPnl() {
   const cardsEl = document.getElementById("trading-pnl-cards");
   const tradesEl = document.getElementById("trading-trades");
   const date = document.getElementById("trading-date").value;
+  const acct = _tradingAccount();
   try {
-    const r = await fetch(`/purgatory/orders${date ? `?date=${encodeURIComponent(date)}` : ""}`);
+    const params = new URLSearchParams();
+    if (date) params.set("date", date);
+    if (acct !== "all") params.set("account", acct);
+    const qs = params.toString();
+    const r = await fetch(`/purgatory/orders${qs ? `?${qs}` : ""}`);
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
     const d = await r.json();
 
@@ -3453,6 +3477,7 @@ async function refreshTradingPnl() {
         <thead class="text-ink-faint uppercase tracking-wider">
           <tr>
             <th class="text-left pb-2 pr-3">Ticker</th>
+            <th class="text-center pb-2 pr-3">Acct</th>
             <th class="text-center pb-2 pr-3">Strat</th>
             <th class="text-center pb-2 pr-3">Dir</th>
             <th class="text-left pb-2 pr-3">Signal bar</th>
@@ -3467,6 +3492,7 @@ async function refreshTradingPnl() {
         <tbody>${trades.map(t => `
           <tr class="border-t border-line${(t.signal_outcome === "win" && t.pnl < 0) || (t.signal_outcome === "loss" && t.pnl > 0) ? " bg-amber-500/5" : ""}">
             <td class="py-1.5 pr-3 mono font-semibold text-ink"><a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(t.ticker || "")}">${escapeHTML(t.ticker || "")}</a></td>
+            <td class="py-1.5 pr-3 text-center" title="${t.account === "live" ? "Real-money account" : "Paper account"}">${t.account === "live" ? "💵" : "📋"}</td>
             <td class="py-1.5 pr-3 text-center">${_strategyBadge(t.strategy)}</td>
             <td class="py-1.5 pr-3 text-center font-bold ${t.direction === "call" ? "val-up" : "val-down"}">${t.direction === "call" ? "CALL" : "PUT"}</td>
             <td class="py-1.5 pr-3 mono text-ink-dim">${t.bar_time ? escapeHTML(new Date(t.bar_time).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })) : "—"}</td>
@@ -3483,6 +3509,7 @@ async function refreshTradingPnl() {
         <div class="border border-line rounded-lg p-3 flex items-center justify-between gap-3">
           <div>
             <div class="flex items-center gap-2">
+              <span title="${t.account === "live" ? "Real-money account" : "Paper account"}">${t.account === "live" ? "💵" : "📋"}</span>
               <span class="mono font-semibold text-ink"><a href="#" class="hover:text-brand underline decoration-dotted" data-analyze="${escapeHTML(t.ticker || "")}">${escapeHTML(t.ticker || "")}</a></span>
               <span class="font-bold text-xs ${t.direction === "call" ? "val-up" : "val-down"}">${t.direction === "call" ? "CALL" : "PUT"}</span>
               ${t.signal_outcome ? _outcomeBadge(t.signal_outcome) : ""}
@@ -3542,8 +3569,9 @@ let _tradingPnlChart = null;
 async function refreshTradingPerf() {
   const tilesEl = document.getElementById("trading-perf-tiles");
   const meta = document.getElementById("trading-perf-meta");
+  const acct = _tradingAccount();
   try {
-    const r = await fetch("/purgatory/pnl");
+    const r = await fetch(`/purgatory/pnl${acct !== "all" ? `?account=${acct}` : ""}`);
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
     const d = await r.json();
     const t = d.totals || {};
@@ -3559,7 +3587,8 @@ async function refreshTradingPerf() {
       tile("6 months", t.six_months),
       tile("All time", t.all_time),
     ].join("");
-    if (meta) meta.textContent = `${d.total_trades} closed trades · ${d.paper ? "paper" : "LIVE"}`;
+    const acctLabel = acct === "all" ? "all accounts" : (acct === "live" ? "💵 live" : "paper");
+    if (meta) meta.textContent = `${d.total_trades} closed trades · ${acctLabel}`;
     _buildTradingPnlChart(d.days || []);
   } catch (e) {
     tilesEl.innerHTML = `<div class="col-span-full text-ink-faint text-sm">${escapeHTML(e.message)}</div>`;
@@ -3609,6 +3638,15 @@ async function refreshTrading() {
 
 document.getElementById("trading-refresh-btn").addEventListener("click", refreshTrading);
 document.getElementById("trading-date").addEventListener("change", refreshTradingPnl);
+{
+  const acctSel = document.getElementById("trading-account");
+  acctSel.value = _tradingAccount();
+  acctSel.addEventListener("change", () => {
+    localStorage.setItem("trading.account", acctSel.value);
+    refreshTradingPerf();
+    refreshTradingPnl();
+  });
+}
 
 // ===================== Live auto-refresh =====================
 // Alerts and Trading are monitors, not documents: refresh every 60s while
