@@ -2890,6 +2890,12 @@ ALPACA_LIVE_TRADING_BASE = "https://api.alpaca.markets"
 # Live sizing is deliberately its own knob — real-account bankroll and the
 # paper account's fictional $100k should never share a default silently.
 ALPACA_LIVE_NOTIONAL_USD = float(os.environ.get("ALPACA_LIVE_NOTIONAL_USD", "500"))
+# Sizing floors at 1 contract, so a single expensive contract can overshoot
+# the notional target. Cap what one live trade may cost (default 1.5x the
+# notional); a pricier signal skips the live leg with a Slack note while
+# the paper leg still trades and measures it. <= 0 disables the cap.
+ALPACA_LIVE_MAX_TRADE_USD = float(os.environ.get(
+    "ALPACA_LIVE_MAX_TRADE_USD", str(1.5 * ALPACA_LIVE_NOTIONAL_USD)))
 
 
 def _live_keys_present() -> bool:
@@ -3218,12 +3224,28 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
     # a live account) and this exact pair has been promoted to real money.
     if (ALPACA_PAPER and _live_trading_enabled()
             and (strategy, ticker, direction) in LIVE_TRADING_PAIRS):
-        live_order = _enter(paper=False, notional=ALPACA_LIVE_NOTIONAL_USD)
-        if live_order:
-            _post_slack_text(
-                f"💵 *LIVE ENTRY* — {ticker} {direction.upper()} "
-                f"({contract['symbol']}), ~${ALPACA_LIVE_NOTIONAL_USD:.0f} notional. "
-                f"Exit in {ALPACA_TRADING_HOLD_MINUTES} min or at -{ALPACA_TRADING_STOP_LOSS_PCT:.0f}% stop.")
+        if not premium or premium <= 0:
+            # Real money never trades at an unknown price; the paper leg
+            # above already took the signal, so nothing is lost analytically.
+            log.info("LIVE skip (%s %s): no usable premium to size against", ticker, direction)
+            _post_slack_text(f"⚠️ *LIVE SKIP* — {ticker} {direction.upper()}: no usable "
+                             f"quote to size against. Paper leg still trades.")
+        else:
+            est_qty = max(1, int(ALPACA_LIVE_NOTIONAL_USD / (premium * 100)))
+            est_cost = est_qty * premium * 100
+            if ALPACA_LIVE_MAX_TRADE_USD > 0 and est_cost > ALPACA_LIVE_MAX_TRADE_USD:
+                log.info("LIVE skip (%s %s): est cost $%.0f > $%.0f cap",
+                         ticker, direction, est_cost, ALPACA_LIVE_MAX_TRADE_USD)
+                _post_slack_text(f"⚠️ *LIVE SKIP* — {ticker} {direction.upper()}: one contract "
+                                 f"≈ ${premium * 100:.0f}, over the ${ALPACA_LIVE_MAX_TRADE_USD:.0f} "
+                                 f"live cap (ALPACA_LIVE_MAX_TRADE_USD). Paper leg still trades.")
+            else:
+                live_order = _enter(paper=False, notional=ALPACA_LIVE_NOTIONAL_USD)
+                if live_order:
+                    _post_slack_text(
+                        f"💵 *LIVE ENTRY* — {ticker} {direction.upper()} "
+                        f"({contract['symbol']}) x{est_qty}, ~${est_cost:.0f}. "
+                        f"Exit in {ALPACA_TRADING_HOLD_MINUTES} min or at -{ALPACA_TRADING_STOP_LOSS_PCT:.0f}% stop.")
     return order
 
 
@@ -5901,6 +5923,7 @@ def purgatory_status():
             "pairs":           [{"strategy": s, "ticker": t, "direction": d}
                                 for s, t, d in sorted(LIVE_TRADING_PAIRS)],
             "notional_usd":    ALPACA_LIVE_NOTIONAL_USD,
+            "max_trade_usd":   ALPACA_LIVE_MAX_TRADE_USD,
         },
         "slack_signal_scope":      SLACK_SIGNAL_SCOPE,
         "signal_spread_cost_pct":  SIGNAL_SPREAD_COST_PCT,

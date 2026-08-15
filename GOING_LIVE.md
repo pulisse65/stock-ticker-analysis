@@ -35,6 +35,7 @@ advice — it's the plumbing, documented.
 | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_API_SECRET` | live keys | never paste in chat — straight into Render |
 | `LIVE_TRADING_PAIRS` | `purgatory:TSLA:call` | the ONLY pair that trades real money |
 | `ALPACA_LIVE_NOTIONAL_USD` | your per-trade size | live sizing is its own knob; think in % of bankroll |
+| `ALPACA_LIVE_MAX_TRADE_USD` | optional, default 1.5× notional | hard cap per live trade — a pricier contract skips the live leg (Slack note); paper still trades it |
 | `SLACK_SIGNAL_SCOPE` | `live` (optional) | quiets paper/signals-only alerts; live entries/stops/exits still ping |
 
 Do NOT touch: `ALPACA_API_KEY`/`SECRET` (paper + market data),
