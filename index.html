@@ -3385,10 +3385,15 @@ async function refreshTradingStatus() {
     const d = await r.json();
     _setPill("trading-enabled-pill", `Trader: ${d.trading_enabled ? "on" : "off"}`, d.trading_enabled ? "good" : "neutral");
     const lv = d.live_trading || {};
+    const halted = !!(lv.halt && lv.halt.halted);
     const liveMode = lv.active
-      ? `paper + 💵 LIVE (${(lv.pairs || []).map(p => `${p.ticker} ${p.direction}s`).join(", ") || "no pairs"})`
+      ? (halted
+        ? "paper + 🛑 LIVE HALTED"
+        : `paper + 💵 LIVE (${(lv.pairs || []).map(p => `${p.ticker} ${p.direction}s`).join(", ") || "no pairs"})`)
       : (d.trading_paper ? "paper" : "LIVE");
     _setPill("trading-mode-pill", `Mode: ${liveMode}`, lv.active ? "bad" : (d.trading_paper ? "good" : "bad"));
+    const modeEl = document.getElementById("trading-mode-pill");
+    if (modeEl) modeEl.title = halted ? `Circuit breaker: ${lv.halt.reason || ""}` : "";
     const sizeStr = lv.active
       ? `$${d.trading_notional_usd ?? "—"} paper · $${lv.notional_usd ?? "—"} live`
       : `$${d.trading_notional_usd ?? "—"}/trade`;

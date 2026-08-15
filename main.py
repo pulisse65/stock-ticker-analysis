@@ -2897,6 +2897,23 @@ ALPACA_LIVE_NOTIONAL_USD = float(os.environ.get("ALPACA_LIVE_NOTIONAL_USD", "500
 ALPACA_LIVE_MAX_TRADE_USD = float(os.environ.get(
     "ALPACA_LIVE_MAX_TRADE_USD", str(1.5 * ALPACA_LIVE_NOTIONAL_USD)))
 
+# --- Live-account circuit breaker (automatic stand-down) ---
+# Two triggers, checked before every live entry:
+#   1. cumulative live P&L <= -LIVE_HALT_MAX_LOSS_USD  (any trade count)
+#   2. win rate < LIVE_HALT_MAX_WIN_RATE once >= LIVE_HALT_MIN_TRADES closed
+# The state is computed from the closed-trade record in Supabase, never
+# stored: it survives restarts, can't silently reset, and latches by
+# construction (a halt stops new entries, so the record that tripped it
+# never changes). Resuming after review is the one deliberate human act:
+# set LIVE_HALT_RESET_AT to an ISO timestamp and only newer trades count.
+LIVE_HALT_MIN_TRADES = int(os.environ.get("LIVE_HALT_MIN_TRADES", "10"))
+LIVE_HALT_MAX_WIN_RATE = float(os.environ.get("LIVE_HALT_MAX_WIN_RATE", "60"))
+LIVE_HALT_MAX_LOSS_USD = float(os.environ.get("LIVE_HALT_MAX_LOSS_USD", "150"))
+LIVE_HALT_RESET_AT = os.environ.get("LIVE_HALT_RESET_AT", "").strip()
+_live_halt_cache: tuple[float, dict] = (0.0, {})
+_LIVE_HALT_CACHE_TTL = 300
+_live_halt_slacked = False
+
 
 def _live_keys_present() -> bool:
     return bool(ALPACA_LIVE_API_KEY and ALPACA_LIVE_API_SECRET)
@@ -3224,7 +3241,12 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
     # a live account) and this exact pair has been promoted to real money.
     if (ALPACA_PAPER and _live_trading_enabled()
             and (strategy, ticker, direction) in LIVE_TRADING_PAIRS):
-        if not premium or premium <= 0:
+        halt = _live_halt_status()
+        if halt.get("halted"):
+            log.warning("LIVE HALTED (%s) — skipping live entry for %s %s",
+                        halt.get("reason"), ticker, direction)
+            _notify_live_halt_once(halt)
+        elif not premium or premium <= 0:
             # Real money never trades at an unknown price; the paper leg
             # above already took the signal, so nothing is lost analytically.
             log.info("LIVE skip (%s %s): no usable premium to size against", ticker, direction)
@@ -3694,6 +3716,87 @@ def _compute_daily_realized_pnl(date_str: str, account: str | None = None) -> di
         "by_account":     by_account,
         "paper":          ALPACA_PAPER,
     }
+
+
+def _evaluate_live_halt(trades: list[dict]) -> dict[str, Any]:
+    """Pure circuit-breaker evaluation over closed live trades. Split from
+    the fetch so the tripwire logic is testable with synthetic trades."""
+    if LIVE_HALT_RESET_AT:
+        trades = [t for t in trades
+                  if (t.get("entry_submitted_at") or "") >= LIVE_HALT_RESET_AT]
+    n = len(trades)
+    wins = sum(1 for t in trades if t["pnl"] > 0)
+    total = round(sum(t["pnl"] for t in trades), 2)
+    wr = round(wins / n * 100, 1) if n else None
+    halted, reason = False, None
+    if LIVE_HALT_MAX_LOSS_USD > 0 and total <= -LIVE_HALT_MAX_LOSS_USD:
+        halted = True
+        reason = (f"cumulative live P&L ${total:+,.2f} breached the "
+                  f"-${LIVE_HALT_MAX_LOSS_USD:,.0f} loss breaker")
+    elif n >= LIVE_HALT_MIN_TRADES and wr is not None and wr < LIVE_HALT_MAX_WIN_RATE:
+        halted = True
+        reason = (f"win rate {wr}% over {n} closed live trades is below "
+                  f"the {LIVE_HALT_MAX_WIN_RATE:.0f}% floor")
+    return {
+        "halted":       halted,
+        "reason":       reason,
+        "n_trades":     n,
+        "wins":         wins,
+        "win_rate_pct": wr,
+        "total_pnl":    total,
+        "thresholds":   {"min_trades":   LIVE_HALT_MIN_TRADES,
+                         "max_win_rate": LIVE_HALT_MAX_WIN_RATE,
+                         "max_loss_usd": LIVE_HALT_MAX_LOSS_USD},
+        "reset_at":     LIVE_HALT_RESET_AT or None,
+    }
+
+
+def _live_halt_status(force: bool = False) -> dict[str, Any]:
+    """Current circuit-breaker state, cached 5 min. Real money fails SAFE:
+    if the record can't be read and there's no cached state, live entries
+    are treated as halted rather than trading blind."""
+    global _live_halt_cache
+    now = time.time()
+    ts, val = _live_halt_cache
+    if not force and val and now - ts < _LIVE_HALT_CACHE_TTL:
+        return val
+    try:
+        if _supabase_client is None:
+            raise RuntimeError("Supabase unavailable")
+        res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .eq("paper", False)
+            .order("submitted_at", desc=False)
+            .execute()
+        )
+        trades = [t for t in _match_order_rows(list(res.data or []))
+                  if t["account"] == "live"]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Live-halt record query failed: %s", exc)
+        if val:
+            return val   # stale-on-error beats trading blind or flapping
+        return {"halted": True, "reason": "live trade record unavailable — failing safe",
+                "n_trades": None, "wins": None, "win_rate_pct": None, "total_pnl": None,
+                "thresholds": None, "reset_at": LIVE_HALT_RESET_AT or None}
+    status = _evaluate_live_halt(trades)
+    _live_halt_cache = (now, status)
+    return status
+
+
+def _notify_live_halt_once(status: dict[str, Any]) -> None:
+    """One Slack alert per halt episode (re-arms if the breaker clears
+    after a LIVE_HALT_RESET_AT resume)."""
+    global _live_halt_slacked
+    if status.get("halted") and not _live_halt_slacked:
+        _post_slack_text(
+            f"🛑 *LIVE TRADING HALTED* — {status.get('reason')}. "
+            f"Live entries are suspended (open positions still close normally); "
+            f"paper trading and scoring continue. To resume after review, set "
+            f"LIVE_HALT_RESET_AT to now so only newer trades count.")
+        _live_halt_slacked = True
+    elif not status.get("halted"):
+        _live_halt_slacked = False
 
 
 # Filter thresholds (env-overridable so we can tighten/loosen without redeploy)
@@ -5517,6 +5620,15 @@ def purgatory_scan():
     except Exception as exc:  # noqa: BLE001
         log.warning("Auto-trade sweep failed: %s", exc)
 
+    # Re-check the live circuit breaker when order state changed this pass,
+    # so a breach alerts within one scan of the closing trade instead of
+    # waiting for the next live entry attempt.
+    try:
+        if _live_trading_enabled() and (n_reconciled or n_closed):
+            _notify_live_halt_once(_live_halt_status(force=True))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Live-halt check failed: %s", exc)
+
     # Garbage-collect dedupe entries older than 24h
     cutoff = time.time() - 86400
     for k, fired_at in list(_purgatory_alerted.items()):
@@ -5924,6 +6036,7 @@ def purgatory_status():
                                 for s, t, d in sorted(LIVE_TRADING_PAIRS)],
             "notional_usd":    ALPACA_LIVE_NOTIONAL_USD,
             "max_trade_usd":   ALPACA_LIVE_MAX_TRADE_USD,
+            "halt":            _live_halt_status() if _live_trading_enabled() else None,
         },
         "slack_signal_scope":      SLACK_SIGNAL_SCOPE,
         "signal_spread_cost_pct":  SIGNAL_SPREAD_COST_PCT,

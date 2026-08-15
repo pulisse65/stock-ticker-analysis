@@ -58,14 +58,31 @@ exit, stop-loss) always post individually.
   dropdown filters P&L and trades to `💵 Live only`.
 - Alpaca's live dashboard mirrors the app's orders in real time.
 
-## 4. Tripwires — decide them before the first trade
+## 4. Tripwires — automatic circuit breaker
 
-- **Stand-down:** delete `LIVE_TRADING_PAIRS` (or the live keys) and
-  redeploy. Paper trading and all scoring continue untouched.
-- Review after every 10 live trades: live win rate materially under the
-  paper record (under ~60% at n=10) → stand down and compare live fills vs
-  paper fills on the same signals — the dual-leg design makes slippage
-  directly measurable per trade.
+The stand-down rule is enforced by the system. Before every live entry
+(and after every closing trade) the breaker recomputes from the closed
+live-trade record in Supabase:
+
+- **Loss breaker:** cumulative live P&L ≤ −`LIVE_HALT_MAX_LOSS_USD`
+  (default $150) — fires at any trade count.
+- **Win-rate breaker:** win rate < `LIVE_HALT_MAX_WIN_RATE` (default 60%)
+  once ≥ `LIVE_HALT_MIN_TRADES` (default 10) live trades have closed.
+
+When it trips: live entries stop, open live positions still close
+normally (hold timer + stop-loss keep running), paper trading and scoring
+continue, a 🛑 Slack alert posts once, the Mode pill shows
+`paper + 🛑 LIVE HALTED`, and `/purgatory/status → live_trading.halt`
+carries the reason. The state is computed, never stored — it survives
+restarts and redeploys and latches by construction (no new entries means
+the record that tripped it never changes).
+
+**Resuming is deliberately manual:** investigate first (compare live fills
+vs the paper legs of the same signals — slippage is measurable per trade),
+then set `LIVE_HALT_RESET_AT` to the current ISO timestamp (e.g.
+`2026-09-01T00:00:00Z`) so only trades after it count toward the breaker.
+
+- Emergency full stop remains: delete `LIVE_TRADING_PAIRS` and redeploy.
 - Friday caution: purgatory runs 49.1% on Fridays (n=55) vs 71.7% on
   Thursdays. If early live losers cluster on Fridays, that's the first
   lever.
