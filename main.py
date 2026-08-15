@@ -3100,6 +3100,11 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
     direction = signal["signal"]     # 'call' | 'put'
     spot = float(signal["price"])
 
+    if TRADING_PAIRS_ALLOWLIST and (strategy, ticker, direction) not in TRADING_PAIRS_ALLOWLIST:
+        log.info("Trade skipped (%s %s %s): not in TRADING_PAIRS_ALLOWLIST",
+                 strategy, ticker, direction)
+        return None
+
     contract = _select_option_contract(ticker, spot, direction)
     if not contract:
         log.info("No option contract available for %s %s @ %s", ticker, direction, spot)
@@ -3601,8 +3606,20 @@ def _parse_manual_disabled_pairs(raw: str) -> set[tuple[str, str, str]]:
 # Manually disabled pairs, on top of the automatic 30-day-record rule.
 # AVGO:call added 2026-07-08: -$363 on the day, 30d avg favorable -0.16%
 # (sits just above the -0.20% auto cutoff but has been a chronic drag).
+# AVGO:put added 2026-08-13: 36.4% wr on n=11 honest-scored, net -0.066 —
+# both AVGO sides now benched; the name chops through purgatory's levels.
 PURGATORY_DISABLED_PAIRS = _parse_manual_disabled_pairs(
-    os.environ.get("PURGATORY_DISABLED_PAIRS", "AVGO:call")
+    os.environ.get("PURGATORY_DISABLED_PAIRS", "AVGO:call,AVGO:put")
+)
+
+# Live-trading scalpel: when set, orders are placed ONLY for pairs on this
+# allowlist — every other trading-strategy signal stays alert+scoring-only.
+# Same triple format as disabled pairs ("purgatory:TSLA:call,..."). Empty
+# (the default) means no restriction, preserving existing behavior. This
+# exists so a real-money rollout can start with a single proven pair
+# instead of inheriting every signal the strategy fires.
+TRADING_PAIRS_ALLOWLIST = _parse_manual_disabled_pairs(
+    os.environ.get("TRADING_PAIRS_ALLOWLIST", "")
 )
 
 
@@ -3887,7 +3904,11 @@ _STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
     "orb":            set(),   # active window 9:45-11:00 is the constraint
     "vwap_reversion": set(),   # active window 11:00-14:30 is the constraint
     "ema_pullback":   {"open_first_15", "close_chop"},
-    "bb_squeeze":     {"open_first_15", "close_chop"},
+    # bb_squeeze: 8/13 retro (n=106 honest-scored) — lunch ran 32.5% wr
+    # (n=40) and 13:00-14:30 ran 32.3% (n=31), while the windows around
+    # them ran 66.7% (11:00-11:30) and 75.0% (12:30-13:00). Squeeze
+    # breakouts during the dead zones are overwhelmingly false starts.
+    "bb_squeeze":     {"open_first_15", "lunch_chop", "early_afternoon_chop", "close_chop"},
     "orb_ntz":        set(),   # engine enforces its own 9:45-11:00 window
     "pd_level":       {"open_first_15", "close_chop"},
     "vwap_reclaim":   {"open_first_15", "close_chop"},
@@ -5744,6 +5765,8 @@ def purgatory_status():
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
+        "trading_pairs_allowlist": [{"strategy": s, "ticker": t, "direction": d}
+                                    for s, t, d in sorted(TRADING_PAIRS_ALLOWLIST)],
         "signal_spread_cost_pct":  SIGNAL_SPREAD_COST_PCT,
         "strategies":              _strategy_status_block(),
         "manual_disabled_pairs":   [{"strategy": s, "ticker": t, "direction": d}
