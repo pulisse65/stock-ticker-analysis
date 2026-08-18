@@ -3297,12 +3297,15 @@ def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
             return []
         exits_res = (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("strategy,signal_ticker,signal_direction,signal_bar_time")
+            .select("strategy,signal_ticker,signal_direction,signal_bar_time,paper")
             .eq("role", "exit")
             .execute()
         )
         # paper joins the key: the live and paper legs of one signal are
-        # separate positions and must open/close independently.
+        # separate positions and must open/close independently. It MUST be
+        # in the select above — without it every exit defaulted to paper,
+        # live entries never matched their exits, and the sweep re-closed
+        # (and re-Slacked) the same live position every scan pass.
         closed = {
             (r.get("strategy") or "purgatory", r["signal_ticker"], r["signal_direction"],
              r["signal_bar_time"], bool(r.get("paper", True)))
@@ -3364,7 +3367,10 @@ def _sweep_pending_positions() -> int:
         log.info("%s EXIT: %s %s %s x%s (status %s)",
                  "Paper" if paper else "LIVE",
                  entry["signal_ticker"], entry["signal_direction"], opt, qty, status)
-        if not paper:
+        # status "no_position" is the synthetic 404 marker — the position was
+        # already gone, this pass only wrote the idempotency exit row. Nothing
+        # actually closed, so there is nothing to announce.
+        if not paper and status != "no_position":
             _post_slack_text(f"💵 *LIVE EXIT* (hold timer) — {entry['signal_ticker']} "
                              f"{entry['signal_direction'].upper()} ({opt}) closed.")
     return n_closed
@@ -3493,7 +3499,9 @@ def _sweep_stop_losses() -> int:
         log.info("%s STOP-LOSS EXIT: %s %s %s x%s (-%.1f%% vs entry, basis %s)",
                  "Paper" if paper else "LIVE",
                  entry["signal_ticker"], entry["signal_direction"], opt, qty, loss_pct, stop_basis)
-        if not paper:
+        # Same no_position guard as the hold sweep: a synthetic 404 close
+        # means the position was already gone — don't announce it.
+        if not paper and result.get("status") != "no_position":
             _post_slack_text(f"🛑 *LIVE STOP-LOSS* — {entry['signal_ticker']} "
                              f"{entry['signal_direction'].upper()} ({opt}) closed at "
                              f"-{loss_pct:.1f}% vs entry (basis: {stop_basis}).")
@@ -3563,7 +3571,12 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
         if r["role"] == "entry":
             entries[key] = r
         elif r["role"] == "exit":
-            exits[key] = r
+            # Duplicate exits can exist for one key (the sweep's idempotency
+            # rows land on 404 re-closes and carry no fill). Keep the row
+            # with a real fill_price so the trade's P&L survives the dupes.
+            prev = exits.get(key)
+            if prev is None or (prev.get("fill_price") is None and r.get("fill_price") is not None):
+                exits[key] = r
 
     # Execution-drag accounting: compare fills against the quote mid
     # captured when each order was submitted. pnl_at_mid is what the
