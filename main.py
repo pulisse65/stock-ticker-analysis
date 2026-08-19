@@ -3252,6 +3252,16 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
             log.info("LIVE skip (%s %s): no usable premium to size against", ticker, direction)
             _post_slack_text(f"⚠️ *LIVE SKIP* — {ticker} {direction.upper()}: no usable "
                              f"quote to size against. Paper leg still trades.")
+        elif _has_open_live_entry(contract["symbol"]):
+            # No stacking: a second live position in the same contract can't
+            # be exited separately (close-by-symbol sells both) and doubles
+            # the intended per-trade risk. The 8/19 back-to-back TSLA calls
+            # briefly held ~$775 of premium against a $500/trade budget.
+            log.info("LIVE skip (%s %s): already holding an open live position in %s",
+                     ticker, direction, contract["symbol"])
+            _post_slack_text(f"⚠️ *LIVE SKIP* — {ticker} {direction.upper()}: already holding "
+                             f"an open live position in {contract['symbol']} (no stacking). "
+                             f"Paper leg still trades.")
         else:
             est_qty = max(1, int(ALPACA_LIVE_NOTIONAL_USD / (premium * 100)))
             est_cost = est_qty * premium * 100
@@ -3321,15 +3331,86 @@ def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
         return []
 
 
+def _persist_exit_row(entry: dict, result: dict, raw: dict) -> None:
+    """Write the standard exit row for `entry` closed by Alpaca order
+    `result`. Shared by the hold sweep, the stop-loss sweep, and sibling
+    attribution."""
+    _persist_order_row({
+        "strategy":          entry.get("strategy") or "purgatory",
+        "signal_ticker":     entry["signal_ticker"],
+        "signal_direction":  entry["signal_direction"],
+        "signal_bar_time":   entry["signal_bar_time"],
+        "option_symbol":     entry.get("option_symbol"),
+        "option_strike":     entry.get("option_strike"),
+        "option_expiration": entry.get("option_expiration"),
+        "option_type":       entry.get("option_type"),
+        "side":              "sell",
+        "role":              "exit",
+        "qty":               int(entry.get("qty") or 1),
+        "alpaca_order_id":   result.get("id"),
+        "alpaca_status":     result.get("status", "accepted"),
+        "submitted_at":      _now_iso(),
+        "paper":             bool(entry.get("paper", True)),
+        "raw":               raw,
+    })
+
+
+def _attribute_sibling_exits(entry: dict, all_open: list[dict], result: dict,
+                             quote: dict | None, exit_reason: str) -> set:
+    """Alpaca's close-position call liquidates EVERY contract of the symbol
+    in that account — including contracts belonging to OTHER open entries
+    (two same-pair signals minutes apart pick the same ATM contract, as the
+    8/19 live TSLA calls did). Write exit rows for those sibling entries
+    too, pointed at the same close order, so the fill reconciler prices
+    them from the sell that actually included them. Without this the
+    sibling's books never close and its P&L silently disappears.
+
+    Returns the sibling row ids handled (so the caller's loop skips them)."""
+    opt = entry.get("option_symbol")
+    paper = bool(entry.get("paper", True))
+    handled: set = set()
+    for sib in all_open:
+        if sib is entry or sib.get("id") == entry.get("id"):
+            continue
+        if sib.get("option_symbol") != opt or bool(sib.get("paper", True)) != paper:
+            continue
+        raw = {"exit_reason": exit_reason, "attributed": True, **result}
+        if quote:
+            raw["quote_at_submit"] = quote
+        _persist_exit_row(sib, result, raw)
+        handled.add(sib.get("id"))
+        log.info("%s EXIT (attributed): %s %s %s x%s closed by the same order %s",
+                 "Paper" if paper else "LIVE", sib["signal_ticker"],
+                 sib["signal_direction"], opt, sib.get("qty") or 1, result.get("id"))
+    return handled
+
+
+def _has_open_live_entry(option_symbol: str) -> bool:
+    """True when the live account already holds an open entry in this
+    contract. Used to refuse stacking a second live position onto the same
+    symbol — the close-by-symbol exit can't separate them, and the combined
+    premium can silently exceed the per-trade risk budget."""
+    try:
+        return any(e.get("option_symbol") == option_symbol and not bool(e.get("paper", True))
+                   for e in _fetch_open_entries_for_sweep(0))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _sweep_pending_positions() -> int:
     """Close every entry ≥ ALPACA_TRADING_HOLD_MINUTES old. Idempotent —
     404 from Alpaca (no position) still writes an exit row so we don't retry."""
     if not ALPACA_TRADING_ENABLED or not _alpaca_enabled():
         return 0
 
-    stale = _fetch_open_entries_for_sweep(ALPACA_TRADING_HOLD_MINUTES)
+    all_open = _fetch_open_entries_for_sweep(0)
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ALPACA_TRADING_HOLD_MINUTES)).isoformat()
+    stale = [e for e in all_open if (e.get("submitted_at") or "") < cutoff]
     n_closed = 0
+    handled: set = set()
     for entry in stale:
+        if entry.get("id") in handled:
+            continue   # already closed this pass as a sibling of another entry
         opt = entry.get("option_symbol")
         qty = entry.get("qty") or 1
         if not opt:
@@ -3345,34 +3426,19 @@ def _sweep_pending_positions() -> int:
         raw = {"exit_reason": "hold", **result}
         if quote:
             raw["quote_at_submit"] = quote
-        _persist_order_row({
-            "strategy":          entry.get("strategy") or "purgatory",
-            "signal_ticker":     entry["signal_ticker"],
-            "signal_direction":  entry["signal_direction"],
-            "signal_bar_time":   entry["signal_bar_time"],
-            "option_symbol":     opt,
-            "option_strike":     entry.get("option_strike"),
-            "option_expiration": entry.get("option_expiration"),
-            "option_type":       entry.get("option_type"),
-            "side":              "sell",
-            "role":              "exit",
-            "qty":               int(qty),
-            "alpaca_order_id":   result.get("id"),
-            "alpaca_status":     status,
-            "submitted_at":      _now_iso(),
-            "paper":             paper,
-            "raw":               raw,
-        })
+        _persist_exit_row(entry, result, raw)
         n_closed += 1
         log.info("%s EXIT: %s %s %s x%s (status %s)",
                  "Paper" if paper else "LIVE",
                  entry["signal_ticker"], entry["signal_direction"], opt, qty, status)
         # status "no_position" is the synthetic 404 marker — the position was
         # already gone, this pass only wrote the idempotency exit row. Nothing
-        # actually closed, so there is nothing to announce.
-        if not paper and status != "no_position":
-            _post_slack_text(f"💵 *LIVE EXIT* (hold timer) — {entry['signal_ticker']} "
-                             f"{entry['signal_direction'].upper()} ({opt}) closed.")
+        # actually closed, so there is nothing to announce or attribute.
+        if status != "no_position":
+            handled |= _attribute_sibling_exits(entry, all_open, result, quote, "hold")
+            if not paper:
+                _post_slack_text(f"💵 *LIVE EXIT* (hold timer) — {entry['signal_ticker']} "
+                                 f"{entry['signal_direction'].upper()} ({opt}) closed.")
     return n_closed
 
 
@@ -3432,8 +3498,11 @@ def _sweep_stop_losses() -> int:
 
     open_entries = _fetch_open_entries_for_sweep(0)   # all open, any age
     n_stopped = 0
+    handled: set = set()
     und_closes: dict[str, float] | None = None        # fetched lazily, once
     for entry in open_entries:
+        if entry.get("id") in handled:
+            continue   # already closed this pass as a sibling of another entry
         opt = entry.get("option_symbol")
         fill = _safe_float(entry.get("fill_price"))
         qty = entry.get("qty") or 1
@@ -3472,39 +3541,24 @@ def _sweep_stop_losses() -> int:
         result = _alpaca_close_position(opt, paper=paper)
         if not result:
             continue
-        _persist_order_row({
-            "strategy":          entry.get("strategy") or "purgatory",
-            "signal_ticker":     entry["signal_ticker"],
-            "signal_direction":  entry["signal_direction"],
-            "signal_bar_time":   entry["signal_bar_time"],
-            "option_symbol":     opt,
-            "option_strike":     entry.get("option_strike"),
-            "option_expiration": entry.get("option_expiration"),
-            "option_type":       entry.get("option_type"),
-            "side":              "sell",
-            "role":              "exit",
-            "qty":               int(qty),
-            "alpaca_order_id":   result.get("id"),
-            "alpaca_status":     result.get("status", "accepted"),
-            "submitted_at":      _now_iso(),
-            "paper":             paper,
-            "raw":               {"exit_reason": "stop_loss",
-                                  "stop_basis": stop_basis,
-                                  "loss_pct_at_trigger": round(loss_pct, 2),
-                                  "entry_fill": fill, "mid_at_trigger": round(mid, 4),
-                                  **({"quote_at_submit": quote} if quote else {}),
-                                  **(result or {})},
-        })
+        _persist_exit_row(entry, result, {"exit_reason": "stop_loss",
+                                          "stop_basis": stop_basis,
+                                          "loss_pct_at_trigger": round(loss_pct, 2),
+                                          "entry_fill": fill, "mid_at_trigger": round(mid, 4),
+                                          **({"quote_at_submit": quote} if quote else {}),
+                                          **(result or {})})
         n_stopped += 1
         log.info("%s STOP-LOSS EXIT: %s %s %s x%s (-%.1f%% vs entry, basis %s)",
                  "Paper" if paper else "LIVE",
                  entry["signal_ticker"], entry["signal_direction"], opt, qty, loss_pct, stop_basis)
         # Same no_position guard as the hold sweep: a synthetic 404 close
-        # means the position was already gone — don't announce it.
-        if not paper and result.get("status") != "no_position":
-            _post_slack_text(f"🛑 *LIVE STOP-LOSS* — {entry['signal_ticker']} "
-                             f"{entry['signal_direction'].upper()} ({opt}) closed at "
-                             f"-{loss_pct:.1f}% vs entry (basis: {stop_basis}).")
+        # means the position was already gone — don't announce or attribute.
+        if result.get("status") != "no_position":
+            handled |= _attribute_sibling_exits(entry, open_entries, result, quote, "stop_loss")
+            if not paper:
+                _post_slack_text(f"🛑 *LIVE STOP-LOSS* — {entry['signal_ticker']} "
+                                 f"{entry['signal_direction'].upper()} ({opt}) closed at "
+                                 f"-{loss_pct:.1f}% vs entry (basis: {stop_basis}).")
     return n_stopped
 
 
@@ -3578,6 +3632,37 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
             if prev is None or (prev.get("fill_price") is None and r.get("fill_price") is not None):
                 exits[key] = r
 
+    # Filled exits per (option symbol, account) — the attribution fallback
+    # below borrows from these when a pair's own exit rows are all no-fill
+    # 404 phantoms (pre-attribution data: the sibling's contracts were sold
+    # inside another entry's close order and never got their own exit row).
+    filled_exits: dict[tuple, list[dict]] = {}
+    for r in rows:
+        if (r["role"] == "exit" and r.get("option_symbol")
+                and _safe_float(r.get("fill_price")) is not None):
+            filled_exits.setdefault(
+                (r["option_symbol"], bool(r.get("paper", True))), []).append(r)
+
+    def _borrow_attributed_exit(entry: dict, ex: dict) -> dict | None:
+        """The sell order that actually included this entry's contracts:
+        the nearest prior filled exit on the same symbol+account, within
+        30 minutes of the phantom. Only used when the pair's own exit is
+        the synthetic no_position marker."""
+        if (ex.get("alpaca_status") or "") != "no_position":
+            return None
+        cands = filled_exits.get((entry.get("option_symbol"), bool(entry.get("paper", True))), [])
+        phantom_t = _parse_signal_ts(ex.get("submitted_at"))
+        if phantom_t is None:
+            return None
+        best = None
+        for c in cands:
+            ct = _parse_signal_ts(c.get("submitted_at"))
+            if ct is None or ct > phantom_t or (phantom_t - ct).total_seconds() > 1800:
+                continue
+            if best is None or ct > _parse_signal_ts(best.get("submitted_at")):
+                best = c
+        return best
+
     # Execution-drag accounting: compare fills against the quote mid
     # captured when each order was submitted. pnl_at_mid is what the
     # trade returns with frictionless mid fills; drag = realized - mid.
@@ -3595,6 +3680,13 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
             continue
         ep = _safe_float(entry.get("fill_price"))
         xp = _safe_float(ex.get("fill_price"))
+        attributed = bool((ex.get("raw") or {}).get("attributed")) if isinstance(ex.get("raw"), dict) else False
+        if xp is None:
+            borrowed = _borrow_attributed_exit(entry, ex)
+            if borrowed is not None:
+                ex = borrowed
+                xp = _safe_float(ex.get("fill_price"))
+                attributed = True
         qty = entry.get("qty") or 1
         if ep is None or xp is None:
             continue
@@ -3629,6 +3721,7 @@ def _match_order_rows(rows: list[dict]) -> list[dict]:
             "exit_filled_at":     ex.get("filled_at"),
             "exit_reason":        exit_raw.get("exit_reason") or "hold",
             "stop_basis":         exit_raw.get("stop_basis"),
+            "exit_attributed":    attributed or None,
         })
     return trades
 
