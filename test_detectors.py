@@ -266,5 +266,58 @@ bounce2 = [mk_bar(63, V2, bounce_c * 1.0005, V2 * 0.999, bounce_c, 1000)]
 check("no retest after closes lost VWAP",
       main._check_vwap_reclaim_signal("TEST", main._build_intraday_context(ramp + pull_bad + bounce2)) is None)
 
+# ---------------- Market Wave ----------------
+print("MWAVE:")
+
+def wave_bars(open_px=100.0, top=100.45, bottom=99.70, climb=20, fall=18):
+    """Open flat-ish, climb to `top`, slide to `bottom`. No bar closes the
+    day beyond the ±0.5% trend filter as long as top/bottom stay inside."""
+    out = []
+    for i in range(climb):                      # 9:30 → climb
+        px = open_px + (top - open_px) * (i + 1) / climb
+        out.append(mk_bar(i, px - 0.02, px + 0.03, px - 0.04, px, 1000))
+    for j in range(fall):                       # slide back down
+        px = top + (bottom - top) * (j + 1) / fall
+        out.append(mk_bar(climb + j, px + 0.02, px + 0.04, px - 0.03, px, 1000))
+    return out
+
+# textbook dip-and-turn → call (swing high ~100.48, cur close 99.70:
+# depth ~0.78% >= 0.75, day move -0.30% inside the trend cap)
+bars = wave_bars(bottom=99.62) + [mk_bar(38, 99.64, 99.72, 99.62, 99.70, 1000)]
+sig = main._check_market_wave_signal("TEST", main._build_intraday_context(bars))
+check("fires call on dip-and-turn", sig is not None and sig["signal"] == "call", f"got {sig}")
+if sig:
+    check("meta depth/scope sane", 0.75 <= sig["meta"]["wave_depth_pct"] <= 0.9
+          and sig["meta"]["scope_bars"] >= 20, str(sig["meta"]))
+    check("swing_high captured", abs(sig["meta"]["swing_high"] - 100.48) < 0.02, str(sig["meta"]))
+
+# turn bar that already retraced most of the wave → depth < threshold, no fire
+bars_r = wave_bars() + [mk_bar(38, 99.95, 100.12, 99.93, 100.10, 1000)]
+check("no fire when bounce already retraced",
+      main._check_market_wave_signal("TEST", main._build_intraday_context(bars_r)) is None)
+
+# same shape but the slide breaks the ±0.5% day-trend filter → no fire
+bars_t = wave_bars(top=100.45, bottom=99.30) + [mk_bar(38, 99.32, 99.45, 99.30, 99.42, 1000)]
+check("no fire on a trend day",
+      main._check_market_wave_signal("TEST", main._build_intraday_context(bars_t)) is None)
+
+# deep dip but the current bar is still red (no turn) → no fire
+bars_d = wave_bars() + [mk_bar(38, 99.72, 99.74, 99.60, 99.62, 1000)]
+check("no fire without an up-turn bar",
+      main._check_market_wave_signal("TEST", main._build_intraday_context(bars_d)) is None)
+
+# mirror: early dip (swing low ~99.51), rally past +0.75% off it, red turn bar → put
+bars_p = wave_bars(open_px=100.0, top=99.55, bottom=100.42, climb=20, fall=18) \
+         + [mk_bar(38, 100.45, 100.47, 100.34, 100.38, 1000)]
+sig_p = main._check_market_wave_signal("TEST", main._build_intraday_context(bars_p))
+check("fires put on rip-and-turn", sig_p is not None and sig_p["signal"] == "put", f"got {sig_p}")
+
+# too little session behind it → no wave yet (premarket bars satisfy the
+# context builder's 30-bar minimum but don't count toward today's RTH bars)
+pre = [mk_bar(-120 + i, 100.0, 100.05, 99.95, 100.0, 500) for i in range(25)]
+bars_s = pre + wave_bars(climb=6, fall=5) + [mk_bar(11, 99.9, 100.0, 99.88, 99.98, 1000)]
+check("no fire with < 22 RTH bars",
+      main._check_market_wave_signal("TEST", main._build_intraday_context(bars_s)) is None)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

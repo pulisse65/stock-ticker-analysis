@@ -4238,7 +4238,7 @@ def _check_purgatory_signal(ticker: str, bars: list[dict]) -> dict[str, Any] | N
 # detectors share one 1-min indicator frame per ticker per pass
 # (_build_intraday_context) — computed once, passed to all four.
 
-_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz", "pd_level", "vwap_reclaim", "kronos")
+_ALL_STRATEGIES = ("purgatory", "orb", "vwap_reversion", "ema_pullback", "bb_squeeze", "orb_ntz", "pd_level", "vwap_reclaim", "market_wave", "kronos")
 
 _STRATEGY_LABELS = {
     "purgatory":      "PURG",
@@ -4249,6 +4249,7 @@ _STRATEGY_LABELS = {
     "orb_ntz":        "ORB-NTZ",
     "pd_level":       "PD-LVL",
     "vwap_reclaim":   "VWAP-RC",
+    "market_wave":    "MWAVE",
     "kronos":         "KRONOS",
 }
 
@@ -4267,6 +4268,9 @@ _STRATEGY_SKIP_WINDOWS: dict[str, set[str]] = {
     "orb_ntz":        set(),   # engine enforces its own 9:45-11:00 window
     "pd_level":       {"open_first_15", "close_chop"},
     "vwap_reclaim":   {"open_first_15", "close_chop"},
+    # market_wave: waves haven't formed in the opening 15 min, and the
+    # closing-cliff rule applies to any 15-min-horizon reversion entry.
+    "market_wave":    {"open_first_15", "close_chop"},
     # kronos: an off-box ML forecaster posting via /purgatory/external-signal.
     # Opening chaos and the last-minutes scoring cliff apply to it like any
     # other 15-min-horizon signal.
@@ -4286,6 +4290,9 @@ _STRATEGY_COOLDOWN_MIN = {
     # vwap_reclaim: "a couple failed attempts before it actually breaks" is
     # normal for this setup, so re-fires are allowed — throttled, not blocked.
     "vwap_reclaim": 30,
+    # market_wave: a wave that keeps sliding re-arms the trigger every green
+    # bar; the cooldown keeps one wave from spamming a ladder of entries.
+    "market_wave": 30,
     # kronos: the runner has its own cadence, but a server-side throttle
     # protects against a buggy or duplicate runner spamming alerts.
     "kronos": 30,
@@ -4430,6 +4437,18 @@ VWAPX_VOL_MULT = float(os.environ.get("VWAPX_VOL_MULT", "1.2"))
 VWAPX_MARGIN_PCT = float(os.environ.get("VWAPX_MARGIN_PCT", "0.05"))
 VWAPX_RETEST_TOL_PCT = float(os.environ.get("VWAPX_RETEST_TOL_PCT", "0.05"))
 VWAPX_MIN_BARS_HELD = int(os.environ.get("VWAPX_MIN_BARS_HELD", "10"))
+# Market Wave (intraday adaptation of Arch Public's laddered swing-reversion
+# "recipes", signals-only trial 8/22). Scope = trailing wave lookback in
+# 1-min bars; swing = how far price must still sit beyond the wave extreme
+# when the turn bar prints. Their per-recipe knobs (buffers, thresholds,
+# trade-size ladders) collapse into these two — the honest scorer decides
+# whether the entry has any edge before sizing ever matters. Swing default
+# calibrated on an 8/12-8/21 1-min replay across the 10-ticker watchlist:
+# 0.50% → 31 signals/day, 0.60% → 26/day, 0.75% → ~19/day mostly in the
+# names that move (MSTR/SMCI/INTC/TSLA), 1.0% → 11/day.
+MW_SCOPE_BARS = int(os.environ.get("MW_SCOPE_BARS", "60"))
+MW_SWING_PCT = float(os.environ.get("MW_SWING_PCT", "0.75"))
+
 # ORB+NTZ (break + retest + next-candle entry; see orb_ntz_strategy.py)
 ORB_NTZ_MIN_CONFLUENCE = int(os.environ.get("ORB_NTZ_MIN_CONFLUENCE", "0"))
 ORB_NTZ_REQUIRE_TREND = os.environ.get("ORB_NTZ_REQUIRE_TREND", "").strip() in ("1", "true", "yes")
@@ -5048,6 +5067,52 @@ def _check_vwap_reclaim_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, An
     })
 
 
+def _check_market_wave_signal(ticker: str, ctx: dict[str, Any]) -> dict[str, Any] | None:
+    """Wave-turn reversion: price is still >= MW_SWING_PCT below the trailing
+    MW_SCOPE_BARS swing high (call) / above the swing low (put) when a bar
+    prints against the wave (green close ticking up / red close ticking down).
+    Measuring depth at the CURRENT close — not the wave extreme — means a
+    bounce that already retraced the swing stops qualifying, so entries stay
+    near the turn instead of chasing. Trend days are excluded: fading a
+    one-way tape is the documented failure mode of every reversion detector
+    in this file. Waves are built from today's bars only — an overnight gap
+    is not a wave."""
+    today = ctx["today"]
+    if len(today) < 20 + 2:   # a meaningful wave needs some session behind it
+        return None
+    cur, prev = today.iloc[-1], today.iloc[-2]
+
+    day_open = float(today.iloc[0]["o"])
+    day_move_pct = (float(cur["c"]) - day_open) / day_open * 100.0
+    if abs(day_move_pct) > PURGATORY_TREND_FILTER_PCT:
+        return None
+
+    window = today.iloc[-(MW_SCOPE_BARS + 1):-1]   # trailing wave, current bar excluded
+    swing_high = float(window["h"].max())
+    swing_low = float(window["l"].min())
+    if not (swing_high > 0 and swing_low > 0):
+        return None
+    c, o, pc = float(cur["c"]), float(cur["o"]), float(prev["c"])
+
+    drop_pct = (swing_high - c) / swing_high * 100.0
+    rise_pct = (c - swing_low) / swing_low * 100.0
+    direction = depth = None
+    if drop_pct >= MW_SWING_PCT and c > o and c > pc:
+        direction, depth = "call", drop_pct
+    elif rise_pct >= MW_SWING_PCT and c < o and c < pc:
+        direction, depth = "put", rise_pct
+    if not direction:
+        return None
+
+    return _mk_strategy_signal("market_wave", ticker, direction, cur, {
+        "swing_high":     round(swing_high, 4),
+        "swing_low":      round(swing_low, 4),
+        "wave_depth_pct": round(depth, 3),
+        "scope_bars":     int(len(window)),
+        "day_move_pct":   round(day_move_pct, 3),
+    })
+
+
 # 1-min detectors, dispatched from the scan loop. Purgatory is handled
 # separately (4-min bars, legacy signature).
 _STRATEGY_DETECTORS_1MIN = {
@@ -5058,6 +5123,7 @@ _STRATEGY_DETECTORS_1MIN = {
     "orb_ntz":        _check_orb_ntz_signal,
     "pd_level":       _check_pd_level_signal,
     "vwap_reclaim":   _check_vwap_reclaim_signal,
+    "market_wave":    _check_market_wave_signal,
 }
 
 
