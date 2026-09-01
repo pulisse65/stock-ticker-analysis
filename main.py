@@ -2938,6 +2938,17 @@ def _post_slack_text(text: str) -> bool:
 # Default cut 30 → 15 after the 2026-07-08 retro: favorable moves peak at
 # 10-15m and mean-revert by 30m (QQQ/IWM/AVGO all gave back gains held past 15m).
 ALPACA_TRADING_HOLD_MINUTES = int(os.environ.get("ALPACA_TRADING_HOLD_MINUTES", "15"))
+# Paper-only extended-hold experiment (8/31): hold-horizon curves show the
+# 7/8 finding is window-dependent — MORNING signals keep developing past the
+# 15-min exit (TSLA calls before 10:30 ET: net favorable +0.384% @15m →
+# +0.542% @30m, n=17; pooled purgatory morning improves too) while midday
+# signals still mean-revert. Paper legs entered before the ET cutoff hold
+# this long instead, so every morning signal on a live pair yields a
+# live-15min vs paper-extended pairing on identical entries. Live positions
+# and post-cutoff paper keep the standard hold; the stop-loss sweep protects
+# the extended minutes like any others. Set <= the base hold to disable.
+PAPER_MORNING_HOLD_MINUTES = int(os.environ.get("PAPER_MORNING_HOLD_MINUTES", "25"))
+PAPER_MORNING_HOLD_CUTOFF_ET = os.environ.get("PAPER_MORNING_HOLD_CUTOFF_ET", "10:30").strip()
 # Stop-loss: close early when the option's live mid drops this % below the
 # entry fill. Caps the -$300 tail losses (AAPL 7/8 put was -35% within 5 min
 # and never recovered). Set <= 0 to disable.
@@ -3397,15 +3408,44 @@ def _has_open_live_entry(option_symbol: str) -> bool:
         return False
 
 
+def _hold_minutes_for_entry(entry: dict) -> int:
+    """Hold timer for one open position. Live positions and post-cutoff
+    paper get the standard hold; paper legs entered before the morning
+    cutoff (ET) run the extended-hold experiment. Any parsing doubt falls
+    back to the standard hold — the experiment must never lengthen a hold
+    by accident."""
+    if PAPER_MORNING_HOLD_MINUTES <= ALPACA_TRADING_HOLD_MINUTES:
+        return ALPACA_TRADING_HOLD_MINUTES
+    if not bool(entry.get("paper", True)):
+        return ALPACA_TRADING_HOLD_MINUTES
+    ts = _parse_signal_ts(entry.get("submitted_at"))
+    if ts is None:
+        return ALPACA_TRADING_HOLD_MINUTES
+    try:
+        et = pd.Timestamp(ts).tz_convert("America/New_York")
+    except Exception:  # noqa: BLE001
+        return ALPACA_TRADING_HOLD_MINUTES
+    if et.hour * 60 + et.minute < _PAPER_MORNING_HOLD_CUTOFF_MIN:
+        return PAPER_MORNING_HOLD_MINUTES
+    return ALPACA_TRADING_HOLD_MINUTES
+
+
 def _sweep_pending_positions() -> int:
-    """Close every entry ≥ ALPACA_TRADING_HOLD_MINUTES old. Idempotent —
+    """Close every entry older than its hold timer (standard hold, or the
+    extended paper-morning hold — see _hold_minutes_for_entry). Idempotent —
     404 from Alpaca (no position) still writes an exit row so we don't retry."""
     if not ALPACA_TRADING_ENABLED or not _alpaca_enabled():
         return 0
 
     all_open = _fetch_open_entries_for_sweep(0)
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ALPACA_TRADING_HOLD_MINUTES)).isoformat()
-    stale = [e for e in all_open if (e.get("submitted_at") or "") < cutoff]
+    now = datetime.now(timezone.utc)
+    stale = []
+    for e in all_open:
+        ts = _parse_signal_ts(e.get("submitted_at"))
+        # Unparseable submitted_at closes immediately — same fail-closed
+        # behavior as the old string-compare cutoff.
+        if ts is None or now - ts >= timedelta(minutes=_hold_minutes_for_entry(e)):
+            stale.append(e)
     n_closed = 0
     handled: set = set()
     for entry in stale:
@@ -4470,6 +4510,7 @@ def _parse_hhmm_to_mins(s: str, default_mins: int) -> int:
 
 
 _ORB_CUTOFF_MIN = _parse_hhmm_to_mins(ORB_CUTOFF_ET, 660)
+_PAPER_MORNING_HOLD_CUTOFF_MIN = _parse_hhmm_to_mins(PAPER_MORNING_HOLD_CUTOFF_ET, 630)
 _vwapr_parts = VWAPR_WINDOW_ET.split("-")
 _VWAPR_START_MIN = _parse_hhmm_to_mins(_vwapr_parts[0] if _vwapr_parts else "", 660)
 _VWAPR_END_MIN = _parse_hhmm_to_mins(_vwapr_parts[1] if len(_vwapr_parts) > 1 else "", 870)
@@ -6201,6 +6242,11 @@ def purgatory_status():
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
+        "paper_morning_hold": {
+            "minutes":   PAPER_MORNING_HOLD_MINUTES,
+            "cutoff_et": PAPER_MORNING_HOLD_CUTOFF_ET,
+            "active":    PAPER_MORNING_HOLD_MINUTES > ALPACA_TRADING_HOLD_MINUTES,
+        },
         "live_trading": {
             "keys_configured": _live_keys_present(),
             "active":          ALPACA_PAPER and _live_trading_enabled(),

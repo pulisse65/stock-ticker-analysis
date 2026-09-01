@@ -59,3 +59,11 @@ multiple-comparisons objection. Pre-registered on 2026-08-21:
 - `purgatory:QQQ:put` restricted to Mon–Thu
 
 Revisit either after ~10–15 forward signals with positive paper fills.
+
+**Paper morning-hold experiment (started 2026-08-31):** hold-horizon curves showed morning
+signals keep developing past the 15-min exit (TSLA calls before 10:30 ET: net favorable
++0.384% @15m → +0.542% @30m, n=17; pooled purgatory morning improves; midday decays).
+Paper legs entered before 10:30 ET now hold 25 min (`PAPER_MORNING_HOLD_MINUTES`); live
+keeps 15 everywhere. Decision rule: after ~15–20 paired morning TSLA-call trades, compare
+the paper-25m legs vs live-15m legs (and vs each leg's own f15/f25) — hold duration is
+derivable from `entry_filled_at` → `exit_filled_at`. Only then consider changing the live hold.

@@ -319,5 +319,22 @@ bars_s = pre + wave_bars(climb=6, fall=5) + [mk_bar(11, 99.9, 100.0, 99.88, 99.9
 check("no fire with < 22 RTH bars",
       main._check_market_wave_signal("TEST", main._build_intraday_context(bars_s)) is None)
 
+# ---------------- Paper morning extended hold ----------------
+print("HOLD:")
+# 2026-07-08 is EDT: 13:51Z = 9:51 ET (before the 10:30 cutoff), 15:10Z = 11:10 ET
+morning = "2026-07-08T13:51:00+00:00"
+midday = "2026-07-08T15:10:00+00:00"
+check("paper morning entry holds 25",
+      main._hold_minutes_for_entry({"paper": True, "submitted_at": morning}) == 25)
+check("live morning entry keeps 15",
+      main._hold_minutes_for_entry({"paper": False, "submitted_at": morning}) == 15)
+check("paper midday entry keeps 15",
+      main._hold_minutes_for_entry({"paper": True, "submitted_at": midday}) == 15)
+check("missing timestamp keeps 15",
+      main._hold_minutes_for_entry({"paper": True}) == 15)
+check("boundary: 10:29 ET extends, 10:30 ET does not",
+      main._hold_minutes_for_entry({"paper": True, "submitted_at": "2026-07-08T14:29:00+00:00"}) == 25
+      and main._hold_minutes_for_entry({"paper": True, "submitted_at": "2026-07-08T14:30:00+00:00"}) == 15)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
