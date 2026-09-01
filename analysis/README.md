@@ -57,6 +57,11 @@ multiple-comparisons objection. Pre-registered on 2026-08-21:
 
 - `purgatory:TSLA:put` restricted to 09:45–10:30 ET
 - `purgatory:QQQ:put` restricted to Mon–Thu
+- *(added 2026-08-31)* `purgatory:AAPL:call` in the morning (09:45–11:30 ET): flagged by three
+  independent lenses — best fill book (+$1,151, zero stop-outs, not outlier-dominated), and
+  80–82% positive-net hit rates at 15m/25m holds in both morning windows across 8–9 sessions
+  (n=10–11 each) despite a mediocre generic win rate (its moves are consistently positive but
+  small, so the +0.10%-in-30min threshold underrates it). Judge on post-8/31 signals.
 
 Revisit either after ~10–15 forward signals with positive paper fills.
 
