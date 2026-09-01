@@ -4003,11 +4003,14 @@ LIVE_TRADING_PAIRS = _parse_manual_disabled_pairs(
     os.environ.get("LIVE_TRADING_PAIRS", "")
 )
 
-# Slack signal-alert scope: "all" (every signal — the default), "trading"
-# (only STRATEGIES_TRADING signals), or "live" (only signals that map to a
+# Slack signal-alert scope: "all" (every signal), "trading" (only
+# STRATEGIES_TRADING signals), or "live" (only signals that map to a
 # LIVE_TRADING_PAIRS entry). Paper data collection keeps running silently
 # in the narrower scopes; retros and live trade notifications always post.
-SLACK_SIGNAL_SCOPE = os.environ.get("SLACK_SIGNAL_SCOPE", "all").strip().lower()
+# Default flipped all → live 8/31: with market_wave/orb_ntz/bb_squeeze
+# un-muted for data collection the signal stream runs ~20+/day, and the
+# owner asked for Slack to carry live-money traffic only.
+SLACK_SIGNAL_SCOPE = os.environ.get("SLACK_SIGNAL_SCOPE", "live").strip().lower()
 
 
 def _slack_scope_allows(sig: dict[str, Any]) -> bool:
