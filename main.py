@@ -4371,7 +4371,21 @@ STRATEGIES_TRADING = _parse_strategy_csv("STRATEGIES_TRADING", {"purgatory"}) & 
 STRATEGY_MUTE_MIN_N = int(os.environ.get("STRATEGY_MUTE_MIN_N", "30"))
 STRATEGY_MUTE_MAX_WIN_RATE = float(os.environ.get("STRATEGY_MUTE_MAX_WIN_RATE", "35"))
 STRATEGY_MUTE_MIN_NET_F15 = float(os.environ.get("STRATEGY_MUTE_MIN_NET_F15", "-0.05"))
-STRATEGIES_NEVER_MUTE = _parse_strategy_csv("STRATEGIES_NEVER_MUTE", set())
+# Default never-mute roster (8/31): strategies whose kill-gate verdicts are
+# frozen on evidence we already know is incomplete or unfair, kept firing for
+# data collection (they remain signals-only and cannot trade):
+#   market_wave — benched at n=79 / 57.0% wr / net -0.055, 0.005 past the
+#     gate, after 6 sessions; the best signals-only win rate on the board
+#     deserves a real sample before a verdict sticks.
+#   orb_ntz — benched on the generic +15m metric (net -0.052) that the plan
+#     branch above exists to replace; plan verdicts are still backfilling.
+#   bb_squeeze — its muted record (30.6% wr) is mostly pre-8/13 signals from
+#     windows the 8/13 skip-window config no longer allows; the new config
+#     never got a clean run.
+# The four genuinely-dead strategies (vwap_reversion, ema_pullback, pd_level,
+# vwap_reclaim) stay gate-managed. Env override replaces this list entirely.
+STRATEGIES_NEVER_MUTE = _parse_strategy_csv(
+    "STRATEGIES_NEVER_MUTE", {"market_wave", "orb_ntz", "bb_squeeze"})
 _muted_strategies_cache: tuple[float, dict[str, dict]] = (0.0, {})
 
 
