@@ -72,3 +72,49 @@ Paper legs entered before 10:30 ET now hold 25 min (`PAPER_MORNING_HOLD_MINUTES`
 keeps 15 everywhere. Decision rule: after ~15–20 paired morning TSLA-call trades, compare
 the paper-25m legs vs live-15m legs (and vs each leg's own f15/f25) — hold duration is
 derivable from `entry_filled_at` → `exit_filled_at`. Only then consider changing the live hold.
+
+## Bullseye daily-prediction track (started 2026-09-06)
+
+Separate from the intraday sweep: a friend's daily BUY/HOLD/SELL classifier (bullseye,
+gradient-boosted over 40 daily bars, 5-session horizon) is measured on the platform before
+any paper equity book is built on it. Setup, quirks, and run modes: `BULLSEYE_SETUP.md`.
+Live view: the **Bullseye** tab, or `GET /purgatory/external-predictions?days=90` — the
+`summary` block carries accuracy, direction hit, always-HOLD and majority-class baselines,
+per-call precision, confusion matrix, per-ticker accuracy.
+
+**Baseline read (backfill of 2026-07-09 → 2026-08-28, 384 scored rows, 11 tickers, all
+`backfilled=true`):**
+
+| metric | value |
+|---|---|
+| accuracy (label match) | 49.5% |
+| always-HOLD baseline | 25.3% |
+| majority-class baseline | 37.5% |
+| direction hit | 58.3% |
+| BUY precision / median move | 47.8% / +1.34% (n=226) |
+| SELL precision / median move | 52.1% / −1.14% (n=94) |
+| HOLD precision | 51.6% (n=64) |
+
+Per ticker (n=37 each): AAPL 65%, SMCI 59%, MSFT 54%, IWM/MSTR/TSLA 51%, AVGO 49%,
+AMZN 41%, QQQ 35%, INTC 32%.
+
+Read with care: every row is backfilled and the model's training cut-off is unknown, so
+some dates may sit inside its training set; the early 200-row read (acc 51.5%, SELL 63%)
+softened as the sample grew; and the low always-HOLD baseline says this window had large
+moves, which flatters a model that leans BUY/SELL. Verdict: beats both naive baselines,
+roughly half the calls are wrong — *worth watching, not worth trading yet.*
+
+**Decision rule for Stage 2 (paper equity swing book):** judge only on forward rows
+(daemon output, `backfilled=false`, use the tab's forward-only toggle) after ≥ 3 weeks
+(~150 rows). Proceed if forward accuracy clears the always-HOLD and majority baselines by a
+margin that survives a Wilson 95% lower bound, and BUY/SELL median realized moves keep their
+sign. Otherwise leave it as a measurement feed.
+
+**Rerun / extend:**
+- Backfill more history (insert-once, safe to repeat):
+  `~/Downloads/bullseye-main/.venv/bin/python bullseye_runner.py backfill --days 120`
+- Scoring is automatic (scan loop, 30-min throttle, 200 rows/pass, completed sessions
+  only). Off-hours, `curl -X POST https://tickertracker.dev/purgatory/scan` forces a pass.
+- Runner output was verified identical to `app.py -p TICKER DATE -j` on the same DB, so the
+  platform scores the model exactly as shipped (incl. its `return_1d ≡ 0` and yield-curve
+  ≡ 0 inference quirks — see `BULLSEYE_SETUP.md`).
