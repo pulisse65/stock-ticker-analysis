@@ -5839,6 +5839,13 @@ def purgatory_scan():
     except Exception as exc:  # noqa: BLE001
         log.warning("Plan-outcome backfill failed: %s", exc)
 
+    # Daily (multi-day horizon) predictions from off-box models, scored
+    # against realized closes. Throttles itself to one pass per 30 min.
+    try:
+        _score_matured_daily_predictions()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Daily-prediction scorer failed: %s", exc)
+
     # Auto-trader housekeeping: pull fresh fill statuses, then close any
     # positions past the hold-time cutoff. Both no-ops when trading is off.
     n_reconciled = 0
@@ -6008,6 +6015,462 @@ def purgatory_external_signal(req: _ExternalSignalRequest, request: Request):
         "bar_time":   bar_time_iso,
         "window":     window,
         "slack_sent": sig.get("slack_sent", False),
+    }
+
+
+# --- External daily predictions (bullseye) ---
+#
+# A second class of off-box model: daily BUY/HOLD/SELL calls on stocks with
+# a multi-day horizon (bullseye — a HistGradientBoosting classifier over 40
+# days of daily OHLCV forecasting the 5-business-day-ahead return). These
+# are NOT intraday option signals, so they don't ride _fire_signal: no
+# Slack, no kill gate, no orders. They land in their own table and are
+# scored against realized daily closes once target_date has printed, so the
+# model's hit rate is measured on this platform before any paper equity
+# book is built on top of it.
+#
+# Auth reuses EXTERNAL_SIGNAL_TOKEN: same runner box, same trust domain.
+_DAILY_PREDICTIONS_TABLE = "daily_predictions"
+_EXTERNAL_PREDICTION_SOURCES = {"bullseye"}
+
+# Label cut-offs mirror bullseye's training labels: a forward return above
+# BUY_PCT was labelled BUY, below SELL_PCT was SELL, else HOLD. Scoring with
+# the same cut-offs makes "correct" mean what the model was trained to mean.
+DAILY_PRED_BUY_PCT = float(os.environ.get("DAILY_PRED_BUY_PCT", "1.65"))
+DAILY_PRED_SELL_PCT = float(os.environ.get("DAILY_PRED_SELL_PCT", "-1.05"))
+DAILY_PRED_HORIZON_BDAYS = int(os.environ.get("DAILY_PRED_HORIZON_BDAYS", "5"))
+_DAILY_PRED_SCORE_INTERVAL_S = 30 * 60
+_daily_pred_last_score_at = 0.0
+
+# bullseye's base_labels order: 0=SELL, 1=HOLD, 2=BUY (asset-tracking's
+# core.Prediction.Forecast uses the same ints).
+_FORECAST_NAMES = {0: "sell", 1: "hold", 2: "buy"}
+_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+
+
+def _normalize_forecast(raw: Any) -> str | None:
+    """Accept the int class (0/1/2) or a case-insensitive name; return
+    'sell' | 'hold' | 'buy', or None when unrecognisable."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return _FORECAST_NAMES.get(int(raw)) if float(raw).is_integer() else None
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("sell", "hold", "buy"):
+            return s
+        if s.isdigit():
+            return _FORECAST_NAMES.get(int(s))
+    return None
+
+
+def _label_from_return(pct: float) -> str:
+    if pct > DAILY_PRED_BUY_PCT:
+        return "buy"
+    if pct < DAILY_PRED_SELL_PCT:
+        return "sell"
+    return "hold"
+
+
+def _add_business_days(d: date, n: int) -> date:
+    """Weekday-only add (no holiday calendar) — mirrors bullseye's
+    date_add_bus so target_date agrees with what the model was trained on."""
+    step = 1 if n >= 0 else -1
+    remaining = abs(n)
+    while remaining:
+        d += timedelta(days=step)
+        if d.weekday() < 5:
+            remaining -= 1
+    return d
+
+
+def _score_prediction_row(row: dict[str, Any], closes: dict[date, float]) -> dict[str, Any] | None:
+    """Pure scorer. Given a prediction row and that ticker's daily closes
+    (completed sessions only), return the update payload — or None when
+    the target session hasn't printed yet. Entry = close on as_of_date
+    (first at/after, for holidays); exit = first close at/after target_date."""
+    try:
+        as_of = date.fromisoformat(str(row["as_of_date"])[:10])
+        target = date.fromisoformat(str(row["target_date"])[:10])
+    except (KeyError, ValueError, TypeError):
+        return None
+    if not closes:
+        return None
+    days = sorted(closes)
+
+    def close_at_or_after(d: date) -> tuple[date, float] | None:
+        for k in days:
+            if k >= d:
+                return k, closes[k]
+        return None
+
+    entry = close_at_or_after(as_of)
+    exit_ = close_at_or_after(target)
+    if entry is None or exit_ is None:
+        return None
+    entry_day, entry_close = entry
+    exit_day, exit_close = exit_
+    if entry_day >= exit_day or entry_close <= 0:
+        return None
+
+    realized = (exit_close - entry_close) / entry_close * 100.0
+    actual = _label_from_return(realized)
+    forecast = row.get("forecast")
+    correct = actual == forecast
+    if forecast == "buy":
+        direction_correct = realized > 0
+    elif forecast == "sell":
+        direction_correct = realized < 0
+    else:
+        direction_correct = correct
+    return {
+        "entry_close":       round(entry_close, 4),
+        "entry_close_date":  entry_day.isoformat(),
+        "target_close":      round(exit_close, 4),
+        "target_close_date": exit_day.isoformat(),
+        "realized_pct":      round(realized, 4),
+        "actual":            actual,
+        "correct":           correct,
+        "direction_correct": direction_correct,
+        "scored_at":         _now_iso(),
+    }
+
+
+def _fetch_daily_closes(tickers: list[str], start: date, end_exclusive: date) -> dict[str, dict[date, float]]:
+    """Daily closes per ticker from yfinance — the same source bullseye
+    trains on, so the label cut-offs apply to like-for-like prices.
+    `end_exclusive` follows yfinance semantics (the bar on that date is
+    NOT included)."""
+    out: dict[str, dict[date, float]] = {t: {} for t in tickers}
+    if not tickers or start >= end_exclusive:
+        return out
+    try:
+        df = yf.download(
+            tickers,
+            start=start.isoformat(),
+            end=end_exclusive.isoformat(),
+            interval="1d",
+            auto_adjust=False,
+            group_by="ticker",
+            threads=False,
+            progress=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Daily-prediction close fetch failed: %s", exc)
+        return out
+    if df is None or df.empty:
+        return out
+    for t in tickers:
+        try:
+            if isinstance(df.columns, pd.MultiIndex):
+                if t not in df.columns.get_level_values(0):
+                    continue
+                series = df[t]["Close"]
+            else:
+                series = df["Close"]
+            for idx, val in series.dropna().items():
+                v = float(val)
+                if math.isfinite(v) and v > 0:
+                    out[t][pd.Timestamp(idx).date()] = v
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Daily close parse failed for %s: %s", t, exc)
+    return out
+
+
+def _score_matured_daily_predictions(force: bool = False) -> int:
+    """Score rows whose target session has completed. Throttled to one
+    pass per 30 min (the data only changes once a day). Returns rows
+    scored this pass."""
+    global _daily_pred_last_score_at
+    if _supabase_client is None:
+        return 0
+    if not force and (time.time() - _daily_pred_last_score_at) < _DAILY_PRED_SCORE_INTERVAL_S:
+        return 0
+    _daily_pred_last_score_at = time.time()
+
+    # Only fully printed sessions count: today's bar joins the usable set
+    # after the close, otherwise a live partial bar would be scored as the
+    # settle.
+    now_et = pd.Timestamp.now(tz=_ET)
+    today_et = now_et.date()
+    after_close = (now_et.hour, now_et.minute) >= (16, 10)
+    end_exclusive = today_et + timedelta(days=1) if after_close else today_et
+    last_complete = end_exclusive - timedelta(days=1)
+
+    try:
+        res = (
+            _supabase_client.table(_DAILY_PREDICTIONS_TABLE)
+            .select("id, ticker, as_of_date, target_date, forecast")
+            .is_("scored_at", "null")
+            .lte("target_date", last_complete.isoformat())
+            .order("target_date", desc=False)
+            .limit(200)
+            .execute()
+        )
+        pending = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Daily-prediction score query failed: %s", exc)
+        return 0
+    if not pending:
+        return 0
+
+    as_ofs = []
+    for p in pending:
+        try:
+            as_ofs.append(date.fromisoformat(str(p["as_of_date"])[:10]))
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not as_ofs:
+        return 0
+    tickers = sorted({str(p.get("ticker") or "") for p in pending if p.get("ticker")})
+    closes_by = _fetch_daily_closes(tickers, min(as_ofs) - timedelta(days=3), end_exclusive)
+
+    n = 0
+    for p in pending:
+        closes = closes_by.get(p.get("ticker"), {})
+        upd = _score_prediction_row(p, closes)
+        if upd is None:
+            # Data extends well past the target yet no entry/exit pair could
+            # be formed (delisted ticker, bad dates): park it instead of
+            # re-querying forever.
+            try:
+                target = date.fromisoformat(str(p["target_date"])[:10])
+            except (KeyError, ValueError, TypeError):
+                target = None
+            if closes and target is not None and max(closes) > target + timedelta(days=7):
+                upd = {"scored_at": _now_iso(), "score_note": "unscorable: no entry/exit close pair"}
+            else:
+                continue
+        try:
+            _supabase_client.table(_DAILY_PREDICTIONS_TABLE).update(upd).eq("id", p["id"]).execute()
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Daily-prediction update failed for %s: %s", p.get("id"), exc)
+    if n:
+        log.info("Daily-prediction scorer: %d row(s) scored", n)
+    return n
+
+
+def _summarize_predictions(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Hit-rate summary over prediction rows (scored + pending). Pure."""
+    scored = [r for r in rows if r.get("actual") in ("buy", "hold", "sell")]
+    unscorable = sum(1 for r in rows if r.get("scored_at") and r.get("actual") not in ("buy", "hold", "sell"))
+    pending = len(rows) - len(scored) - unscorable
+    n = len(scored)
+
+    def _mean(vals: list[float]) -> float | None:
+        return round(sum(vals) / len(vals), 4) if vals else None
+
+    by_class: dict[str, dict[str, Any]] = {}
+    confusion: dict[str, dict[str, int]] = {}
+    for cls in ("buy", "hold", "sell"):
+        sub = [r for r in scored if r.get("forecast") == cls]
+        rets = [float(r["realized_pct"]) for r in sub if r.get("realized_pct") is not None]
+        by_class[cls] = {
+            "n":              len(sub),
+            "accuracy":       _mean([1.0 if r.get("correct") else 0.0 for r in sub]),
+            "direction_hit":  _mean([1.0 if r.get("direction_correct") else 0.0 for r in sub]),
+            "avg_realized_pct": _mean(rets),
+            "median_realized_pct": (round(float(np.median(rets)), 4) if rets else None),
+        }
+        confusion[cls] = {a: sum(1 for r in sub if r.get("actual") == a) for a in ("buy", "hold", "sell")}
+
+    actual_counts = {a: sum(1 for r in scored if r.get("actual") == a) for a in ("buy", "hold", "sell")}
+    by_ticker: dict[str, dict[str, Any]] = {}
+    for r in scored:
+        t = r.get("ticker") or "?"
+        b = by_ticker.setdefault(t, {"n": 0, "correct": 0})
+        b["n"] += 1
+        b["correct"] += 1 if r.get("correct") else 0
+    for b in by_ticker.values():
+        b["accuracy"] = round(b["correct"] / b["n"], 4) if b["n"] else None
+
+    return {
+        "n_total":     len(rows),
+        "n_scored":    n,
+        "n_pending":   pending,
+        "n_unscorable": unscorable,
+        "accuracy":    _mean([1.0 if r.get("correct") else 0.0 for r in scored]),
+        "direction_hit": _mean([1.0 if r.get("direction_correct") else 0.0 for r in scored]),
+        # What a model that learned nothing would score: always-HOLD, and
+        # the single most common realized class.
+        "baseline_always_hold": (round(actual_counts["hold"] / n, 4) if n else None),
+        "baseline_majority":    (round(max(actual_counts.values()) / n, 4) if n else None),
+        "actual_counts": actual_counts,
+        "by_forecast":   by_class,
+        "confusion":     confusion,      # forecast -> actual -> count
+        "by_ticker":     dict(sorted(by_ticker.items(), key=lambda kv: (-kv[1]["n"], kv[0]))),
+    }
+
+
+class _ExternalPrediction(BaseModel):
+    ticker: str
+    as_of_date: str                      # YYYY-MM-DD: last daily bar the features saw
+    forecast: Any                        # 0/1/2 or 'sell'/'hold'/'buy'
+    target_date: str | None = None       # defaults to as_of + DAILY_PRED_HORIZON_BDAYS business days
+    conf_buy: float | None = None
+    conf_hold: float | None = None
+    conf_sell: float | None = None
+    ref_price: float | None = None       # close on as_of_date as the runner saw it
+    model: str | None = None
+    backfilled: bool | None = None       # runner may state it; else inferred from as_of_date
+    meta: dict[str, Any] | None = None
+
+
+class _ExternalPredictionBatch(BaseModel):
+    source: str = "bullseye"
+    predictions: list[_ExternalPrediction] = Field(default_factory=list)
+
+
+@app.post("/purgatory/external-predictions")
+def purgatory_external_predictions_post(batch: _ExternalPredictionBatch, request: Request):
+    """Ingest a batch of daily predictions. Hard 4xx = client bug (bad
+    token / empty batch); per-row problems come back in `rejected` with a
+    200 so one bad ticker doesn't sink the run. Rows are insert-once:
+    re-posting an existing (source, ticker, as_of_date) is a no-op."""
+    if not EXTERNAL_SIGNAL_TOKEN:
+        raise HTTPException(503, "External predictions disabled: set EXTERNAL_SIGNAL_TOKEN.")
+    supplied = request.headers.get("x-signal-token", "")
+    if not hmac.compare_digest(supplied, EXTERNAL_SIGNAL_TOKEN):
+        raise HTTPException(401, "Bad or missing X-Signal-Token header.")
+    if _supabase_client is None:
+        raise HTTPException(503, "Daily predictions need Supabase (SUPABASE_URL/SUPABASE_KEY).")
+    source = batch.source.strip().lower()
+    if source not in _EXTERNAL_PREDICTION_SOURCES:
+        raise HTTPException(400, f"Unknown source '{source}'. Allowed: {sorted(_EXTERNAL_PREDICTION_SOURCES)}")
+    if not batch.predictions:
+        raise HTTPException(400, "predictions is empty.")
+    if len(batch.predictions) > 500:
+        raise HTTPException(400, "Max 500 predictions per request.")
+
+    today_et = _now_et_date()
+    prev_bday = _add_business_days(today_et, -1)
+    submitted_at = _now_iso()
+    rows: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    def reject(ticker: str, reason: str) -> None:
+        rejected.append({"ticker": ticker, "reason": reason})
+
+    for p in batch.predictions:
+        ticker = (p.ticker or "").strip().upper()
+        if not _TICKER_RE.match(ticker):
+            reject(p.ticker, "bad ticker")
+            continue
+        forecast = _normalize_forecast(p.forecast)
+        if forecast is None:
+            reject(ticker, f"bad forecast {p.forecast!r}")
+            continue
+        try:
+            as_of = date.fromisoformat(p.as_of_date.strip()[:10])
+        except (ValueError, AttributeError):
+            reject(ticker, "bad as_of_date (want YYYY-MM-DD)")
+            continue
+        if as_of > today_et:
+            reject(ticker, "as_of_date is in the future")
+            continue
+        if p.target_date:
+            try:
+                target = date.fromisoformat(p.target_date.strip()[:10])
+            except ValueError:
+                reject(ticker, "bad target_date (want YYYY-MM-DD)")
+                continue
+            if target <= as_of:
+                reject(ticker, "target_date must be after as_of_date")
+                continue
+        else:
+            target = _add_business_days(as_of, DAILY_PRED_HORIZON_BDAYS)
+        confs: dict[str, float | None] = {}
+        bad_conf = False
+        for k in ("conf_buy", "conf_hold", "conf_sell"):
+            v = getattr(p, k)
+            if v is not None and (not math.isfinite(v) or v < 0.0 or v > 1.0):
+                bad_conf = True
+                break
+            confs[k] = v
+        if bad_conf:
+            reject(ticker, "confidences must be in [0, 1]")
+            continue
+        ref = p.ref_price if (p.ref_price is not None and math.isfinite(p.ref_price) and p.ref_price > 0) else None
+        # A prediction whose as_of session is older than the previous
+        # business day wasn't a forward call at post time — flag it so
+        # honest forward-only views can exclude replays.
+        backfilled = p.backfilled if p.backfilled is not None else (as_of < prev_bday)
+        rows.append({
+            "source":       source,
+            "ticker":       ticker,
+            "as_of_date":   as_of.isoformat(),
+            "target_date":  target.isoformat(),
+            "forecast":     forecast,
+            **confs,
+            "ref_price":    ref,
+            "model":        ((p.model or "").strip()[:64] or None),
+            "backfilled":   bool(backfilled),
+            "meta":         (dict(list((p.meta or {}).items())[:20]) or None),
+            "submitted_at": submitted_at,
+        })
+
+    inserted = 0
+    if rows:
+        try:
+            res = (
+                _supabase_client.table(_DAILY_PREDICTIONS_TABLE)
+                .upsert(rows, on_conflict="source,ticker,as_of_date", ignore_duplicates=True)
+                .execute()
+            )
+            inserted = len(res.data or [])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Daily-prediction insert failed: %s", exc)
+            raise HTTPException(502, f"Insert failed: {exc}") from exc
+    return {
+        "source":     source,
+        "accepted":   inserted,
+        "duplicates": max(0, len(rows) - inserted),
+        "rejected":   rejected,
+    }
+
+
+@app.get("/purgatory/external-predictions")
+def purgatory_external_predictions_get(
+    source: str = "bullseye",
+    days: int = 90,
+    ticker: str | None = None,
+    include_backfilled: bool = True,
+    limit: int = 2000,
+):
+    """Prediction rows + hit-rate summary for the dashboard and for
+    verification. `days` counts back from today (ET) on as_of_date."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Daily predictions need Supabase (SUPABASE_URL/SUPABASE_KEY).")
+    source = source.strip().lower()
+    days = max(1, min(int(days), 3650))
+    since = (_now_et_date() - timedelta(days=days)).isoformat()
+    q = (
+        _supabase_client.table(_DAILY_PREDICTIONS_TABLE)
+        .select("*")
+        .eq("source", source)
+        .gte("as_of_date", since)
+    )
+    if ticker:
+        q = q.eq("ticker", ticker.strip().upper())
+    if not include_backfilled:
+        q = q.eq("backfilled", False)
+    try:
+        res = q.order("as_of_date", desc=True).order("ticker").limit(max(1, min(int(limit), 5000))).execute()
+        rows = list(res.data or [])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Query failed: {exc}") from exc
+    return {
+        "source":   source,
+        "since":    since,
+        "thresholds": {
+            "buy_pct":       DAILY_PRED_BUY_PCT,
+            "sell_pct":      DAILY_PRED_SELL_PCT,
+            "horizon_bdays": DAILY_PRED_HORIZON_BDAYS,
+        },
+        "summary":  _summarize_predictions(rows),
+        "rows":     rows,
+        "ts":       _now_iso(),
     }
 
 
@@ -6275,6 +6738,13 @@ def purgatory_status():
         },
         "slack_signal_scope":      SLACK_SIGNAL_SCOPE,
         "signal_spread_cost_pct":  SIGNAL_SPREAD_COST_PCT,
+        "daily_predictions": {
+            "enabled":       bool(EXTERNAL_SIGNAL_TOKEN) and _supabase_client is not None,
+            "sources":       sorted(_EXTERNAL_PREDICTION_SOURCES),
+            "horizon_bdays": DAILY_PRED_HORIZON_BDAYS,
+            "buy_pct":       DAILY_PRED_BUY_PCT,
+            "sell_pct":      DAILY_PRED_SELL_PCT,
+        },
         "strategies":              _strategy_status_block(),
         "manual_disabled_pairs":   [{"strategy": s, "ticker": t, "direction": d}
                                     for s, t, d in sorted(PURGATORY_DISABLED_PAIRS)],
