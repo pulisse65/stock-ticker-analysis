@@ -336,5 +336,111 @@ check("boundary: 10:29 ET extends, 10:30 ET does not",
       main._hold_minutes_for_entry({"paper": True, "submitted_at": "2026-07-08T14:29:00+00:00"}) == 25
       and main._hold_minutes_for_entry({"paper": True, "submitted_at": "2026-07-08T14:30:00+00:00"}) == 15)
 
+# ---------------- Daily predictions (bullseye) ----------------
+print("DAILYPRED:")
+from datetime import date as _date
+nf = main._normalize_forecast
+check("forecast ints map to bullseye base_labels order",
+      nf(0) == "sell" and nf(1) == "hold" and nf(2) == "buy")
+check("forecast names/strings normalise",
+      nf(" BUY ") == "buy" and nf("2") == "buy" and nf(2.0) == "buy")
+check("garbage forecast rejected",
+      nf(3) is None and nf(True) is None and nf("maybe") is None and nf(1.5) is None)
+
+lf = main._label_from_return
+check("label cut-offs match training (+1.65 / -1.05)",
+      lf(1.66) == "buy" and lf(1.65) == "hold" and lf(-1.05) == "hold" and lf(-1.06) == "sell")
+
+abd = main._add_business_days
+check("business-day add skips weekends",
+      abd(_date(2026, 9, 4), 5) == _date(2026, 9, 11)     # Fri + 5 = next Fri
+      and abd(_date(2026, 9, 7), -1) == _date(2026, 9, 4)  # Mon - 1 = Fri
+      and abd(_date(2026, 9, 5), 1) == _date(2026, 9, 7))  # Sat + 1 = Mon
+
+# 2026-08-31 (Mon) .. 2026-09-11, with Labor Day (Sep 7) missing
+closes = {
+    _date(2026, 8, 31): 100.0, _date(2026, 9, 1): 101.0, _date(2026, 9, 2): 101.5,
+    _date(2026, 9, 3): 102.0,  _date(2026, 9, 4): 103.0,
+    _date(2026, 9, 8): 104.0,  _date(2026, 9, 9): 98.5, _date(2026, 9, 10): 99.0,
+}
+spr = main._score_prediction_row
+r = spr({"as_of_date": "2026-08-31", "target_date": "2026-09-08", "forecast": "buy"}, closes)
+check("buy scored correct on +4%", r is not None and r["actual"] == "buy" and r["correct"] is True
+      and abs(r["realized_pct"] - 4.0) < 1e-6 and r["direction_correct"] is True, str(r))
+r = spr({"as_of_date": "2026-09-01", "target_date": "2026-09-09", "forecast": "buy"}, closes)
+check("buy scored wrong on -2.5% (actual sell)", r is not None and r["actual"] == "sell"
+      and r["correct"] is False and r["direction_correct"] is False, str(r))
+r = spr({"as_of_date": "2026-09-02", "target_date": "2026-09-10", "forecast": "hold"}, closes)
+check("hold inside band counts correct", r is not None and r["actual"] == "sell" and r["correct"] is False, str(r))
+r = spr({"as_of_date": "2026-09-01", "target_date": "2026-09-07", "forecast": "sell"}, closes)
+check("holiday target rolls to next close", r is not None and r["target_close_date"] == "2026-09-08"
+      and r["direction_correct"] is False, str(r))
+r = spr({"as_of_date": "2026-09-04", "target_date": "2026-09-11", "forecast": "buy"}, closes)
+check("unprinted target -> None", r is None)
+check("empty closes -> None", spr({"as_of_date": "2026-09-01", "target_date": "2026-09-08", "forecast": "buy"}, {}) is None)
+check("bad dates -> None", spr({"as_of_date": "nope", "target_date": "2026-09-08", "forecast": "buy"}, closes) is None)
+
+summ = main._summarize_predictions([
+    {"ticker": "A", "forecast": "buy",  "actual": "buy",  "correct": True,  "direction_correct": True,  "realized_pct": 3.0,  "scored_at": "x"},
+    {"ticker": "A", "forecast": "buy",  "actual": "hold", "correct": False, "direction_correct": True,  "realized_pct": 0.5,  "scored_at": "x"},
+    {"ticker": "B", "forecast": "sell", "actual": "hold", "correct": False, "direction_correct": False, "realized_pct": 0.2,  "scored_at": "x"},
+    {"ticker": "B", "forecast": "hold", "actual": None,   "correct": None,  "direction_correct": None,  "realized_pct": None, "scored_at": None},
+    {"ticker": "C", "forecast": "hold", "actual": None,   "correct": None,  "direction_correct": None,  "realized_pct": None, "scored_at": "x", "score_note": "unscorable"},
+])
+check("summary counts", summ["n_total"] == 5 and summ["n_scored"] == 3 and summ["n_pending"] == 1
+      and summ["n_unscorable"] == 1, str(summ))
+check("summary accuracy + baselines", abs(summ["accuracy"] - 1/3) < 1e-3
+      and abs(summ["baseline_always_hold"] - 2/3) < 1e-3 and abs(summ["baseline_majority"] - 2/3) < 1e-3
+      and summ["by_forecast"]["buy"]["n"] == 2 and summ["confusion"]["buy"]["hold"] == 1, str(summ))
+
+# Endpoint plumbing with a fake Supabase client
+from fastapi.testclient import TestClient
+class _FakeQ:
+    def __init__(self, store): self.store = store; self.rows = None
+    def upsert(self, rows, on_conflict=None, ignore_duplicates=False):
+        self.rows = rows; self.store["upserts"].append((rows, on_conflict, ignore_duplicates)); return self
+    def select(self, *a, **k): return self
+    def eq(self, *a, **k): return self
+    def gte(self, *a, **k): return self
+    def order(self, *a, **k): return self
+    def limit(self, *a, **k): return self
+    def execute(self):
+        class R: pass
+        r = R(); r.data = self.rows if self.rows is not None else []; return r
+class _FakeSB:
+    def __init__(self): self.store = {"upserts": []}
+    def table(self, name): assert name == "daily_predictions"; return _FakeQ(self.store)
+
+client = TestClient(main.app)
+_saved_tok, _saved_sb = main.EXTERNAL_SIGNAL_TOKEN, main._supabase_client
+main.EXTERNAL_SIGNAL_TOKEN = "t0k"
+fake = _FakeSB(); main._supabase_client = fake
+body = {"source": "bullseye", "predictions": [
+    {"ticker": "aapl", "as_of_date": "2026-09-04", "forecast": 2, "conf_buy": 0.61, "conf_hold": 0.3, "conf_sell": 0.09, "ref_price": 230.1, "model": "small-classifier-nb"},
+    {"ticker": "MSFT", "as_of_date": "2026-09-04", "forecast": "hold"},
+    {"ticker": "BAD!", "as_of_date": "2026-09-04", "forecast": 1},
+    {"ticker": "TSLA", "as_of_date": "2026-09-04", "forecast": 7},
+    {"ticker": "NVDA", "as_of_date": "2099-01-01", "forecast": 0},
+    {"ticker": "AMD",  "as_of_date": "2026-09-04", "forecast": 0, "conf_buy": 1.5},
+]}
+resp = client.post("/purgatory/external-predictions", json=body)
+check("post without token -> 401", resp.status_code == 401, str(resp.status_code))
+resp = client.post("/purgatory/external-predictions", json=body, headers={"X-Signal-Token": "t0k"})
+j = resp.json()
+check("post accepted 2, rejected 4", resp.status_code == 200 and j["accepted"] == 2 and len(j["rejected"]) == 4, str(j))
+rows, conflict, ignore = fake.store["upserts"][0]
+check("insert-once upsert on natural key", conflict == "source,ticker,as_of_date" and ignore is True)
+aapl = next(r for r in rows if r["ticker"] == "AAPL")
+check("row normalised: forecast name, +5 bdays target, ticker upper",
+      aapl["forecast"] == "buy" and aapl["target_date"] == "2026-09-11" and aapl["source"] == "bullseye", str(aapl))
+check("backfilled inferred from as_of age",
+      aapl["backfilled"] == (_date(2026, 9, 4) < main._add_business_days(main._now_et_date(), -1)))
+resp = client.post("/purgatory/external-predictions", json={"source": "kronos", "predictions": [{"ticker": "A", "as_of_date": "2026-09-04", "forecast": 1}]},
+                   headers={"X-Signal-Token": "t0k"})
+check("unknown source -> 400", resp.status_code == 400)
+resp = client.get("/purgatory/external-predictions?days=30")
+check("get returns summary shape", resp.status_code == 200 and "summary" in resp.json() and resp.json()["thresholds"]["buy_pct"] == 1.65, str(resp.json())[:200])
+main.EXTERNAL_SIGNAL_TOKEN, main._supabase_client = _saved_tok, _saved_sb
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
