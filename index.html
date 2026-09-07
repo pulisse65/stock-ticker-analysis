@@ -392,6 +392,7 @@
       <nav class="flex items-center gap-0 overflow-x-auto no-scrollbar">
         <button class="tab-btn active" data-tab="alerts">Alerts</button>
         <button class="tab-btn" data-tab="trading">Trading</button>
+        <button class="tab-btn" data-tab="bullseye">Bullseye</button>
         <button class="tab-btn" data-tab="analysis">Analysis</button>
         <button class="tab-btn" data-tab="dashboard">Dashboard</button>
         <button class="tab-btn" data-tab="watchlist">Quotes</button>
@@ -915,6 +916,53 @@
       </section>
     </section>
 
+    <!-- ============================== BULLSEYE TAB ============================== -->
+    <section id="tab-bullseye" class="tab-panel space-y-5">
+      <section class="card p-4">
+        <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
+          <div>
+            <h2 class="font-semibold text-ink">🎯 Bullseye daily predictions</h2>
+            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">A friend's daily BUY / HOLD / SELL model (gradient-boosted classifier over 40 daily bars) forecasting the move 5 sessions ahead. Scored here against realized closes using the model's own training cut-offs. Measurement only — nothing trades on these.</p>
+          </div>
+          <button id="bullseye-refresh-btn" type="button" class="btn-ghost px-3 py-1.5 text-sm">Refresh</button>
+        </div>
+        <div class="flex flex-wrap items-center gap-3 text-xs">
+          <select id="bullseye-days" class="input px-2 py-1 text-xs">
+            <option value="30">Last 30 days</option>
+            <option value="90" selected>Last 90 days</option>
+            <option value="180">Last 180 days</option>
+            <option value="365">Last year</option>
+          </select>
+          <input id="bullseye-ticker" class="input px-2 py-1 text-xs w-24" placeholder="Ticker" />
+          <label class="flex items-center gap-1.5 text-ink-dim cursor-pointer" title="Hide rows that were posted after their as-of session (walk-forward replays the model may have been trained on)">
+            <input id="bullseye-forward-only" type="checkbox" class="accent-current" /> forward-only
+          </label>
+          <span id="bullseye-thresholds" class="px-2.5 py-1 rounded-full v-neutral">—</span>
+          <span id="bullseye-meta" class="text-ink-faint ml-auto"></span>
+        </div>
+      </section>
+
+      <section class="card p-4">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Hit rate</h3>
+        <div id="bullseye-tiles" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <div>
+            <h4 class="text-[10px] font-bold uppercase tracking-wider text-ink-faint mb-2">By call</h4>
+            <div id="bullseye-by-forecast" class="text-sm text-ink-dim">—</div>
+          </div>
+          <div>
+            <h4 class="text-[10px] font-bold uppercase tracking-wider text-ink-faint mb-2">By ticker</h4>
+            <div id="bullseye-by-ticker" class="text-sm text-ink-dim">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card p-4">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Predictions</h3>
+        <div id="bullseye-rows" class="text-sm text-ink-dim">—</div>
+      </section>
+    </section>
+
     <!-- ============================== LEARN TAB ============================== -->
     <section id="tab-learn" class="tab-panel space-y-5">
       <div class="card p-5">
@@ -1175,7 +1223,7 @@ function timeAgo(iso) {
 // One setTab for everything: switches panels, lazy-loads the tab's data,
 // and persists the choice (localStorage + URL hash) so reloads and shared
 // links land on the same view. "learn" is reachable via the ? button only.
-const KNOWN_TABS = ["alerts", "trading", "analysis", "dashboard", "watchlist", "sectors", "movers", "ai", "learn"];
+const KNOWN_TABS = ["alerts", "trading", "bullseye", "analysis", "dashboard", "watchlist", "sectors", "movers", "ai", "learn"];
 function setTab(name) {
   if (!KNOWN_TABS.includes(name)) name = "alerts";
   document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
@@ -1191,6 +1239,7 @@ function setTab(name) {
   else if (name === "movers") refreshMovers(false);
   else if (name === "alerts") refreshAlerts();
   else if (name === "trading") refreshTrading();
+  else if (name === "bullseye") refreshBullseye();
   else if (name === "ai") {
     const aiTicker = document.getElementById("ai-ticker");
     if (state.currentTicker && aiTicker && !aiTicker.value) {
@@ -3663,6 +3712,96 @@ document.getElementById("trading-date").addEventListener("change", refreshTradin
     refreshTradingPnl();
   });
 }
+
+// ===================== Bullseye (daily predictions) =====================
+const _BULLSEYE_PILL = { buy: "v-bullish", sell: "v-bearish", hold: "v-neutral" };
+function _bullseyePill(cls) {
+  const c = String(cls || "").toLowerCase();
+  return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold ${_BULLSEYE_PILL[c] || "v-neutral"}">${c.toUpperCase() || "—"}</span>`;
+}
+function _bullseyePct(v, digits = 1) { return v == null ? "—" : `${(v * 100).toFixed(digits)}%`; }
+function _bullseyeSigned(v) {
+  if (v == null) return "—";
+  const n = Number(v);
+  return `<span class="mono ${n > 0 ? "tone-bullish-text" : (n < 0 ? "tone-bearish-text" : "")}">${n > 0 ? "+" : ""}${n.toFixed(2)}%</span>`;
+}
+
+async function refreshBullseye() {
+  const tiles = document.getElementById("bullseye-tiles");
+  const byF = document.getElementById("bullseye-by-forecast");
+  const byT = document.getElementById("bullseye-by-ticker");
+  const rowsEl = document.getElementById("bullseye-rows");
+  const meta = document.getElementById("bullseye-meta");
+  const thr = document.getElementById("bullseye-thresholds");
+  const days = document.getElementById("bullseye-days").value;
+  const fwdOnly = document.getElementById("bullseye-forward-only").checked;
+  const tick = document.getElementById("bullseye-ticker").value.trim().toUpperCase();
+  try {
+    const qs = new URLSearchParams({ days, include_backfilled: fwdOnly ? "false" : "true", limit: "2000" });
+    if (tick) qs.set("ticker", tick);
+    const r = await fetch(`/purgatory/external-predictions?${qs}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const d = await r.json();
+    const s = d.summary || {};
+    const t = d.thresholds || {};
+    thr.textContent = `BUY > +${Number(t.buy_pct ?? 0).toFixed(2)}% · SELL < ${Number(t.sell_pct ?? 0).toFixed(2)}% · ${t.horizon_bdays ?? "?"} sessions`;
+
+    const tile = (label, main, sub = "", cls = "") => `
+      <div class="border border-line rounded-lg p-3">
+        <div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">${label}</div>
+        <div class="text-lg font-semibold mono ${cls}">${main}</div>
+        ${sub ? `<div class="text-[11px] text-ink-faint mt-0.5">${sub}</div>` : ""}
+      </div>`;
+    const beats = (a, b) => (a == null || b == null) ? "" : (a > b ? "tone-bullish-text" : (a < b ? "tone-bearish-text" : ""));
+    tiles.innerHTML = [
+      tile("Scored", s.n_scored ?? 0, `${s.n_pending ?? 0} pending · ${s.n_total ?? 0} total`),
+      tile("Accuracy", _bullseyePct(s.accuracy), `always-HOLD ${_bullseyePct(s.baseline_always_hold)}`, beats(s.accuracy, s.baseline_always_hold)),
+      tile("vs majority class", _bullseyePct(s.baseline_majority), "what guessing the commonest outcome scores"),
+      tile("Direction hit", _bullseyePct(s.direction_hit), "BUY↑ / SELL↓ / HOLD in band"),
+    ].join("");
+
+    const bf = s.by_forecast || {};
+    byF.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead><tr class="text-ink-faint text-left"><th class="py-1">Call</th><th class="py-1 text-right">n</th><th class="py-1 text-right">Precision</th><th class="py-1 text-right">Direction</th><th class="py-1 text-right">Avg move</th><th class="py-1 text-right">Median</th></tr></thead>
+      <tbody>${["buy", "hold", "sell"].map(c => { const b = bf[c] || {}; return `<tr class="border-t border-line">
+        <td class="py-1">${_bullseyePill(c)}</td><td class="py-1 text-right mono">${b.n ?? 0}</td>
+        <td class="py-1 text-right mono">${_bullseyePct(b.accuracy)}</td><td class="py-1 text-right mono">${_bullseyePct(b.direction_hit)}</td>
+        <td class="py-1 text-right">${_bullseyeSigned(b.avg_realized_pct)}</td><td class="py-1 text-right">${_bullseyeSigned(b.median_realized_pct)}</td></tr>`; }).join("")}</tbody></table></div>`;
+
+    const bt = Object.entries(s.by_ticker || {});
+    byT.innerHTML = bt.length ? `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead><tr class="text-ink-faint text-left"><th class="py-1">Ticker</th><th class="py-1 text-right">Scored</th><th class="py-1 text-right">Accuracy</th></tr></thead>
+      <tbody>${bt.slice(0, 30).map(([tk, b]) => `<tr class="border-t border-line"><td class="py-1 font-semibold">${escapeHTML(tk)}</td>
+        <td class="py-1 text-right mono">${b.n}</td><td class="py-1 text-right mono">${_bullseyePct(b.accuracy)}</td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="text-ink-faint text-xs">Nothing scored yet.</div>`;
+
+    const rows = d.rows || [];
+    meta.textContent = rows.length ? `${rows.length} rows since ${d.since}${fwdOnly ? " · forward-only" : ""}` : "";
+    rowsEl.innerHTML = rows.length ? `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead><tr class="text-ink-faint text-left"><th class="py-1">As of</th><th class="py-1">Ticker</th><th class="py-1">Call</th><th class="py-1 text-right">Conf</th><th class="py-1">Target</th><th class="py-1 text-right">Realized</th><th class="py-1">Actual</th><th class="py-1 text-center">✓</th></tr></thead>
+      <tbody>${rows.slice(0, 300).map(r => {
+        const conf = r.forecast === "buy" ? r.conf_buy : (r.forecast === "sell" ? r.conf_sell : r.conf_hold);
+        const mark = r.actual ? (r.correct ? `<span class="tone-bullish-text font-bold">✓</span>` : `<span class="tone-bearish-text font-bold">✗</span>`)
+                              : (r.scored_at ? `<span class="text-ink-faint" title="${escapeHTML(r.score_note || "unscorable")}">–</span>` : `<span class="text-ink-faint" title="waiting for the target session to close">…</span>`);
+        return `<tr class="border-t border-line ${r.backfilled ? "opacity-70" : ""}" ${r.backfilled ? 'title="backfilled: posted after its as-of session"' : ""}>
+          <td class="py-1 mono">${escapeHTML(String(r.as_of_date || ""))}${r.backfilled ? '<span class="text-ink-faint"> ↺</span>' : ""}</td>
+          <td class="py-1 font-semibold">${escapeHTML(r.ticker || "")}</td>
+          <td class="py-1">${_bullseyePill(r.forecast)}</td>
+          <td class="py-1 text-right mono">${conf == null ? "—" : _bullseyePct(conf, 0)}</td>
+          <td class="py-1 mono text-ink-faint">${escapeHTML(String(r.target_date || ""))}</td>
+          <td class="py-1 text-right">${_bullseyeSigned(r.realized_pct)}</td>
+          <td class="py-1">${r.actual ? _bullseyePill(r.actual) : ""}</td>
+          <td class="py-1 text-center">${mark}</td></tr>`; }).join("")}</tbody></table></div>`
+      : `<div class="text-ink-faint">No predictions in this window. Start the runner — see BULLSEYE_SETUP.md.</div>`;
+  } catch (e) {
+    tiles.innerHTML = "";
+    rowsEl.innerHTML = `<div class="text-ink-faint text-sm">${escapeHTML(e.message)}</div>`;
+  }
+}
+document.getElementById("bullseye-refresh-btn").addEventListener("click", refreshBullseye);
+document.getElementById("bullseye-days").addEventListener("change", refreshBullseye);
+document.getElementById("bullseye-forward-only").addEventListener("change", refreshBullseye);
+document.getElementById("bullseye-ticker").addEventListener("change", refreshBullseye);
 
 // ===================== Live auto-refresh =====================
 // Alerts and Trading are monitors, not documents: refresh every 60s while
