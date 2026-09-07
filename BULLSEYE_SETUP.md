@@ -63,6 +63,32 @@ $V bullseye_runner.py daemon
 `--tickers AAPL TSLA` overrides the app watchlist; `--dry-run` prints the
 batch instead of posting.
 
+## Always-on box (Windows mini PC) via Task Scheduler — recommended
+
+A once-a-day `run` beats a daemon: nothing long-lived to die, and rows are
+insert-once so it can overlap with the Mac daemon during the switch.
+
+1. Install Python 3.11 (python.org, "Add to PATH").
+2. Copy `bullseye-main` (without `.venv`) to e.g. `C:\bullseye`; put
+   `bullseye_runner.py` next to it (or clone this repo).
+3. PowerShell:
+   ```powershell
+   py -3.11 -m venv C:\bullseye\.venv
+   C:\bullseye\.venv\Scripts\pip install "scikit-learn==1.7.2" peewee pandas numpy ta python-dateutil joblib yfinance requests tzdata
+   ```
+   `tzdata` is required on Windows — the runner uses `zoneinfo` for ET and
+   Windows ships no tz database.
+4. User environment variables (not in any script): `EXTERNAL_SIGNAL_TOKEN`,
+   `BULLSEYE_REPO=C:\bullseye`.
+5. Test: `C:\bullseye\.venv\Scripts\python bullseye_runner.py run --dry-run`
+6. Task Scheduler → Create Task: trigger Weekly Mon–Fri 5:05 PM Eastern;
+   action program `C:\bullseye\.venv\Scripts\python.exe`, arguments
+   `bullseye_runner.py run`, Start in = the runner's folder; "Run whether user
+   is logged on or not"; on failure restart every 30 min up to 3 times.
+
+First run should log `accepted 11` (or `duplicates 11` if the Mac already
+posted that day). Then stop the Mac daemon.
+
 ## Env vars
 
 | var | default | meaning |
