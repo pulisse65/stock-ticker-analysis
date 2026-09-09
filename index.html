@@ -195,6 +195,19 @@
       border-bottom-color: var(--brand);
     }
 
+    /* Inline help: a small ? glyph or dotted-underlined label carrying data-tip (hover / tap) */
+    .tip-q {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 14px; height: 14px; margin-left: 4px; border-radius: 9999px;
+      border: 1px solid var(--line); color: var(--ink-faint);
+      font-size: 9px; font-weight: 700; line-height: 1; cursor: help; vertical-align: middle; user-select: none;
+    }
+    .tip-q:hover { color: var(--ink); border-color: var(--ink-faint); }
+    .has-tip { text-decoration: underline dotted; text-underline-offset: 3px; cursor: help; }
+    details.explainer summary { cursor: pointer; list-style: none; }
+    details.explainer summary::-webkit-details-marker { display: none; }
+    details.explainer summary .chev { display: inline-block; transition: transform .15s; }
+    details.explainer[open] summary .chev { transform: rotate(90deg); }
     .tab-panel { display: none; }
     .tab-panel.active { display: block; }
 
@@ -922,43 +935,63 @@
         <div class="flex items-start justify-between gap-4 flex-wrap mb-3">
           <div>
             <h2 class="font-semibold text-ink">🎯 Bullseye daily predictions</h2>
-            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">A friend's daily BUY / HOLD / SELL model (gradient-boosted classifier over 40 daily bars) forecasting the move 5 sessions ahead. Scored here against realized closes using the model's own training cut-offs. Measurement only — nothing trades on these.</p>
+            <p class="text-xs text-ink-faint mt-0.5 max-w-2xl">Every weekday after the close, a friend's machine-learning model looks at the last 40 daily bars of each watchlist ticker and calls <b>BUY</b>, <b>HOLD</b> or <b>SELL</b> for where the stock will be <b>5 trading days later</b>. This page keeps score. Nothing trades on these calls.</p>
           </div>
           <button id="bullseye-refresh-btn" type="button" class="btn-ghost px-3 py-1.5 text-sm">Refresh</button>
         </div>
+        <details class="explainer border border-line rounded-lg px-3 py-2 mb-3 text-xs">
+          <summary class="text-ink-dim font-semibold"><span class="chev mr-1">▸</span>How to read this page</summary>
+          <div class="mt-2 space-y-2 text-ink-dim leading-relaxed">
+            <p><b class="text-ink">1 · The call.</b> <span class="v-bullish px-1.5 py-0.5 rounded-full text-[10px] font-semibold">BUY</span> means the model expects the close 5 sessions out to be <b>more than +1.65% above</b> the as-of close. <span class="v-bearish px-1.5 py-0.5 rounded-full text-[10px] font-semibold">SELL</span> means <b>more than 1.05% below</b>. <span class="v-neutral px-1.5 py-0.5 rounded-full text-[10px] font-semibold">HOLD</span> means somewhere in between. Those cut-offs come from how the model was trained, so it's graded on its own terms.</p>
+            <p><b class="text-ink">2 · The grade.</b> Once the target session has closed, the server computes the realized % move from the as-of close to the target close, turns it into an <i>actual</i> label with the same cut-offs, and marks the call <span class="tone-bullish-text font-bold">✓</span> if it matched or <span class="tone-bearish-text font-bold">✗</span> if not. <span class="text-ink-faint">…</span> means the target session hasn't closed yet.</p>
+            <p><b class="text-ink">3 · Backfilled vs forward-only.</b> Rows marked <span class="text-ink-faint">↺</span> were replayed from history in one batch after the fact. They're useful for a first look, but the model may have been trained on those dates, so they can flatter it. <b>Forward-only</b> rows were posted the same evening the call was made, before anyone knew the outcome — that's the honest test. Tick <i>forward-only</i> to see just those.</p>
+            <p><b class="text-ink">4 · What counts as good.</b> Accuracy on its own is misleading because outcomes aren't evenly split. Two lazy strategies set the bar: <b>always-HOLD</b> (call HOLD every time) and <b>majority class</b> (always call whatever outcome has been commonest). The model has to beat both, on forward-only rows, with enough calls that the gap isn't luck. The read-out below tracks exactly that.</p>
+            <p class="text-ink-faint">Educational measurement only — not investment advice.</p>
+          </div>
+        </details>
         <div class="flex flex-wrap items-center gap-3 text-xs">
-          <select id="bullseye-days" class="input px-2 py-1 text-xs">
+          <select id="bullseye-days" class="input px-2 py-1 text-xs" data-tip="Window of as-of dates to include. All the numbers on this page are computed over just these rows.">
             <option value="30">Last 30 days</option>
             <option value="90" selected>Last 90 days</option>
             <option value="180">Last 180 days</option>
             <option value="365">Last year</option>
           </select>
-          <input id="bullseye-ticker" class="input px-2 py-1 text-xs w-24" placeholder="Ticker" />
-          <label class="flex items-center gap-1.5 text-ink-dim cursor-pointer" title="Hide rows that were posted after their as-of session (walk-forward replays the model may have been trained on)">
+          <input id="bullseye-ticker" class="input px-2 py-1 text-xs w-24" placeholder="Ticker" data-tip="Type a symbol and press Enter to look at one ticker only. Clear it to go back to the whole watchlist." />
+          <label class="flex items-center gap-1.5 text-ink-dim cursor-pointer" data-tip="Hide the ↺ backfilled rows (replayed from history after the fact — the model may have trained on those dates). What's left is the honest test: calls posted before the outcome was known.">
             <input id="bullseye-forward-only" type="checkbox" class="accent-current" /> forward-only
           </label>
-          <span id="bullseye-thresholds" class="px-2.5 py-1 rounded-full v-neutral">—</span>
+          <span id="bullseye-thresholds" class="px-2.5 py-1 rounded-full v-neutral" data-tip="The model's own label cut-offs. A 5-session move above the BUY line makes the actual outcome BUY, below the SELL line makes it SELL, anything between is HOLD. Calls are graded against these same lines.">—</span>
           <span id="bullseye-meta" class="text-ink-faint ml-auto"></span>
         </div>
       </section>
 
       <section class="card p-4">
-        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Hit rate</h3>
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-2">Plain-English read<span class="tip-q" data-tip="A sentence or two that says what the numbers below add up to, and how far along the honest (forward-only) test is against the pre-registered decision rule in analysis/README.md.">?</span></h3>
+        <div id="bullseye-verdict" class="text-sm text-ink-dim leading-relaxed">—</div>
+      </section>
+
+      <section class="card p-4">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Hit rate<span class="tip-q" data-tip="How often the model's calls matched what actually happened, over the rows in the current window. Hover any tile for what it means.">?</span></h3>
         <div id="bullseye-tiles" class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4"></div>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div>
-            <h4 class="text-[10px] font-bold uppercase tracking-wider text-ink-faint mb-2">By call</h4>
+            <h4 class="text-[10px] font-bold uppercase tracking-wider text-ink-faint mb-2">By call<span class="tip-q" data-tip="Split by what the model said. Tells you whether one kind of call carries the signal — e.g. its SELLs might be sharper than its BUYs.">?</span></h4>
             <div id="bullseye-by-forecast" class="text-sm text-ink-dim">—</div>
           </div>
           <div>
-            <h4 class="text-[10px] font-bold uppercase tracking-wider text-ink-faint mb-2">By ticker</h4>
+            <h4 class="text-[10px] font-bold uppercase tracking-wider text-ink-faint mb-2">By ticker<span class="tip-q" data-tip="Same accuracy, split by symbol. With only a few dozen calls per ticker these swing a lot — treat differences of a few points as noise.">?</span></h4>
             <div id="bullseye-by-ticker" class="text-sm text-ink-dim">—</div>
           </div>
         </div>
       </section>
 
       <section class="card p-4">
-        <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Predictions</h3>
+        <div class="flex items-baseline justify-between gap-3 flex-wrap mb-3">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Predictions<span class="tip-q" data-tip="Every individual call in the window, newest first. Hover a column header for what it means.">?</span></h3>
+          <div class="text-[11px] text-ink-faint">
+            <span class="tone-bullish-text font-bold">✓</span> matched &nbsp;·&nbsp; <span class="tone-bearish-text font-bold">✗</span> missed &nbsp;·&nbsp; … waiting for the target close &nbsp;·&nbsp; – unscorable &nbsp;·&nbsp; ↺ backfilled (dimmed)
+          </div>
+        </div>
         <div id="bullseye-rows" class="text-sm text-ink-dim">—</div>
       </section>
     </section>
@@ -3075,22 +3108,42 @@ const STRATEGY_GUIDE = {
 const STRATEGY_GUIDE_FOOTER =
   "Lifecycle: new strategies run signals-only — alerts and scoring, no orders. Outcomes are scored 5–30 minutes after each alert from the first tradeable price, net of estimated spread. Promotion to auto-trading requires ≥30 scored signals, ≥50% win rate, and net avg > +0.05% @15m. A strategy whose trailing 30-day record breaches the kill gate (<35% win rate or net < −0.05% on ≥30 scored) is auto-muted until its record recovers.";
 
-// --- Rich tooltip: one floating element, event delegation over [data-strat] ---
-document.addEventListener("mouseover", (e) => {
+// --- Rich tooltip: one floating element, event delegation over [data-strat] (strategy badges)
+//     and [data-tip] (plain-text help on any element; hover on desktop, tap on touch) ---
+let _richTipEl = null;
+function _showRichTip(el) {
   const tip = document.getElementById("strat-tip");
   if (!tip) return;
-  const el = e.target.closest ? e.target.closest("[data-strat]") : null;
-  if (!el || !STRATEGY_GUIDE[el.dataset.strat]) { tip.classList.add("hidden"); return; }
-  const k = el.dataset.strat;
-  tip.innerHTML = `
-    <div class="font-bold text-ink mb-1">${escapeHTML(STRATEGY_LABELS[k] || k)} · ${escapeHTML(STRATEGY_NAMES[k] || "")}</div>
-    <div class="text-ink-dim leading-relaxed">${escapeHTML(STRATEGY_GUIDE[k])}</div>`;
+  if (!el) { tip.classList.add("hidden"); _richTipEl = null; return; }
+  if (el.dataset.strat !== undefined) {
+    const k = el.dataset.strat;
+    if (!STRATEGY_GUIDE[k]) { tip.classList.add("hidden"); _richTipEl = null; return; }
+    tip.innerHTML = `
+      <div class="font-bold text-ink mb-1">${escapeHTML(STRATEGY_LABELS[k] || k)} · ${escapeHTML(STRATEGY_NAMES[k] || "")}</div>
+      <div class="text-ink-dim leading-relaxed">${escapeHTML(STRATEGY_GUIDE[k])}</div>`;
+  } else {
+    const text = el.dataset.tip || "";
+    if (!text) { tip.classList.add("hidden"); _richTipEl = null; return; }
+    tip.innerHTML = `${el.dataset.tipTitle ? `<div class="font-bold text-ink mb-1">${escapeHTML(el.dataset.tipTitle)}</div>` : ""}<div class="text-ink-dim leading-relaxed">${escapeHTML(text)}</div>`;
+  }
   tip.classList.remove("hidden");
+  _richTipEl = el;
   const r = el.getBoundingClientRect();
   tip.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - tip.offsetWidth - 12))}px`;
   let top = r.bottom + 8;
   if (top + tip.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - tip.offsetHeight - 8);
   tip.style.top = `${top}px`;
+}
+document.addEventListener("mouseover", (e) => {
+  const el = e.target.closest ? e.target.closest("[data-strat],[data-tip]") : null;
+  _showRichTip(el);
+});
+// Touch / click: tap a ? glyph (or anything carrying data-tip) to toggle its tooltip; tap elsewhere to dismiss.
+document.addEventListener("click", (e) => {
+  const el = e.target.closest ? e.target.closest("[data-tip]") : null;
+  if (!el) { if (_richTipEl) _showRichTip(null); return; }
+  if (el.classList.contains("tip-q")) e.preventDefault(); // don't toggle a <details>/<label> the glyph sits in
+  _showRichTip(_richTipEl === el ? null : el);
 });
 document.addEventListener("scroll", () => document.getElementById("strat-tip")?.classList.add("hidden"), true);
 
@@ -3720,6 +3773,38 @@ function _bullseyePill(cls) {
   return `<span class="px-2 py-0.5 rounded-full text-[11px] font-semibold ${_BULLSEYE_PILL[c] || "v-neutral"}">${c.toUpperCase() || "—"}</span>`;
 }
 function _bullseyePct(v, digits = 1) { return v == null ? "—" : `${(v * 100).toFixed(digits)}%`; }
+// Wilson score interval, lower bound — "the accuracy is at least this, 95 times out of 100"
+function _wilsonLow(k, n, z = 1.96) {
+  if (!n) return null;
+  const p = k / n, z2 = z * z;
+  return (p + z2 / (2 * n) - z * Math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))) / (1 + z2 / n);
+}
+function _median(a) { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
+const _BULLSEYE_FWD_TARGET = 150; // forward-only scored rows before the Stage 2 rule can be evaluated (analysis/README.md)
+const _BULLSEYE_TIPS = {
+  scored: "Calls whose target session has closed and been graded. Pending = target session hasn't closed yet. Total = every call in the window.",
+  accuracy: "Share of graded calls where the model's label matched the actual outcome. Green when it beats BOTH naive baselines, red when it doesn't. On its own this number can mislead — see the baselines.",
+  baselines: "What two lazy strategies would have scored on these same rows. Always-HOLD: call HOLD every time. Majority: always call whatever outcome turned out commonest. The model has to beat both to be doing anything.",
+  direction: "Looser test that ignores the size cut-offs: a BUY counts if the stock finished up at all, a SELL if it finished down at all, a HOLD if it stayed inside the band. Higher than accuracy by construction.",
+  fwd: "The honest test: calls posted the evening they were made, before the outcome was known. The decision rule needs about 150 of these graded before it can be evaluated. Grows by one per ticker per trading day.",
+  th_n: "Number of graded calls of this kind.",
+  th_precision: "Of the times the model made this call, how often the outcome actually matched. For BUY: how often the stock really did close more than +1.65% higher 5 sessions later.",
+  th_direction: "Looser: for BUY, how often the stock finished up at all; for SELL, down at all; for HOLD, inside the band.",
+  th_avg: "Average realized 5-session % move after this call. You want this positive after BUY and negative after SELL. Averages get dragged around by a few big moves — check the median too.",
+  th_median: "Middle realized 5-session % move after this call — half the outcomes were better, half worse. Less sensitive to outliers than the average. Sign should agree with the call.",
+  th_tk_scored: "Graded calls for this symbol in the window.",
+  th_tk_acc: "Share of this symbol's graded calls that matched the outcome. Small counts → noisy.",
+  th_asof: "The last daily bar the model saw. The call was made after this session's close. ↺ = backfilled (replayed later from history, dimmed).",
+  th_ticker: "Symbol the call is about.",
+  th_call: "What the model said: BUY (expects > +1.65% in 5 sessions), SELL (expects < −1.05%), HOLD (expects in between).",
+  th_conf: "The model's own probability for the label it chose. It picks the highest of three, so anything above 33% wins; these usually land between 40% and 55%. Not calibrated — treat as a rough lean.",
+  th_target: "The session the call is graded against: 5 trading days after the as-of date, rolled forward past market holidays.",
+  th_realized: "Percent change from the as-of close to the target close. Blank until the target session has closed.",
+  th_actual: "What actually happened, labelled with the same cut-offs as the call.",
+  th_mark: "✓ call matched the actual label · ✗ it didn't · … target session hasn't closed yet · – couldn't be graded (see hover).",
+};
+function _q(key) { return `<span class="tip-q" data-tip="${escapeHTML(_BULLSEYE_TIPS[key] || "")}">?</span>`; }
+function _th(label, key, extra = "") { return `<th class="py-1 ${extra}"><span class="has-tip" data-tip="${escapeHTML(_BULLSEYE_TIPS[key] || "")}">${label}</span></th>`; }
 function _bullseyeSigned(v) {
   if (v == null) return "—";
   const n = Number(v);
@@ -3746,23 +3831,66 @@ async function refreshBullseye() {
     const t = d.thresholds || {};
     thr.textContent = `BUY > +${Number(t.buy_pct ?? 0).toFixed(2)}% · SELL < ${Number(t.sell_pct ?? 0).toFixed(2)}% · ${t.horizon_bdays ?? "?"} sessions`;
 
-    const tile = (label, main, sub = "", cls = "") => `
-      <div class="border border-line rounded-lg p-3">
-        <div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">${label}</div>
+    const rows = d.rows || [];
+    // Forward-only stats are computed client-side from the rows so they show even when backfilled rows are included.
+    const fwdScored = rows.filter(r => !r.backfilled && r.actual);
+    const fwdCorrect = fwdScored.filter(r => r.correct).length;
+    const fwdAcc = fwdScored.length ? fwdCorrect / fwdScored.length : null;
+    const fwdCounts = { buy: 0, hold: 0, sell: 0 };
+    fwdScored.forEach(r => { if (r.actual in fwdCounts) fwdCounts[r.actual]++; });
+    const fwdHold = fwdScored.length ? fwdCounts.hold / fwdScored.length : null;
+    const fwdMaj = fwdScored.length ? Math.max(...Object.values(fwdCounts)) / fwdScored.length : null;
+    const fwdBest = fwdScored.length ? Math.max(fwdHold, fwdMaj) : null;
+    const fwdLow = _wilsonLow(fwdCorrect, fwdScored.length);
+    const fwdMedBuy = _median(fwdScored.filter(r => r.forecast === "buy").map(r => Number(r.realized_pct)));
+    const fwdMedSell = _median(fwdScored.filter(r => r.forecast === "sell").map(r => Number(r.realized_pct)));
+
+    const tile = (label, main, sub = "", cls = "", tipKey = "") => `
+      <div class="border border-line rounded-lg p-3" ${tipKey ? `data-tip="${escapeHTML(_BULLSEYE_TIPS[tipKey])}"` : ""}>
+        <div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint has-tip">${label}</div>
         <div class="text-lg font-semibold mono ${cls}">${main}</div>
         ${sub ? `<div class="text-[11px] text-ink-faint mt-0.5">${sub}</div>` : ""}
       </div>`;
+    const bestBase = (s.baseline_always_hold == null && s.baseline_majority == null) ? null : Math.max(s.baseline_always_hold ?? 0, s.baseline_majority ?? 0);
     const beats = (a, b) => (a == null || b == null) ? "" : (a > b ? "tone-bullish-text" : (a < b ? "tone-bearish-text" : ""));
     tiles.innerHTML = [
-      tile("Scored", s.n_scored ?? 0, `${s.n_pending ?? 0} pending · ${s.n_total ?? 0} total`),
-      tile("Accuracy", _bullseyePct(s.accuracy), `always-HOLD ${_bullseyePct(s.baseline_always_hold)}`, beats(s.accuracy, s.baseline_always_hold)),
-      tile("vs majority class", _bullseyePct(s.baseline_majority), "what guessing the commonest outcome scores"),
-      tile("Direction hit", _bullseyePct(s.direction_hit), "BUY↑ / SELL↓ / HOLD in band"),
+      tile("Scored", s.n_scored ?? 0, `${s.n_pending ?? 0} pending · ${s.n_total ?? 0} total`, "", "scored"),
+      tile("Accuracy", _bullseyePct(s.accuracy), bestBase == null ? "needs to beat both baselines" : `best naive baseline ${_bullseyePct(bestBase)}`, beats(s.accuracy, bestBase), "accuracy"),
+      tile("Naive baselines", `${_bullseyePct(s.baseline_always_hold, 0)} · ${_bullseyePct(s.baseline_majority, 0)}`, "always-HOLD · majority class", "", "baselines"),
+      tile("Direction hit", _bullseyePct(s.direction_hit), "BUY↑ / SELL↓ / HOLD in band", "", "direction"),
     ].join("");
+
+    // ---- Plain-English read ----
+    const verdictEl = document.getElementById("bullseye-verdict");
+    const pct = v => _bullseyePct(v, 0);
+    const parts = [];
+    if (!s.n_scored) {
+      parts.push(`<p>Nothing has been graded yet in this window${rows.length ? ` — ${rows.length} call${rows.length === 1 ? "" : "s"} waiting for their target session to close` : ""}.</p>`);
+    } else {
+      const beatsBoth = s.accuracy > bestBase;
+      parts.push(`<p>Across <b class="text-ink">${s.n_scored}</b> graded calls the model was right <b class="${beats(s.accuracy, bestBase)}">${pct(s.accuracy)}</b> of the time — ${beatsBoth ? "better than" : "not better than"} both lazy baselines (always-HOLD ${pct(s.baseline_always_hold)}, majority class ${pct(s.baseline_majority)}). Put the other way, about <b class="text-ink">${pct(1 - s.accuracy)}</b> of its calls were wrong.</p>`);
+      if (!fwdOnly && rows.some(r => r.backfilled)) parts.push(`<p class="text-ink-faint">That figure includes ↺ backfilled rows the model may have trained on, so it's an upper bound on the real skill.</p>`);
+    }
+    const fwdPct = Math.min(100, fwdScored.length / _BULLSEYE_FWD_TARGET * 100);
+    let fwdLine;
+    if (!fwdScored.length) fwdLine = `Honest test (forward-only): <b class="text-ink">0</b> graded so far. Each trading day adds one call per watchlist ticker; the first grades land 5 sessions after the runner's first post.`;
+    else {
+      fwdLine = `Honest test (forward-only): <b class="text-ink">${fwdScored.length}</b> graded, accuracy <b class="${beats(fwdAcc, fwdBest)}">${pct(fwdAcc)}</b> vs best baseline ${pct(fwdBest)}.`;
+      if (fwdScored.length >= 30) fwdLine += ` With this many calls we can be 95% sure the true accuracy is at least <b class="${beats(fwdLow, fwdBest)}">${pct(fwdLow)}</b> — ${fwdLow > fwdBest ? "that clears the baseline." : "not yet clear of the baseline."}`;
+      else fwdLine += ` Too few to say anything yet.`;
+    }
+    const gateMet = fwdScored.length >= _BULLSEYE_FWD_TARGET && fwdLow > fwdBest && (fwdMedBuy ?? 0) > 0 && (fwdMedSell ?? 0) < 0;
+    parts.push(`<div class="mt-2">${fwdLine}</div>
+      <div class="mt-1.5 flex items-center gap-2 text-[11px] text-ink-faint">
+        <div class="h-1.5 flex-1 rounded-full bg-line overflow-hidden"><div class="h-full ${gateMet ? "v-bullish" : "bg-current"} opacity-70" style="width:${fwdPct.toFixed(1)}%"></div></div>
+        <span class="mono">${fwdScored.length} / ${_BULLSEYE_FWD_TARGET}</span>
+        <span class="has-tip" data-tip="Pre-registered rule from analysis/README.md: at least ${_BULLSEYE_FWD_TARGET} forward-only graded calls, the 95% lower bound of their accuracy above both naive baselines, and the median move after BUY positive / after SELL negative. Until then the model is being watched, not acted on.">Stage 2 gate: <b class="${gateMet ? "tone-bullish-text" : "text-ink-dim"}">${gateMet ? "met" : "not met"}</b></span>
+      </div>`);
+    verdictEl.innerHTML = parts.join("");
 
     const bf = s.by_forecast || {};
     byF.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs">
-      <thead><tr class="text-ink-faint text-left"><th class="py-1">Call</th><th class="py-1 text-right">n</th><th class="py-1 text-right">Precision</th><th class="py-1 text-right">Direction</th><th class="py-1 text-right">Avg move</th><th class="py-1 text-right">Median</th></tr></thead>
+      <thead><tr class="text-ink-faint text-left"><th class="py-1">Call</th>${_th("n", "th_n", "text-right")}${_th("Precision", "th_precision", "text-right")}${_th("Direction", "th_direction", "text-right")}${_th("Avg move", "th_avg", "text-right")}${_th("Median", "th_median", "text-right")}</tr></thead>
       <tbody>${["buy", "hold", "sell"].map(c => { const b = bf[c] || {}; return `<tr class="border-t border-line">
         <td class="py-1">${_bullseyePill(c)}</td><td class="py-1 text-right mono">${b.n ?? 0}</td>
         <td class="py-1 text-right mono">${_bullseyePct(b.accuracy)}</td><td class="py-1 text-right mono">${_bullseyePct(b.direction_hit)}</td>
@@ -3770,31 +3898,31 @@ async function refreshBullseye() {
 
     const bt = Object.entries(s.by_ticker || {});
     byT.innerHTML = bt.length ? `<div class="overflow-x-auto"><table class="w-full text-xs">
-      <thead><tr class="text-ink-faint text-left"><th class="py-1">Ticker</th><th class="py-1 text-right">Scored</th><th class="py-1 text-right">Accuracy</th></tr></thead>
+      <thead><tr class="text-ink-faint text-left"><th class="py-1">Ticker</th>${_th("Scored", "th_tk_scored", "text-right")}${_th("Accuracy", "th_tk_acc", "text-right")}</tr></thead>
       <tbody>${bt.slice(0, 30).map(([tk, b]) => `<tr class="border-t border-line"><td class="py-1 font-semibold">${escapeHTML(tk)}</td>
         <td class="py-1 text-right mono">${b.n}</td><td class="py-1 text-right mono">${_bullseyePct(b.accuracy)}</td></tr>`).join("")}</tbody></table></div>`
       : `<div class="text-ink-faint text-xs">Nothing scored yet.</div>`;
 
-    const rows = d.rows || [];
     meta.textContent = rows.length ? `${rows.length} rows since ${d.since}${fwdOnly ? " · forward-only" : ""}` : "";
     rowsEl.innerHTML = rows.length ? `<div class="overflow-x-auto"><table class="w-full text-xs">
-      <thead><tr class="text-ink-faint text-left"><th class="py-1">As of</th><th class="py-1">Ticker</th><th class="py-1">Call</th><th class="py-1 text-right">Conf</th><th class="py-1">Target</th><th class="py-1 text-right">Realized</th><th class="py-1">Actual</th><th class="py-1 text-center">✓</th></tr></thead>
+      <thead><tr class="text-ink-faint text-left">${_th("As of", "th_asof")}${_th("Ticker", "th_ticker")}${_th("Call", "th_call")}${_th("Conf", "th_conf", "text-right")}${_th("Target", "th_target", "pl-3")}${_th("Realized", "th_realized", "text-right")}${_th("Actual", "th_actual", "pl-3")}${_th("✓", "th_mark", "text-center")}</tr></thead>
       <tbody>${rows.slice(0, 300).map(r => {
         const conf = r.forecast === "buy" ? r.conf_buy : (r.forecast === "sell" ? r.conf_sell : r.conf_hold);
         const mark = r.actual ? (r.correct ? `<span class="tone-bullish-text font-bold">✓</span>` : `<span class="tone-bearish-text font-bold">✗</span>`)
-                              : (r.scored_at ? `<span class="text-ink-faint" title="${escapeHTML(r.score_note || "unscorable")}">–</span>` : `<span class="text-ink-faint" title="waiting for the target session to close">…</span>`);
-        return `<tr class="border-t border-line ${r.backfilled ? "opacity-70" : ""}" ${r.backfilled ? 'title="backfilled: posted after its as-of session"' : ""}>
-          <td class="py-1 mono">${escapeHTML(String(r.as_of_date || ""))}${r.backfilled ? '<span class="text-ink-faint"> ↺</span>' : ""}</td>
+                              : (r.scored_at ? `<span class="text-ink-faint" data-tip="Couldn't be graded: ${escapeHTML(r.score_note || "no reason recorded")}">–</span>` : `<span class="text-ink-faint" data-tip="Waiting for the ${escapeHTML(String(r.target_date || "target"))} session to close, then the server grades it within about 30 minutes of the next scan.">…</span>`);
+        return `<tr class="border-t border-line ${r.backfilled ? "opacity-70" : ""}">
+          <td class="py-1 mono">${escapeHTML(String(r.as_of_date || ""))}${r.backfilled ? '<span class="text-ink-faint" data-tip="Backfilled: this call was replayed from history after the fact, not posted the evening it was made. The model may have trained on this date, so it can flatter the score."> ↺</span>' : ""}</td>
           <td class="py-1 font-semibold">${escapeHTML(r.ticker || "")}</td>
           <td class="py-1">${_bullseyePill(r.forecast)}</td>
           <td class="py-1 text-right mono">${conf == null ? "—" : _bullseyePct(conf, 0)}</td>
-          <td class="py-1 mono text-ink-faint">${escapeHTML(String(r.target_date || ""))}</td>
+          <td class="py-1 pl-3 mono text-ink-faint">${escapeHTML(String(r.target_date || ""))}</td>
           <td class="py-1 text-right">${_bullseyeSigned(r.realized_pct)}</td>
-          <td class="py-1">${r.actual ? _bullseyePill(r.actual) : ""}</td>
+          <td class="py-1 pl-3">${r.actual ? _bullseyePill(r.actual) : ""}</td>
           <td class="py-1 text-center">${mark}</td></tr>`; }).join("")}</tbody></table></div>`
       : `<div class="text-ink-faint">No predictions in this window. Start the runner — see BULLSEYE_SETUP.md.</div>`;
   } catch (e) {
     tiles.innerHTML = "";
+    document.getElementById("bullseye-verdict").textContent = "—";
     rowsEl.innerHTML = `<div class="text-ink-faint text-sm">${escapeHTML(e.message)}</div>`;
   }
 }
