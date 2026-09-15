@@ -89,6 +89,65 @@ insert-once so it can overlap with the Mac daemon during the switch.
 First run should log `accepted 11` (or `duplicates 11` if the Mac already
 posted that day). Then stop the Mac daemon.
 
+## Grading cron + outage alerts (do all three once)
+
+Grades used to land only as a side effect of the market-hours `/purgatory/scan`
+cron. On 2026-09-11 that cron was auto-disabled by cron-job.org after 26
+consecutive 502s (the Render instance was unreachable for ~100 min), and nothing
+graded for two and a half days with no alert. Three account-side settings close
+that gap. None of them need a secret.
+
+### 1. Uptime monitor on `/healthz` (find out about outages in minutes)
+
+`GET https://stock-ticker-analysis.onrender.com/healthz` returns
+`{"ok": true, "ts": ..., "rss_mb": ...}` with no Supabase/Alpaca/disk work, so
+it's safe to poll every 5 minutes and it keeps the instance warm.
+
+* UptimeRobot (free): New monitor → type **HTTP(s)** (or **Keyword** with
+  keyword `"ok":true`) → URL above → interval **5 min** → alert contact = your
+  email and/or phone push. Recommended: a provider other than cron-job.org, so
+  one vendor's hiccup can't blind both.
+* Or on cron-job.org: a second job, GET `/healthz`, every 5 minutes, all days,
+  with the failure notification from step 2 turned on.
+
+`rss_mb` in the response is the process footprint; the free tier kills at
+512 MB. If a monitor alert lines up with `rss_mb` climbing past ~450 in the
+Render logs, the outage was a memory kill and the fix is a bigger instance.
+
+### 2. cron-job.org failure notifications (on the existing `Stock Cron` job)
+
+cron-job.org disables a job for good after **more than 25 consecutive
+failures** — that threshold is theirs, not configurable — but it will email on
+the *first* failure if you ask. Open the `Stock Cron` job → **Edit** →
+**Notifications**: turn on **On failure** and **When the job is re-enabled /
+back to success** (wording varies), and leave **When disabled** on. Do the same
+on the two jobs below. With the 5-minute health check from step 1 you'll hear
+about an outage before the 26th miss kills the scan.
+
+### 3. Dedicated grading cron (grades land the same evening, scan or no scan)
+
+`POST https://stock-ticker-analysis.onrender.com/purgatory/score-daily-predictions`
+
+* Grades every prediction whose target session has closed, right now.
+* Open like `/scan` (no token). A 5-minute floor between forced runs bounds
+  abuse; it only ever writes what the scan loop would have written anyway.
+* Response: `{"scored": n, "throttled": false, "last_run": {"at", "scored",
+  "pending_due"}}`. `/purgatory/status → daily_predictions.last_score_run`
+  shows the same block for the most recent pass of either path.
+
+cron-job.org → **Create cronjob**: title `Bullseye grade`, URL above, request
+method **POST**, schedule **Mon–Fri at 16:45 America/New_York** (the scorer
+counts today's bar only after 16:10 ET; 16:45 leaves room for Yahoo to post the
+close). Enable the failure notification. A second hit at **18:30 ET** is cheap
+insurance for a slow Yahoo day. Weekends and holidays are harmless: it finds
+nothing due and returns `scored: 0`.
+
+Manual equivalent when you don't want to wait:
+
+```bash
+curl -s -X POST https://tickertracker.dev/purgatory/score-daily-predictions
+```
+
 ## Env vars
 
 | var | default | meaning |
