@@ -6041,6 +6041,9 @@ DAILY_PRED_SELL_PCT = float(os.environ.get("DAILY_PRED_SELL_PCT", "-1.05"))
 DAILY_PRED_HORIZON_BDAYS = int(os.environ.get("DAILY_PRED_HORIZON_BDAYS", "5"))
 _DAILY_PRED_SCORE_INTERVAL_S = 30 * 60
 _daily_pred_last_score_at = 0.0
+_DAILY_PRED_FORCE_INTERVAL_S = 5 * 60     # floor between forced (endpoint-driven) passes
+_daily_pred_last_force_at = 0.0
+_daily_pred_last_run: dict[str, Any] = {"at": None, "scored": 0, "pending_due": 0}  # surfaced in /purgatory/status
 
 # bullseye's base_labels order: 0=SELL, 1=HOLD, 2=BUY (asset-tracking's
 # core.Prediction.Forecast uses the same ints).
@@ -6187,6 +6190,7 @@ def _score_matured_daily_predictions(force: bool = False) -> int:
     if not force and (time.time() - _daily_pred_last_score_at) < _DAILY_PRED_SCORE_INTERVAL_S:
         return 0
     _daily_pred_last_score_at = time.time()
+    _daily_pred_last_run.update({"at": _now_iso(), "scored": 0, "pending_due": 0})
 
     # Only fully printed sessions count: today's bar joins the usable set
     # after the close, otherwise a live partial bar would be scored as the
@@ -6211,6 +6215,7 @@ def _score_matured_daily_predictions(force: bool = False) -> int:
     except Exception as exc:  # noqa: BLE001
         log.warning("Daily-prediction score query failed: %s", exc)
         return 0
+    _daily_pred_last_run["pending_due"] = len(pending)
     if not pending:
         return 0
 
@@ -6246,9 +6251,34 @@ def _score_matured_daily_predictions(force: bool = False) -> int:
             n += 1
         except Exception as exc:  # noqa: BLE001
             log.warning("Daily-prediction update failed for %s: %s", p.get("id"), exc)
+    _daily_pred_last_run["scored"] = n
     if n:
         log.info("Daily-prediction scorer: %d row(s) scored", n)
     return n
+
+
+@app.post("/purgatory/score-daily-predictions")
+def score_daily_predictions():
+    """Grade every daily prediction whose target session has closed, right
+    now, independent of the market-hours scan cron. Meant to be hit once per
+    weekday evening (~16:45 ET) by a second cron so grades land the same day
+    even if the scan cron died or the instance restarted. Open like /scan;
+    abuse is bounded by a 5-minute floor between forced passes and by the
+    fact that it only ever writes scores the scan loop would have written
+    anyway."""
+    global _daily_pred_last_force_at
+    if _supabase_client is None:
+        raise HTTPException(503, "Daily-prediction scoring requires SUPABASE_URL and SUPABASE_KEY.")
+    wait = _DAILY_PRED_FORCE_INTERVAL_S - (time.time() - _daily_pred_last_force_at)
+    if wait > 0:
+        return {"scored": 0, "throttled": True, "retry_after_s": int(wait), "last_run": _daily_pred_last_run}
+    _daily_pred_last_force_at = time.time()
+    try:
+        n = _score_matured_daily_predictions(force=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Forced daily-prediction scorer failed: %s", exc)
+        raise HTTPException(502, f"Scorer failed: {exc}") from exc
+    return {"scored": n, "throttled": False, "last_run": _daily_pred_last_run}
 
 
 def _summarize_predictions(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -6744,6 +6774,7 @@ def purgatory_status():
             "horizon_bdays": DAILY_PRED_HORIZON_BDAYS,
             "buy_pct":       DAILY_PRED_BUY_PCT,
             "sell_pct":      DAILY_PRED_SELL_PCT,
+            "last_score_run": _daily_pred_last_run,   # at / scored / pending_due of the most recent scorer pass
         },
         "strategies":              _strategy_status_block(),
         "manual_disabled_pairs":   [{"strategy": s, "ticker": t, "direction": d}

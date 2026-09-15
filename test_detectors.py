@@ -402,6 +402,8 @@ class _FakeQ:
     def select(self, *a, **k): return self
     def eq(self, *a, **k): return self
     def gte(self, *a, **k): return self
+    def lte(self, *a, **k): return self
+    def is_(self, *a, **k): return self
     def order(self, *a, **k): return self
     def limit(self, *a, **k): return self
     def execute(self):
@@ -440,6 +442,18 @@ resp = client.post("/purgatory/external-predictions", json={"source": "kronos", 
 check("unknown source -> 400", resp.status_code == 400)
 resp = client.get("/purgatory/external-predictions?days=30")
 check("get returns summary shape", resp.status_code == 200 and "summary" in resp.json() and resp.json()["thresholds"]["buy_pct"] == 1.65, str(resp.json())[:200])
+# forced scorer endpoint: runs the scorer now, 5-min floor between forced passes, 503 without Supabase
+main._daily_pred_last_force_at = 0.0
+resp = client.post("/purgatory/score-daily-predictions")
+j = resp.json()
+check("force-score runs and reports", resp.status_code == 200 and j["scored"] == 0 and j["throttled"] is False and j["last_run"]["at"] is not None, str(j))
+resp = client.post("/purgatory/score-daily-predictions")
+check("force-score throttled within 5 min", resp.status_code == 200 and resp.json()["throttled"] is True and resp.json()["retry_after_s"] > 0, str(resp.json()))
+resp = client.get("/purgatory/status")
+check("status exposes last_score_run", resp.status_code == 200 and "last_score_run" in resp.json()["daily_predictions"])
+main._supabase_client = None
+resp = client.post("/purgatory/score-daily-predictions")
+check("force-score without Supabase -> 503", resp.status_code == 503, str(resp.status_code))
 main.EXTERNAL_SIGNAL_TOKEN, main._supabase_client = _saved_tok, _saved_sb
 
 print(f"\n{passed} passed, {failed} failed")
