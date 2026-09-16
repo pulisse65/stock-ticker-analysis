@@ -2898,17 +2898,30 @@ ALPACA_LIVE_MAX_TRADE_USD = float(os.environ.get(
     "ALPACA_LIVE_MAX_TRADE_USD", str(1.5 * ALPACA_LIVE_NOTIONAL_USD)))
 
 # --- Live-account circuit breaker (automatic stand-down) ---
-# Two triggers, checked before every live entry:
+# Three triggers, checked before every live entry:
 #   1. cumulative live P&L <= -LIVE_HALT_MAX_LOSS_USD  (any trade count)
-#   2. win rate < LIVE_HALT_MAX_WIN_RATE once >= LIVE_HALT_MIN_TRADES closed
+#   2. drawdown from the equity peak >= LIVE_HALT_MAX_DRAWDOWN_USD
+#      once >= LIVE_HALT_MIN_TRADES closed
+#   3. average P&L/trade over the last LIVE_HALT_WINDOW trades below
+#      LIVE_HALT_MIN_AVG_USD once >= LIVE_HALT_MIN_TRADES closed
+# A raw win-rate floor used to be trigger 2, and halted a system that was
+# +$1,324 over 16 trades (9/16): small stop-outs clustered and dragged the
+# rate under 60% while big wins kept expectancy strongly positive. Win
+# rate can't see asymmetric payoffs; drawdown and recent expectancy halt
+# when the edge actually decays instead of when variance clusters.
 # The state is computed from the closed-trade record in Supabase, never
 # stored: it survives restarts, can't silently reset, and latches by
 # construction (a halt stops new entries, so the record that tripped it
 # never changes). Resuming after review is the one deliberate human act:
 # set LIVE_HALT_RESET_AT to an ISO timestamp and only newer trades count.
 LIVE_HALT_MIN_TRADES = int(os.environ.get("LIVE_HALT_MIN_TRADES", "10"))
-LIVE_HALT_MAX_WIN_RATE = float(os.environ.get("LIVE_HALT_MAX_WIN_RATE", "60"))
 LIVE_HALT_MAX_LOSS_USD = float(os.environ.get("LIVE_HALT_MAX_LOSS_USD", "150"))
+# Two max stop-outs' worth of give-back from the peak before standing down.
+LIVE_HALT_MAX_DRAWDOWN_USD = float(os.environ.get("LIVE_HALT_MAX_DRAWDOWN_USD", "300"))
+LIVE_HALT_WINDOW = int(os.environ.get("LIVE_HALT_WINDOW", "10"))
+# -25 (not 0): a recent window hovering a few dollars below breakeven is
+# variance on $500 trades; a window averaging worse than -$25/trade is decay.
+LIVE_HALT_MIN_AVG_USD = float(os.environ.get("LIVE_HALT_MIN_AVG_USD", "-25"))
 LIVE_HALT_RESET_AT = os.environ.get("LIVE_HALT_RESET_AT", "").strip()
 _live_halt_cache: tuple[float, dict] = (0.0, {})
 _LIVE_HALT_CACHE_TTL = 300
@@ -3866,34 +3879,62 @@ def _compute_daily_realized_pnl(date_str: str, account: str | None = None) -> di
 
 def _evaluate_live_halt(trades: list[dict]) -> dict[str, Any]:
     """Pure circuit-breaker evaluation over closed live trades. Split from
-    the fetch so the tripwire logic is testable with synthetic trades."""
+    the fetch so the tripwire logic is testable with synthetic trades.
+
+    Halts on decay of the actual edge — cumulative loss, give-back from the
+    equity peak, or negative recent expectancy — never on raw win rate,
+    which punishes asymmetric-payoff systems for normal loss clustering."""
     if LIVE_HALT_RESET_AT:
         trades = [t for t in trades
                   if (t.get("entry_submitted_at") or "") >= LIVE_HALT_RESET_AT]
+    trades = sorted(trades, key=lambda t: t.get("entry_submitted_at") or "")
     n = len(trades)
     wins = sum(1 for t in trades if t["pnl"] > 0)
     total = round(sum(t["pnl"] for t in trades), 2)
     wr = round(wins / n * 100, 1) if n else None
+
+    # Current drawdown: how far cumulative P&L sits below its running peak.
+    run = peak = 0.0
+    for t in trades:
+        run += t["pnl"]
+        peak = max(peak, run)
+    drawdown = round(peak - run, 2)
+
+    recent = trades[-LIVE_HALT_WINDOW:] if LIVE_HALT_WINDOW > 0 else []
+    recent_avg = round(sum(t["pnl"] for t in recent) / len(recent), 2) if recent else None
+
     halted, reason = False, None
     if LIVE_HALT_MAX_LOSS_USD > 0 and total <= -LIVE_HALT_MAX_LOSS_USD:
         halted = True
         reason = (f"cumulative live P&L ${total:+,.2f} breached the "
                   f"-${LIVE_HALT_MAX_LOSS_USD:,.0f} loss breaker")
-    elif n >= LIVE_HALT_MIN_TRADES and wr is not None and wr < LIVE_HALT_MAX_WIN_RATE:
+    elif (n >= LIVE_HALT_MIN_TRADES and LIVE_HALT_MAX_DRAWDOWN_USD > 0
+            and drawdown >= LIVE_HALT_MAX_DRAWDOWN_USD):
         halted = True
-        reason = (f"win rate {wr}% over {n} closed live trades is below "
-                  f"the {LIVE_HALT_MAX_WIN_RATE:.0f}% floor")
+        reason = (f"drawdown ${drawdown:,.2f} from the ${peak:,.2f} equity peak "
+                  f"breached the ${LIVE_HALT_MAX_DRAWDOWN_USD:,.0f} give-back breaker")
+    elif (n >= LIVE_HALT_MIN_TRADES and recent_avg is not None
+            and recent_avg < LIVE_HALT_MIN_AVG_USD):
+        halted = True
+        reason = (f"average P&L ${recent_avg:+,.2f}/trade over the last {len(recent)} "
+                  f"live trades is below the ${LIVE_HALT_MIN_AVG_USD:+,.0f} expectancy floor")
     return {
-        "halted":       halted,
-        "reason":       reason,
-        "n_trades":     n,
-        "wins":         wins,
-        "win_rate_pct": wr,
-        "total_pnl":    total,
-        "thresholds":   {"min_trades":   LIVE_HALT_MIN_TRADES,
-                         "max_win_rate": LIVE_HALT_MAX_WIN_RATE,
-                         "max_loss_usd": LIVE_HALT_MAX_LOSS_USD},
-        "reset_at":     LIVE_HALT_RESET_AT or None,
+        "halted":         halted,
+        "reason":         reason,
+        "n_trades":       n,
+        "wins":           wins,
+        "win_rate_pct":   wr,          # informational only — never a trigger
+        "total_pnl":      total,
+        "peak_pnl":       round(peak, 2),
+        "drawdown_usd":   drawdown,
+        "recent_n":       len(recent),
+        "recent_avg_usd": recent_avg,
+        "thresholds":     {"min_trades":       LIVE_HALT_MIN_TRADES,
+                           "max_loss_usd":     LIVE_HALT_MAX_LOSS_USD,
+                           "max_drawdown_usd": LIVE_HALT_MAX_DRAWDOWN_USD,
+                           "window":           LIVE_HALT_WINDOW,
+                           "min_avg_usd":      LIVE_HALT_MIN_AVG_USD},
+        "reset_at":       LIVE_HALT_RESET_AT or None,
     }
 
 
@@ -3909,10 +3950,15 @@ def _live_halt_status(force: bool = False) -> dict[str, Any]:
     try:
         if _supabase_client is None:
             raise RuntimeError("Supabase unavailable")
+        # Load ALL rows and let _match_order_rows classify accounts — the
+        # same path /purgatory/pnl takes. Filtering to paper=false in SQL
+        # produced a different trade set than the P&L view (rows with a
+        # null flag classify as live in the pairing but were excluded by
+        # the eq filter), so the breaker and the dashboard disagreed
+        # (16 trades/+$1,324 vs 14/+$1,505 on 9/16). One data path now.
         res = (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
             .select("*")
-            .eq("paper", False)
             .order("submitted_at", desc=False)
             .execute()
         )
