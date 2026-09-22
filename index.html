@@ -788,6 +788,44 @@
         <div id="alerts-watchlist" class="text-sm text-ink-dim">—</div>
       </section>
 
+      <!-- Signal leaderboard: all-time vs recent window, Wilson bound, momentum -->
+      <section class="card p-4">
+        <div class="flex items-start justify-between gap-3 flex-wrap mb-3">
+          <div>
+            <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Signal leaderboard<span class="tip-q" data-tip="Every (strategy, ticker, side) pair the scanner has ever scored, honest rows only (scored after the alert fired, never with hindsight). All-time and recent-window records sit side by side so you can see whether a pair's edge is holding up. Hover any column header for what it means.">?</span></h3>
+            <p class="text-[11px] text-ink-faint mt-0.5 max-w-3xl">Ranked by the <b>Wilson lower bound</b> by default: the win rate we can be 95% sure a pair at least has, given how few signals it has. A 100% pair with 4 signals ranks below a 65% pair with 60. <b>Momentum</b> says whether the recent record is beating the pair's own history.</p>
+          </div>
+          <span id="lb-meta" class="text-xs text-ink-faint"></span>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 text-xs mb-3">
+          <select id="lb-days" class="input px-2 py-1 text-xs" data-tip="Length of the recent window shown in the 'Recent' columns and used for the recent paper P&L.">
+            <option value="7">Recent = 7 days</option>
+            <option value="30" selected>Recent = 30 days</option>
+            <option value="90">Recent = 90 days</option>
+          </select>
+          <select id="lb-minn" class="input px-2 py-1 text-xs" data-tip="Hide pairs with fewer all-time signals than this. Small samples produce spectacular win rates by luck.">
+            <option value="5">N ≥ 5</option>
+            <option value="10" selected>N ≥ 10</option>
+            <option value="20">N ≥ 20</option>
+            <option value="30">N ≥ 30</option>
+          </select>
+          <select id="lb-strategy" class="input px-2 py-1 text-xs"><option value="">All strategies</option></select>
+          <select id="lb-side" class="input px-2 py-1 text-xs"><option value="">Both sides</option><option value="call">Calls</option><option value="put">Puts</option></select>
+          <select id="lb-sort" class="input px-2 py-1 text-xs" data-tip="Sort key. Wilson bound is the honest default; 'Momentum' surfaces pairs heating up or cooling off; 'Recent win rate' is noisy on small windows.">
+            <option value="wilson">Sort: Wilson bound</option>
+            <option value="all_wr">Sort: All-time win rate</option>
+            <option value="win_wr">Sort: Recent win rate</option>
+            <option value="momentum">Sort: Momentum</option>
+            <option value="net">Sort: Net move @15m</option>
+            <option value="pnl">Sort: Paper P&L</option>
+            <option value="n">Sort: Signals</option>
+          </select>
+          <label class="flex items-center gap-1.5 text-ink-dim cursor-pointer" data-tip="Hide pairs the platform has muted (manual disable or the 30-day auto-disable gate)."><input id="lb-hide-disabled" type="checkbox" class="accent-current" /> hide muted</label>
+          <button id="lb-refresh" type="button" class="btn-ghost px-2.5 py-1 text-xs ml-auto">Refresh</button>
+        </div>
+        <div id="lb-table" class="text-sm text-ink-dim">—</div>
+      </section>
+
       <!-- Per-ticker / per-direction stats (collapsible — the table got long
            with 6 strategies, and Recent signals below is the priority view
            during trading hours) -->
@@ -3473,8 +3511,104 @@ function renderAlertsStats() {
   }
 }
 
+// ===================== Signal leaderboard =====================
+let _lbData = null;
+const _LB_TIPS = {
+  pair: "Ticker, strategy badge (hover it for what the detector looks for) and side. LIVE = trades real money; muted = disabled by hand or by the 30-day auto-disable gate; $ = a trading strategy with paper fills.",
+  all_n: "All-time honest-scored signals for this pair, and the number of distinct sessions they span. Many signals in few sessions move together — treat the session count as the real sample size.",
+  all_wr: "All-time win rate = wins ÷ (wins + losses + flats). A win means the stock's best favourable move within 30 minutes cleared +0.10% after the assumed spread. This measures the stock, not an option's P&L.",
+  wilson: "Wilson 95% lower bound on the all-time win rate: the rate we can be confident the pair at least has. Shrinks hard for small n. Green at 0.55+, the level the promotion analysis treats as 'real'.",
+  win_n: "Signals inside the recent window (W-L-F).",
+  win_wr: "Win rate inside the recent window. Coloured against the pair's all-time rate: green if better, red if worse by more than 10 points.",
+  spark: "Rolling win rate over the pair's last 10 signals, sampled along its whole history, oldest → newest. A flat high line is a grind; a spike then slide is a hot week that faded.",
+  momentum: "EWMA win rate (half-life 8 signals, so the last ~8 dominate) minus the all-time win rate, in points. Positive = recently better than its own history. Below it: last-10 win rate vs the 10 before, and the current streak.",
+  net: "Average favourable underlying move at +15 min, net of the assumed spread, all-time. The promotion gate's expectancy metric. Positive and a high win rate together are what you want; a high win rate with a negative number is the 'scalper mirage' (wins tap the threshold and retrace).",
+  pnl: "Realized paper option P&L for this pair, all-time / recent window, with fill and stop-out counts. Only purgatory has fills. This is the number that most resembles real money.",
+};
+function _lbTh(label, key, extra = "") { return `<th class="pb-2 ${extra}"><span class="has-tip" data-tip="${escapeHTML(_LB_TIPS[key] || "")}">${label}</span></th>`; }
+function _lbPct(v, d = 0) { return v == null ? "—" : `${(v * 100).toFixed(d)}%`; }
+function _lbSpark(vals) {
+  if (!vals || vals.length < 2) return "";
+  const w = 72, h = 18, n = vals.length;
+  const pts = vals.map((v, i) => `${(i / (n - 1) * w).toFixed(1)},${(h - 2 - v * (h - 4)).toFixed(1)}`).join(" ");
+  const last = vals[vals.length - 1];
+  const cls = last >= 0.6 ? "tone-bullish-text" : (last <= 0.4 ? "tone-bearish-text" : "text-ink-dim");
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="${cls}" aria-hidden="true"><line x1="0" y1="${h / 2}" x2="${w}" y2="${h / 2}" stroke="currentColor" stroke-opacity="0.15" stroke-dasharray="2 2"/><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>`;
+}
+async function refreshLeaderboard() {
+  const el = document.getElementById("lb-table");
+  const days = document.getElementById("lb-days").value;
+  const minn = document.getElementById("lb-minn").value;
+  try {
+    const r = await fetch(`/purgatory/leaderboard?days=${days}&min_n=${minn}`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    _lbData = await r.json();
+    const stratSel = document.getElementById("lb-strategy");
+    const have = new Set([...stratSel.options].map(o => o.value));
+    [...new Set(_lbData.rows.map(x => x.strategy))].sort().forEach(k => {
+      if (!have.has(k)) { const o = document.createElement("option"); o.value = k; o.textContent = STRATEGY_LABELS[k] || k; stratSel.appendChild(o); }
+    });
+    renderLeaderboard();
+  } catch (e) {
+    el.innerHTML = `<span class="text-ink-faint">${escapeHTML(e.message)}</span>`;
+  }
+}
+function renderLeaderboard() {
+  const el = document.getElementById("lb-table");
+  const d = _lbData; if (!d) return;
+  const fStrat = document.getElementById("lb-strategy").value;
+  const fSide = document.getElementById("lb-side").value;
+  const sort = document.getElementById("lb-sort").value;
+  const hideDis = document.getElementById("lb-hide-disabled").checked;
+  let rows = d.rows.filter(x => (!fStrat || x.strategy === fStrat) && (!fSide || x.direction === fSide) && (!hideDis || !x.flags.disabled));
+  const key = {
+    wilson: x => x.all.wilson_lo ?? -1, all_wr: x => x.all.win_rate ?? -1, win_wr: x => x.window.win_rate ?? -1,
+    momentum: x => x.momentum.momentum ?? -9, net: x => x.all.avg_net_f15 ?? -9, pnl: x => x.paper.pnl ?? -1e9, n: x => x.all.n,
+  }[sort] || (x => x.all.wilson_lo ?? -1);
+  rows.sort((a, b) => key(b) - key(a) || b.all.n - a.all.n);
+  document.getElementById("lb-meta").textContent = `${rows.length} of ${d.n_pairs} pairs · ${d.n_signals} honest signals all-time · recent = ${d.days}d`;
+  if (!rows.length) { el.innerHTML = `<span class="text-ink-faint">No pairs match.</span>`; return; }
+  el.innerHTML = `<div class="overflow-x-auto"><table class="w-full text-xs whitespace-nowrap">
+    <thead><tr class="text-ink-faint text-left">
+      ${_lbTh("Pair", "pair")}${_lbTh("N · sessions", "all_n", "text-right")}${_lbTh("All-time", "all_wr", "text-right")}${_lbTh("Wilson lo", "wilson", "text-right")}
+      ${_lbTh(`Recent ${d.days}d`, "win_n", "text-right pl-4")}${_lbTh("Recent win", "win_wr", "text-right")}${_lbTh("Trend", "spark", "text-center pl-4")}${_lbTh("Momentum", "momentum", "text-right")}
+      ${_lbTh("Net @15m", "net", "text-right pl-4")}${_lbTh("Paper P&L", "pnl", "text-right")}
+    </tr></thead>
+    <tbody>${rows.map(x => {
+      const a = x.all, w = x.window, m = x.momentum, pf = x.paper;
+      const dirCls = x.direction === "call" ? "val-up" : "val-down";
+      const wl = a.wilson_lo ?? 0;
+      const wilCls = wl >= 0.55 ? "val-up font-semibold" : (wl >= 0.45 ? "text-ink" : "text-ink-dim");
+      const wwr = w.win_rate, awr = a.win_rate;
+      const wCls = (wwr == null || awr == null) ? "text-ink-dim" : (wwr - awr > 0.10 ? "val-up" : (wwr - awr < -0.10 ? "val-down" : "text-ink"));
+      const mo = m.momentum;
+      const moCls = mo == null ? "text-ink-dim" : (mo > 0.05 ? "val-up" : (mo < -0.05 ? "val-down" : "text-ink-dim"));
+      const moTxt = mo == null ? "—" : `${mo > 0 ? "▲" : (mo < 0 ? "▼" : "•")} ${(Math.abs(mo) * 100).toFixed(0)}pt`;
+      const streak = m.streak ? `<span class="${m.streak > 0 ? "val-up" : "val-down"}">${m.streak > 0 ? "W" : "L"}×${Math.abs(m.streak)}</span>` : "";
+      const net = a.avg_net_f15;
+      const netCls = net == null ? "text-ink-dim" : (net > 0.05 ? "val-up" : (net < -0.05 ? "val-down" : "text-ink-dim"));
+      const flags = `${x.flags.live ? '<span class="px-1.5 py-0.5 rounded-full v-bullish text-[10px] font-bold ml-1">LIVE</span>' : ""}${x.flags.disabled ? '<span class="px-1.5 py-0.5 rounded-full v-neutral text-[10px] ml-1">muted</span>' : ""}${x.flags.trading && !x.flags.live ? '<span class="text-ink-faint text-[10px] ml-1" data-tip="Trading strategy: paper fills exist for this pair">$</span>' : ""}`;
+      const pnlCls = pf.fills ? (pf.pnl > 0 ? "val-up" : (pf.pnl < 0 ? "val-down" : "text-ink-dim")) : "text-ink-faint";
+      const pnlTxt = pf.fills ? `${pf.pnl > 0 ? "+" : ""}$${Math.round(pf.pnl).toLocaleString()}<div class="text-[10px] text-ink-faint">${pf.fills} fills · ${pf.stops} stops · ${d.days}d ${pf.pnl_window > 0 ? "+" : ""}$${Math.round(pf.pnl_window)}</div>` : "—";
+      return `<tr class="border-t border-line align-top ${x.flags.disabled ? "opacity-60" : ""}">
+        <td class="py-1.5 pr-3"><span class="mono font-semibold text-ink">${escapeHTML(x.ticker)}</span> ${_strategyBadge(x.strategy)} <span class="font-bold ${dirCls}">${x.direction.toUpperCase()}</span>${flags}</td>
+        <td class="py-1.5 pr-3 mono text-right">${a.n}<span class="text-ink-faint"> · ${a.sessions}</span></td>
+        <td class="py-1.5 pr-3 mono text-right font-semibold">${_lbPct(awr)}<div class="text-[10px] text-ink-faint">${a.wins}-${a.losses}-${a.flats}</div></td>
+        <td class="py-1.5 pr-3 mono text-right ${wilCls}">${a.wilson_lo == null ? "—" : a.wilson_lo.toFixed(2)}</td>
+        <td class="py-1.5 pr-3 pl-4 mono text-right">${w.n}<div class="text-[10px] text-ink-faint">${w.n ? `${w.wins}-${w.losses}-${w.flats}` : "no signals"}</div></td>
+        <td class="py-1.5 pr-3 mono text-right font-semibold ${wCls}">${_lbPct(wwr)}</td>
+        <td class="py-1.5 pl-4 pr-3 text-center">${_lbSpark(m.spark)}</td>
+        <td class="py-1.5 pr-3 mono text-right ${moCls}">${moTxt}<div class="text-[10px] text-ink-faint">${m.recent_wr == null ? "" : `last10 ${_lbPct(m.recent_wr)}`}${m.prior_wr == null ? "" : ` · prior ${_lbPct(m.prior_wr)}`} ${streak}</div></td>
+        <td class="py-1.5 pr-3 pl-4 mono text-right ${netCls}">${net == null ? "—" : `${net > 0 ? "+" : ""}${net.toFixed(2)}%`}<div class="text-[10px] text-ink-faint">${a.median_net_f15 == null ? "" : `med ${a.median_net_f15 > 0 ? "+" : ""}${a.median_net_f15.toFixed(2)}%`}</div></td>
+        <td class="py-1.5 mono text-right ${pnlCls}">${pnlTxt}</td>
+      </tr>`; }).join("")}</tbody></table></div>`;
+}
+["lb-days", "lb-minn"].forEach(id => document.getElementById(id).addEventListener("change", refreshLeaderboard));
+["lb-strategy", "lb-side", "lb-sort", "lb-hide-disabled"].forEach(id => document.getElementById(id).addEventListener("change", renderLeaderboard));
+document.getElementById("lb-refresh").addEventListener("click", refreshLeaderboard);
+
 async function refreshAlerts() {
-  await Promise.all([refreshAlertsStatus(), refreshAlertsLog(), refreshAlertsStats()]);
+  await Promise.all([refreshAlertsStatus(), refreshAlertsLog(), refreshAlertsStats(), refreshLeaderboard()]);
 }
 
 // ===================== Trading tab =====================

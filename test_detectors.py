@@ -490,5 +490,42 @@ check("_page_all: 1500 rows -> 2 fresh builders, ordered", len(rows) == 1500 and
 built.clear(); rows = main._page_all(_builder(7), page_size=3)
 check("_page_all: custom page size 3 over 7 rows -> 3 pages", len(rows) == 7 and len(built) == 3)
 
+# ---- signal leaderboard ----
+print("LEADERBOARD:")
+from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+_now = _dt(2026, 9, 21, 20, 0, tzinfo=_tz.utc)
+def _sig(i, outcome, f15=0.3, strat="purgatory", tk="TSLA", d="call", days_ago=None):
+    bt = (_now - _td(days=(days_ago if days_ago is not None else 60 - i))).isoformat()
+    return {"strategy": strat, "ticker": tk, "signal": d, "bar_time": bt, "outcome": outcome, "favorable_15m": f15, "favorable_30m": f15}
+# pair A: 20 signals, first 10 all wins (old), last 10 all losses (recent) -> decaying
+A = [_sig(i, "win", days_ago=60 - i) for i in range(10)] + [_sig(10 + i, "loss", -0.2, days_ago=20 - i) for i in range(10)]
+# pair B: 6 signals all wins, tiny n
+B = [_sig(i, "win", strat="market_wave", tk="QQQ", d="put") for i in range(6)]
+# pair C: below min_n
+C = [_sig(i, "win", tk="AAPL") for i in range(3)]
+# noise: unscored + lookahead rows must be ignored
+N = [{"strategy": "purgatory", "ticker": "TSLA", "signal": "call", "bar_time": _now.isoformat(), "outcome": None}]
+trades = [{"account": "paper", "strategy": "purgatory", "ticker": "TSLA", "direction": "call", "pnl": -40.0, "exit_reason": "stop_loss", "entry_submitted_at": (_now - _td(days=2)).isoformat()},
+          {"account": "paper", "strategy": "purgatory", "ticker": "TSLA", "direction": "call", "pnl": 100.0, "exit_reason": "hold", "entry_submitted_at": (_now - _td(days=50)).isoformat()},
+          {"account": "live",  "strategy": "purgatory", "ticker": "TSLA", "direction": "call", "pnl": -999.0, "exit_reason": "hold", "entry_submitted_at": (_now - _td(days=2)).isoformat()}]
+lb = main._build_leaderboard(A + B + C + N, trades, days=30, min_n=5, now=_now,
+                             live_pairs={("purgatory", "TSLA", "call")}, disabled=set(), trading_strategies={"purgatory"})
+check("leaderboard drops pairs under min_n and unscored rows", [ (r["ticker"], r["all"]["n"]) for r in lb ] == [("QQQ", 6), ("TSLA", 20)] or [ (r["ticker"], r["all"]["n"]) for r in lb ] == [("TSLA", 20), ("QQQ", 6)], str([(r["ticker"], r["all"]["n"]) for r in lb]))
+tsla = next(r for r in lb if r["ticker"] == "TSLA"); qqq = next(r for r in lb if r["ticker"] == "QQQ")
+check("all-time record: 10W/10L, wr 0.5", tsla["all"]["wins"] == 10 and tsla["all"]["losses"] == 10 and tsla["all"]["win_rate"] == 0.5)
+check("window record: last 30 days = the 10 recent losses", tsla["window"]["n"] == 10 and tsla["window"]["wins"] == 0, str(tsla["window"]))
+check("momentum negative for a decaying pair", tsla["momentum"]["momentum"] < 0 and tsla["momentum"]["ewma_wr"] < 0.45 and tsla["momentum"]["recent_wr"] == 0.0 and tsla["momentum"]["prior_wr"] == 1.0 and tsla["momentum"]["streak"] == -10, str(tsla["momentum"]))
+check("wilson lower bound: 6/6 -> ~0.61, ranks below nothing but is honest", 0.60 < qqq["all"]["wilson_lo"] < 0.62, str(qqq["all"]["wilson_lo"]))
+check("wilson: 10/20 -> ~0.30", 0.29 < tsla["all"]["wilson_lo"] < 0.31, str(tsla["all"]["wilson_lo"]))
+check("paper fills attach (paper only), window split", tsla["paper"]["fills"] == 2 and tsla["paper"]["pnl"] == 60.0 and tsla["paper"]["stops"] == 1 and tsla["paper"]["fills_window"] == 1 and tsla["paper"]["pnl_window"] == -40.0, str(tsla["paper"]))
+check("flags: live + trading", tsla["flags"] == {"live": True, "disabled": False, "trading": True} and qqq["flags"]["trading"] is False)
+check("spark is a rolling win-rate series ending at 0", tsla["momentum"]["spark"][0] == 1.0 and tsla["momentum"]["spark"][-1] == 0.0 and len(tsla["momentum"]["spark"]) == 20)
+check("net f15 subtracts spread", abs(qqq["all"]["avg_net_f15"] - 0.25) < 1e-9, str(qqq["all"]["avg_net_f15"]))
+check("wilson helper: n=0 -> None", main._wilson_lower(0, 0) is None)
+_saved_sb2 = main._supabase_client; main._supabase_client = None
+resp = client.get("/purgatory/leaderboard")
+check("leaderboard without Supabase -> 503", resp.status_code == 503)
+main._supabase_client = _saved_sb2
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

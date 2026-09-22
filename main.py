@@ -6681,6 +6681,203 @@ def purgatory_stats(days: int = 30, strategy: str | None = None):
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Signal leaderboard — every (strategy, ticker, direction) pair ranked with
+# all-time and N-day records side by side, a Wilson lower bound so small-n
+# rows can't fake an edge, and a momentum read (is the edge improving or
+# decaying right now?) built from the pair's own signal sequence.
+# ---------------------------------------------------------------------------
+_LEADERBOARD_EWMA_HALF_LIFE = 8       # signals; ten straight losses pull a 100% pair to ~42%
+_LEADERBOARD_RECENT_N = 10
+_LEADERBOARD_SPARK_POINTS = 30
+
+
+def _wilson_lower(k: int, n: int, z: float = 1.96) -> float | None:
+    if not n:
+        return None
+    p = k / n
+    z2 = z * z
+    return (p + z2 / (2 * n) - z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))) / (1 + z2 / n)
+
+
+def _pair_record(rows: list[dict]) -> dict[str, Any]:
+    """W/L/F, win rate, Wilson lower bound, net favourable stats for a list
+    of scored signal rows (already filtered to one pair / window)."""
+    n = len(rows)
+    wins = sum(1 for r in rows if r.get("outcome") == "win")
+    losses = sum(1 for r in rows if r.get("outcome") == "loss")
+    flats = n - wins - losses
+    f15 = sorted(float(r["favorable_15m"]) - SIGNAL_SPREAD_COST_PCT
+                 for r in rows if r.get("favorable_15m") is not None)
+    f30 = [float(r["favorable_30m"]) - SIGNAL_SPREAD_COST_PCT
+           for r in rows if r.get("favorable_30m") is not None]
+    med = None
+    if f15:
+        m = len(f15) // 2
+        med = f15[m] if len(f15) % 2 else (f15[m - 1] + f15[m]) / 2
+    return {
+        "n": n, "wins": wins, "losses": losses, "flats": flats,
+        "win_rate": round(wins / n, 4) if n else None,
+        "wilson_lo": round(_wilson_lower(wins, n), 4) if n else None,
+        "avg_net_f15": round(sum(f15) / len(f15), 4) if f15 else None,
+        "median_net_f15": round(med, 4) if med is not None else None,
+        "avg_net_f30": round(sum(f30) / len(f30), 4) if f30 else None,
+        "sessions": len({str(r.get("bar_time") or "")[:10] for r in rows}),
+    }
+
+
+def _pair_momentum(rows_sorted: list[dict]) -> dict[str, Any]:
+    """Is this pair's edge improving or decaying? Three independent reads
+    over the pair's chronological win/loss sequence:
+      ewma_wr    exponentially weighted win rate (half-life 8 signals) —
+                 "what the pair has been doing lately", smoothly
+      recent vs prior  last 10 signals vs the 10 before them
+      spark      rolling-10 win rate sampled along the sequence (for a
+                 sparkline), so the shape (grind / spike / decay) is visible
+    momentum = ewma_wr − all-time win rate, in win-rate points: positive
+    means the recent record beats the pair's own history."""
+    seq = [1.0 if r.get("outcome") == "win" else 0.0 for r in rows_sorted]
+    n = len(seq)
+    if not n:
+        return {"ewma_wr": None, "momentum": None, "recent_wr": None, "prior_wr": None,
+                "recent_n": 0, "streak": 0, "spark": [], "last_bar_time": None}
+    alpha = 1 - 0.5 ** (1 / _LEADERBOARD_EWMA_HALF_LIFE)
+    ew = seq[0]
+    for v in seq[1:]:
+        ew = alpha * v + (1 - alpha) * ew
+    allwr = sum(seq) / n
+    recent = seq[-_LEADERBOARD_RECENT_N:]
+    prior = seq[-2 * _LEADERBOARD_RECENT_N:-_LEADERBOARD_RECENT_N]
+    streak = 0
+    last = seq[-1]
+    for v in reversed(seq):
+        if v != last:
+            break
+        streak += 1
+    streak = streak if last == 1.0 else -streak
+    roll: list[float] = []
+    w = _LEADERBOARD_RECENT_N
+    for i in range(n):
+        lo = max(0, i - w + 1)
+        roll.append(sum(seq[lo:i + 1]) / (i + 1 - lo))
+    if len(roll) > _LEADERBOARD_SPARK_POINTS:
+        step = len(roll) / _LEADERBOARD_SPARK_POINTS
+        roll = [roll[min(n - 1, int(i * step))] for i in range(_LEADERBOARD_SPARK_POINTS)]
+    return {
+        "ewma_wr":   round(ew, 4),
+        "momentum":  round(ew - allwr, 4),
+        "recent_wr": round(sum(recent) / len(recent), 4) if recent else None,
+        "prior_wr":  round(sum(prior) / len(prior), 4) if prior else None,
+        "recent_n":  len(recent),
+        "streak":    streak,
+        "spark":     [round(v, 3) for v in roll],
+        "last_bar_time": rows_sorted[-1].get("bar_time"),
+    }
+
+
+def _build_leaderboard(signal_rows: list[dict], trades: list[dict], days: int,
+                       min_n: int, now: datetime | None = None,
+                       live_pairs: set | None = None, disabled: set | None = None,
+                       trading_strategies: set | None = None) -> list[dict[str, Any]]:
+    """Pure: rows → ranked leaderboard. `trades` are matched paper round-trips
+    (from _match_order_rows). Window = last `days` days from `now`."""
+    now = now or datetime.now(timezone.utc)
+    since = (now - timedelta(days=days)).isoformat()
+    live_pairs = live_pairs or set()
+    disabled = disabled or set()
+    trading_strategies = trading_strategies or set()
+    by_pair: dict[tuple, list[dict]] = {}
+    for r in signal_rows:
+        if r.get("outcome") not in ("win", "loss", "flat"):
+            continue
+        k = (r.get("strategy") or "purgatory", r.get("ticker"), r.get("signal"))
+        if not k[1] or k[2] not in ("call", "put"):
+            continue
+        by_pair.setdefault(k, []).append(r)
+    fills: dict[tuple, list[dict]] = {}
+    for t in trades:
+        if t.get("account") != "paper":
+            continue
+        k = (t.get("strategy") or "purgatory", t.get("ticker"), t.get("direction"))
+        fills.setdefault(k, []).append(t)
+
+    out = []
+    for k, rows in by_pair.items():
+        rows.sort(key=lambda r: str(r.get("bar_time") or ""))
+        allrec = _pair_record(rows)
+        if allrec["n"] < min_n:
+            continue
+        win_rows = [r for r in rows if str(r.get("bar_time") or "") >= since]
+        winrec = _pair_record(win_rows)
+        mom = _pair_momentum(rows)
+        pf = fills.get(k, [])
+        pf_win = [t for t in pf if str(t.get("entry_submitted_at") or "") >= since]
+        strat, ticker, direction = k
+        out.append({
+            "strategy": strat, "ticker": ticker, "direction": direction,
+            "all": allrec,
+            "window": winrec,
+            "momentum": mom,
+            "paper": {
+                "fills": len(pf),
+                "pnl": round(sum(float(t.get("pnl") or 0) for t in pf), 2),
+                "stops": sum(1 for t in pf if t.get("exit_reason") == "stop_loss"),
+                "fills_window": len(pf_win),
+                "pnl_window": round(sum(float(t.get("pnl") or 0) for t in pf_win), 2),
+            },
+            "flags": {
+                "live":     k in live_pairs,
+                "disabled": k in disabled,
+                "trading":  strat in trading_strategies,
+            },
+        })
+    out.sort(key=lambda x: ((x["all"]["wilson_lo"] or 0), x["all"]["n"]), reverse=True)
+    return out
+
+
+@app.get("/purgatory/leaderboard")
+def purgatory_leaderboard(days: int = 30, min_n: int = 5):
+    """Every scored pair, all-time and last-`days` records side by side,
+    Wilson lower bound, momentum (EWMA vs history, last-10 vs prior-10,
+    rolling sparkline), paper fill P&L, and live/disabled flags. Honest
+    rows only (scored_from == 'alerted_at')."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Leaderboard requires Supabase.")
+    days = max(1, min(int(days), 365))
+    min_n = max(1, min(int(min_n), 500))
+    try:
+        sig_rows = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+            .select("strategy, ticker, signal, bar_time, outcome, favorable_15m, favorable_30m")
+            .eq("scored_from", "alerted_at")
+            .not_.is_("outcome", "null")
+            .order("bar_time", desc=False)
+        ))
+        trades = _match_order_rows(_fetch_all_order_rows())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Leaderboard query failed: {exc}") from exc
+    try:
+        auto_disabled = set(_get_disabled_pairs())
+    except Exception:  # noqa: BLE001
+        auto_disabled = set()
+    rows = _build_leaderboard(
+        sig_rows, trades, days, min_n,
+        live_pairs=set(LIVE_TRADING_PAIRS),
+        disabled=set(PURGATORY_DISABLED_PAIRS) | auto_disabled,
+        trading_strategies=set(STRATEGIES_TRADING),
+    )
+    return {
+        "days": days, "min_n": min_n,
+        "n_signals": len(sig_rows), "n_pairs": len(rows),
+        "spread_cost_pct": SIGNAL_SPREAD_COST_PCT,
+        "win_def": "best favourable underlying move within 30 min > +0.10% net of spread",
+        "momentum_def": f"EWMA win rate (half-life {_LEADERBOARD_EWMA_HALF_LIFE} signals) minus all-time win rate",
+        "rows": rows,
+        "ts": _now_iso(),
+    }
+
+
 @app.get("/purgatory/orders")
 def purgatory_orders_get(date: str | None = None, account: str | None = None):
     """Auto-trader results for a UTC date (defaults to today). Reconciles
