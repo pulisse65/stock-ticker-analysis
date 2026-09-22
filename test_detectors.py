@@ -480,6 +480,15 @@ for total, want_calls in ((0, 1), (999, 1), (1000, 2), (2500, 3)):
 main._supabase_client = None
 check("paging with no Supabase -> []", main._fetch_all_order_rows() == [])
 main._supabase_client = _saved_sb
+# generic pager: builder is called once per page (fresh query each time), stitches in order
+built = []
+def _builder(total):
+    def b(): q = _PagedQ(total); built.append(q); return q
+    return b
+built.clear(); rows = main._page_all(_builder(1500))
+check("_page_all: 1500 rows -> 2 fresh builders, ordered", len(rows) == 1500 and len(built) == 2 and rows[-1]["i"] == 1499)
+built.clear(); rows = main._page_all(_builder(7), page_size=3)
+check("_page_all: custom page size 3 over 7 rows -> 3 pages", len(rows) == 7 and len(built) == 3)
 
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

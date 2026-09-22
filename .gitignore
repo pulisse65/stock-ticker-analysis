@@ -27,3 +27,6 @@ Thumbs.db
 
 # Tooling
 .claude/
+
+# Pulled production data for the promotion sweep (rebuild with analysis/pull_*.py)
+analysis/data/
