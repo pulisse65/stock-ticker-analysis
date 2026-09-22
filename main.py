@@ -3663,6 +3663,35 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
     return updates
 
 
+_ORDERS_PAGE_SIZE = 1000   # PostgREST/Supabase caps any single select at 1000 rows
+
+
+def _fetch_all_order_rows() -> list[dict]:
+    """Every row of the orders table, oldest first, paged past the PostgREST
+    1000-row cap. Both the all-time P&L view and the live circuit breaker
+    used a single unpaged select here; once the table passed 1000 rows
+    (2026-09-11) the newest trades silently dropped off — the dashboard
+    froze at +$1,505 and the breaker kept trading through a drawdown that
+    should have halted it. Pages until a short page comes back."""
+    if _supabase_client is None:
+        return []
+    rows: list[dict] = []
+    start = 0
+    while True:
+        res = (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .order("submitted_at", desc=False)
+            .range(start, start + _ORDERS_PAGE_SIZE - 1)
+            .execute()
+        )
+        page = list(res.data or [])
+        rows.extend(page)
+        if len(page) < _ORDERS_PAGE_SIZE:
+            return rows
+        start += _ORDERS_PAGE_SIZE
+
+
 def _match_order_rows(rows: list[dict]) -> list[dict]:
     """Pair entry↔exit order rows by (strategy, ticker, direction, bar_time,
     account) and compute per-trade realized P&L. Shared by the daily summary
@@ -3956,13 +3985,7 @@ def _live_halt_status(force: bool = False) -> dict[str, Any]:
         # null flag classify as live in the pairing but were excluded by
         # the eq filter), so the breaker and the dashboard disagreed
         # (16 trades/+$1,324 vs 14/+$1,505 on 9/16). One data path now.
-        res = (
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("*")
-            .order("submitted_at", desc=False)
-            .execute()
-        )
-        trades = [t for t in _match_order_rows(list(res.data or []))
+        trades = [t for t in _match_order_rows(_fetch_all_order_rows())
                   if t["account"] == "live"]
     except Exception as exc:  # noqa: BLE001
         log.warning("Live-halt record query failed: %s", exc)
@@ -6688,13 +6711,7 @@ def purgatory_pnl(account: str | None = None):
     if _supabase_client is None:
         raise HTTPException(503, "P&L history requires Supabase.")
     try:
-        res = (
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("*")
-            .order("submitted_at", desc=False)
-            .execute()
-        )
-        rows = list(res.data or [])
+        rows = _fetch_all_order_rows()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Supabase P&L query failed: {exc}") from exc
 

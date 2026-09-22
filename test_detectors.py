@@ -456,5 +456,30 @@ resp = client.post("/purgatory/score-daily-predictions")
 check("force-score without Supabase -> 503", resp.status_code == 503, str(resp.status_code))
 main.EXTERNAL_SIGNAL_TOKEN, main._supabase_client = _saved_tok, _saved_sb
 
+# ---- orders table paging past the PostgREST 1000-row cap ----
+print("ORDERS PAGING:")
+class _PagedQ:
+    def __init__(self, total): self.total = total; self.a = self.b = None
+    def select(self, *a, **k): return self
+    def order(self, *a, **k): return self
+    def range(self, a, b): self.a, self.b = a, b; return self
+    def execute(self):
+        class R: pass
+        r = R(); r.data = [{"i": i} for i in range(self.a, min(self.b + 1, self.total))]; return r
+class _PagedSB:
+    def __init__(self, total): self.total = total; self.calls = 0
+    def table(self, name):
+        assert name == main._PURGATORY_ORDERS_TABLE; self.calls += 1; return _PagedQ(self.total)
+_saved_sb = main._supabase_client
+for total, want_calls in ((0, 1), (999, 1), (1000, 2), (2500, 3)):
+    sb = _PagedSB(total); main._supabase_client = sb
+    rows = main._fetch_all_order_rows()
+    check(f"paging fetches all {total} rows in {want_calls} page(s)",
+          len(rows) == total and sb.calls == want_calls and [r["i"] for r in rows] == list(range(total)),
+          f"got {len(rows)} rows / {sb.calls} calls")
+main._supabase_client = None
+check("paging with no Supabase -> []", main._fetch_all_order_rows() == [])
+main._supabase_client = _saved_sb
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
