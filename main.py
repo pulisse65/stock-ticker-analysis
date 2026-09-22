@@ -3541,6 +3541,257 @@ def _estimate_stop_loss_from_underlying(entry: dict[str, Any],
     return loss_pct, est_mid
 
 
+# ---------------------------------------------------------------------------
+# Stop-rule study (shadow-tracked, no behaviour change)
+#
+# The 9/21 sweep found stop exits were the paper book's largest drain
+# (98 stops = −$13.8k vs 412 hold exits = +$14.9k) but fills alone can't say
+# what a wider/tighter/no stop WOULD have done — a stopped option's price
+# after the stop is never observed. So: every scan pass already quotes every
+# open position for the stop check; we now keep those quotes on the entry
+# row (raw.quote_path). When a position is stopped we keep quoting the
+# contract until its original hold deadline (raw.shadow.samples) and record
+# the mid it would have been sold at (raw.shadow.hold_mid). Any threshold
+# can then be replayed on the real path. Samples are one per scan (~4 min),
+# so tighter thresholds are evaluated on a coarse path — stated in the
+# endpoint output. Live trading behaviour is untouched.
+# ---------------------------------------------------------------------------
+_QUOTE_PATH_CAP = 60          # samples kept per entry (a 15-min hold at 4-min scans is ~5)
+_STOP_STUDY_THRESHOLDS: list[float | None] = [10, 15, 20, 25, 30, 40, 50, None]
+
+
+def _push_sample(raw: dict | None, key: str, sample: dict, cap: int = _QUOTE_PATH_CAP) -> dict:
+    """Pure: return a copy of `raw` with `sample` appended to raw[key] (capped)."""
+    raw = dict(raw or {})
+    path = list(raw.get(key) or [])
+    path.append(sample)
+    raw[key] = path[-cap:]
+    return raw
+
+
+def _hold_deadline_for_entry(entry: dict) -> datetime | None:
+    ts = _parse_signal_ts(entry.get("submitted_at"))
+    if ts is None:
+        return None
+    return ts + timedelta(minutes=_hold_minutes_for_entry(entry))
+
+
+def _append_quote_sample(entry: dict, quote: dict) -> None:
+    """Append one {t, mid, bid, ask} to the entry row's raw.quote_path."""
+    if _supabase_client is None or not entry.get("id"):
+        return
+    try:
+        sample = {"t": quote.get("at") or _now_iso(), "mid": quote.get("mid"),
+                  "bid": quote.get("bid"), "ask": quote.get("ask")}
+        raw = _push_sample(entry.get("raw"), "quote_path", sample)
+        if "hold_deadline" not in raw:
+            dl = _hold_deadline_for_entry(entry)
+            if dl is not None:
+                raw["hold_deadline"] = dl.isoformat()
+        entry["raw"] = raw   # keep the in-memory copy current for later steps this pass
+        _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({"raw": raw}).eq("id", entry["id"]).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("quote_path append failed for %s: %s", entry.get("id"), exc)
+
+
+def _start_shadow_tracking(entry: dict, fill: float, quote: dict | None) -> None:
+    """Mark a just-stopped entry so the sampler keeps quoting its contract
+    until the original hold deadline."""
+    if _supabase_client is None or not entry.get("id"):
+        return
+    try:
+        dl = _hold_deadline_for_entry(entry)
+        if dl is None:
+            return
+        raw = dict(entry.get("raw") or {})
+        raw["shadow"] = {"until": dl.isoformat(), "started_at": _now_iso(), "entry_fill": fill,
+                         "stop_mid": (quote or {}).get("mid"), "samples": [], "done": False}
+        entry["raw"] = raw
+        _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({"raw": raw}).eq("id", entry["id"]).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("shadow start failed for %s: %s", entry.get("id"), exc)
+
+
+def _sample_shadow_paths() -> int:
+    """Quote every stopped-out entry still inside its hold deadline; when the
+    deadline has passed, record the hold-time mid and finish. Returns rows
+    touched. Never raises."""
+    if _supabase_client is None or not _alpaca_enabled():
+        return 0
+    since = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    try:
+        rows = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("id, option_symbol, qty, fill_price, raw")
+            .eq("role", "entry")
+            .gte("submitted_at", since)
+            .order("submitted_at", desc=False)
+        ))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Shadow query failed: %s", exc)
+        return 0
+    now = datetime.now(timezone.utc)
+    n = 0
+    for e in rows:
+        raw = e.get("raw") or {}
+        sh = raw.get("shadow")
+        if not isinstance(sh, dict) or sh.get("done") or not e.get("option_symbol"):
+            continue
+        until = _parse_signal_ts(sh.get("until"))
+        if until is None:
+            continue
+        q = _quote_snapshot(e["option_symbol"])
+        if not q or q.get("mid") is None:
+            continue
+        sample = {"t": q.get("at") or _now_iso(), "mid": q.get("mid"), "bid": q.get("bid"), "ask": q.get("ask")}
+        sh = dict(sh)
+        sh["samples"] = (list(sh.get("samples") or []) + [sample])[-_QUOTE_PATH_CAP:]
+        if now >= until:
+            fill = _safe_float(e.get("fill_price")) or _safe_float(sh.get("entry_fill"))
+            qty = int(e.get("qty") or 1)
+            sh["hold_mid"] = q.get("mid")
+            sh["hold_pnl_est"] = round((float(q["mid"]) - fill) * 100 * qty, 2) if fill else None
+            sh["finalized_at"] = _now_iso()
+            sh["late_by_s"] = int((now - until).total_seconds())
+            sh["done"] = True
+        raw = {**raw, "shadow": sh}
+        try:
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({"raw": raw}).eq("id", e["id"]).execute()
+            n += 1
+        except Exception as exc:  # noqa: BLE001
+            log.debug("shadow update failed for %s: %s", e.get("id"), exc)
+    return n
+
+
+def _evaluate_stop_rules(trades: list[dict], thresholds: list[float | None] | None = None) -> dict[str, Any]:
+    """Pure. Each trade: {fill, qty, actual_pnl, exit_reason, path: [{t, mid}],
+    hold_mid}. `path` is the quote path from entry to the hold deadline
+    (quote_path + shadow samples); `hold_mid` is the mid at the deadline
+    (None if unknown). For each threshold, the first sample whose mid sits
+    >= thr% below the fill triggers a stop at that mid; otherwise the trade
+    exits at the hold: actual_pnl if it really held, else hold_mid.
+    Trades that were stopped in reality and have no hold_mid are excluded
+    (no counterfactual possible). None threshold = no stop at all."""
+    thresholds = _STOP_STUDY_THRESHOLDS if thresholds is None else thresholds
+    usable = []
+    for t in trades:
+        fill = _safe_float(t.get("fill"))
+        if not fill or fill <= 0:
+            continue
+        if t.get("exit_reason") == "stop_loss" and t.get("hold_mid") is None:
+            continue
+        usable.append(t)
+    out = []
+    for thr in thresholds:
+        total = 0.0
+        stopped = 0
+        per = []
+        for t in usable:
+            fill = float(t["fill"]); qty = int(t.get("qty") or 1)
+            hit = None
+            if thr is not None:
+                for smp in (t.get("path") or []):
+                    mid = _safe_float(smp.get("mid"))
+                    if mid is None:
+                        continue
+                    if (fill - mid) / fill * 100.0 >= thr:
+                        hit = mid
+                        break
+            if hit is not None:
+                pnl = (hit - fill) * 100 * qty
+                stopped += 1
+            elif t.get("exit_reason") == "stop_loss":
+                pnl = (float(t["hold_mid"]) - fill) * 100 * qty
+            else:
+                pnl = float(t.get("actual_pnl") or 0.0)
+            total += pnl
+            per.append(round(pnl, 2))
+        n = len(usable)
+        wins = sum(1 for v in per if v > 0)
+        out.append({
+            "threshold_pct": thr, "label": "no stop" if thr is None else f"{thr:g}%",
+            "n": n, "stopped": stopped, "pnl": round(total, 2),
+            "avg": round(total / n, 2) if n else None,
+            "win_rate": round(wins / n, 3) if n else None,
+            "worst": min(per) if per else None,
+        })
+    return {"n_trades": len(trades), "n_usable": len(usable), "rules": out}
+
+
+@app.get("/purgatory/stop-study")
+def purgatory_stop_study(days: int = 30, account: str = "paper"):
+    """Replay every stop threshold (10% … 50%, and none) over the real
+    option quote paths recorded on paper positions since `days` ago.
+    Only trades with a complete path count; stopped trades need their
+    shadow hold_mid. Also returns the realized split (stop exits vs hold
+    exits) for the same window as context."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Stop study requires Supabase.")
+    days = max(1, min(int(days), 365))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    paper_flag = account != "live"
+    try:
+        rows = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .gte("submitted_at", since)
+            .eq("paper", paper_flag)
+            .order("submitted_at", desc=False)
+        ))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Stop-study query failed: {exc}") from exc
+    entries: dict[tuple, dict] = {}
+    exits: dict[tuple, dict] = {}
+    for r in rows:
+        k = (r.get("strategy") or "purgatory", r.get("signal_ticker"), r.get("signal_direction"), r.get("signal_bar_time"))
+        if r.get("role") == "entry":
+            entries[k] = r
+        elif r.get("role") == "exit":
+            prev = exits.get(k)
+            if prev is None or (prev.get("fill_price") is None and r.get("fill_price") is not None):
+                exits[k] = r
+    trades, realized = [], {"stop": {"n": 0, "pnl": 0.0}, "hold": {"n": 0, "pnl": 0.0}}
+    tracked = 0
+    for k, e in entries.items():
+        x = exits.get(k)
+        if not x:
+            continue
+        fill = _safe_float(e.get("fill_price")); xfill = _safe_float(x.get("fill_price"))
+        if fill is None or xfill is None:
+            continue
+        qty = int(e.get("qty") or 1)
+        pnl = (xfill - fill) * 100 * qty
+        reason = ((x.get("raw") or {}).get("exit_reason")) or "hold"
+        bucket = "stop" if reason == "stop_loss" else "hold"
+        realized[bucket]["n"] += 1; realized[bucket]["pnl"] += pnl
+        raw = e.get("raw") or {}
+        path = list(raw.get("quote_path") or [])
+        sh = raw.get("shadow") or {}
+        if path:
+            tracked += 1
+        path += list(sh.get("samples") or [])
+        trades.append({
+            "ticker": e.get("signal_ticker"), "direction": e.get("signal_direction"),
+            "fill": fill, "qty": qty, "actual_pnl": round(pnl, 2), "exit_reason": reason,
+            "path": [{"t": p.get("t"), "mid": p.get("mid")} for p in path],
+            "hold_mid": sh.get("hold_mid") if reason == "stop_loss" else None,
+            "samples": len(path),
+        })
+    evaluated = _evaluate_stop_rules([t for t in trades if t["path"]])
+    for b in realized.values():
+        b["pnl"] = round(b["pnl"], 2)
+    return {
+        "days": days, "account": "paper" if paper_flag else "live",
+        "current_stop_pct": ALPACA_TRADING_STOP_LOSS_PCT,
+        "realized": realized,
+        "coverage": {"trades": len(trades), "with_path": tracked,
+                     "shadow_pending": sum(1 for t in trades if t["exit_reason"] == "stop_loss" and t["hold_mid"] is None and t["path"]),
+                     "note": "quote paths are sampled once per scan (~4 min); thresholds tighter than the realized stop are evaluated on that coarse grid"},
+        "study": evaluated,
+        "ts": _now_iso(),
+    }
+
+
 def _sweep_stop_losses() -> int:
     """Close any open entry whose option mid has dropped more than
     ALPACA_TRADING_STOP_LOSS_PCT below the entry fill price. Runs on every
@@ -3595,6 +3846,11 @@ def _sweep_stop_losses() -> int:
             loss_pct, mid = est
             stop_basis = "underlying_est"
 
+        # Stop-rule study: keep the option's quote path on the entry row so any
+        # stop threshold can be evaluated against real prices later.
+        if quote:
+            _append_quote_sample(entry, quote)
+
         if loss_pct < ALPACA_TRADING_STOP_LOSS_PCT:
             continue
 
@@ -3602,6 +3858,7 @@ def _sweep_stop_losses() -> int:
         result = _alpaca_close_position(opt, paper=paper)
         if not result:
             continue
+        _start_shadow_tracking(entry, fill, quote)
         _persist_exit_row(entry, result, {"exit_reason": "stop_loss",
                                           "stop_basis": stop_basis,
                                           "loss_pct_at_trigger": round(loss_pct, 2),
@@ -5938,6 +6195,10 @@ def purgatory_scan():
         n_closed += _sweep_pending_positions()
     except Exception as exc:  # noqa: BLE001
         log.warning("Auto-trade sweep failed: %s", exc)
+    try:
+        _sample_shadow_paths()               # stop-rule study: quote stopped contracts to their hold deadline
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Shadow sampler failed: %s", exc)
 
     # Re-check the live circuit breaker when order state changed this pass,
     # so a breach alerts within one scan of the closing trade instead of

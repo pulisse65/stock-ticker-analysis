@@ -960,6 +960,22 @@
         <div id="trading-trades" class="text-sm text-ink-dim">—</div>
       </section>
 
+      <!-- Stop-rule study (shadow-tracked) -->
+      <section class="card p-4">
+        <div class="flex items-start justify-between gap-3 flex-wrap mb-2">
+          <div>
+            <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Stop-rule study<span class="tip-q" data-tip="Every scan quotes each open paper position for the stop check; those quotes are now kept as a price path. When a position is stopped out, its contract keeps being quoted until the original 15-minute hold time, so we learn what the trade would have been worth had it not been stopped. Each row replays one stop threshold over those real paths. Nothing about the trading behaviour changes.">?</span></h3>
+            <p class="text-[11px] text-ink-faint mt-0.5 max-w-3xl">What the paper book would have made under a different stop, replayed on real option quotes. The current rule is highlighted. <b>No stop</b> means the hold timer is the only exit. Paths are sampled once per scan, so thresholds tighter than the current stop sit on a coarse grid.</p>
+          </div>
+          <select id="stopstudy-days" class="input px-2 py-1 text-xs">
+            <option value="7">Last 7 days</option>
+            <option value="30" selected>Last 30 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+        </div>
+        <div id="stopstudy-body" class="text-sm text-ink-dim">—</div>
+      </section>
+
       <!-- Daily retros -->
       <section class="card p-4">
         <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Daily retros (last 14 days)</h3>
@@ -3884,8 +3900,54 @@ function _buildTradingPnlChart(days) {
   });
 }
 
+async function refreshStopStudy() {
+  const el = document.getElementById("stopstudy-body");
+  const days = document.getElementById("stopstudy-days").value;
+  try {
+    const r = await fetch(`/purgatory/stop-study?days=${days}&account=paper`);
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const d = await r.json();
+    const rz = d.realized, cv = d.coverage, st = d.study;
+    const money = v => `${v > 0 ? "+" : (v < 0 ? "−" : "")}$${Math.abs(Math.round(v)).toLocaleString()}`;
+    const cls = v => v > 0 ? "val-up" : (v < 0 ? "val-down" : "text-ink-dim");
+    const realized = `<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3 text-xs">
+      <div class="border border-line rounded-lg p-3" data-tip="Realized P&L of the paper trades that were closed by the ${d.current_stop_pct}% stop in this window."><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint has-tip">Stop exits</div><div class="text-lg font-semibold mono ${cls(rz.stop.pnl)}">${money(rz.stop.pnl)}</div><div class="text-[11px] text-ink-faint">${rz.stop.n} trades</div></div>
+      <div class="border border-line rounded-lg p-3" data-tip="Realized P&L of the paper trades that ran to the hold timer."><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint has-tip">Hold exits</div><div class="text-lg font-semibold mono ${cls(rz.hold.pnl)}">${money(rz.hold.pnl)}</div><div class="text-[11px] text-ink-faint">${rz.hold.n} trades</div></div>
+      <div class="border border-line rounded-lg p-3" data-tip="Trades in the window that have a recorded quote path (recording started 2026-09-22). The replay below only uses these."><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint has-tip">Tracked</div><div class="text-lg font-semibold mono">${cv.with_path}<span class="text-ink-faint text-sm"> / ${cv.trades}</span></div><div class="text-[11px] text-ink-faint">${cv.shadow_pending} stopped, still shadowing</div></div>
+      <div class="border border-line rounded-lg p-3" data-tip="Trades the replay could use: a full path, and for stopped trades a recorded hold-time price."><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint has-tip">Replayable</div><div class="text-lg font-semibold mono">${st.n_usable}</div><div class="text-[11px] text-ink-faint">current stop ${d.current_stop_pct}%</div></div>
+    </div>`;
+    if (!st.n_usable) {
+      el.innerHTML = realized + `<div class="text-ink-faint text-xs">No replayable paths yet. Paths accrue one position at a time from the next trading session; stopped positions finish shadowing 15 minutes after entry. Check back after a few sessions.</div>`;
+      return;
+    }
+    const best = st.rules.reduce((a, b) => (b.pnl > a.pnl ? b : a), st.rules[0]);
+    el.innerHTML = realized + `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead><tr class="text-ink-faint text-left">
+        <th class="pb-2"><span class="has-tip" data-tip="Stop threshold as % of entry premium. The first quote sample at or below that level sells at that sample's mid.">Stop at</span></th>
+        <th class="pb-2 text-right"><span class="has-tip" data-tip="How many of the replayable trades this rule would have stopped out.">Stopped</span></th>
+        <th class="pb-2 text-right"><span class="has-tip" data-tip="Total P&L under this rule across the replayable trades: stopped trades exit at the triggering quote, the rest exit at the hold.">Total P&L</span></th>
+        <th class="pb-2 text-right">Avg / trade</th>
+        <th class="pb-2 text-right"><span class="has-tip" data-tip="Share of replayable trades that end positive under this rule.">Win rate</span></th>
+        <th class="pb-2 text-right"><span class="has-tip" data-tip="Worst single trade under this rule. The no-stop row shows what an unprotected tail looks like.">Worst</span></th>
+      </tr></thead>
+      <tbody>${st.rules.map(r => {
+        const cur = r.threshold_pct === d.current_stop_pct;
+        return `<tr class="border-t border-line ${cur ? "bg-line/30" : ""}">
+          <td class="py-1.5 mono ${cur ? "font-bold text-ink" : ""}">${r.label}${cur ? ' <span class="text-[10px] text-ink-faint">current</span>' : ""}${r === best ? ' <span class="text-[10px] tone-bullish-text">best</span>' : ""}</td>
+          <td class="py-1.5 mono text-right">${r.stopped}<span class="text-ink-faint"> / ${r.n}</span></td>
+          <td class="py-1.5 mono text-right font-semibold ${cls(r.pnl)}">${money(r.pnl)}</td>
+          <td class="py-1.5 mono text-right ${cls(r.avg)}">${money(r.avg)}</td>
+          <td class="py-1.5 mono text-right">${r.win_rate == null ? "—" : (r.win_rate * 100).toFixed(0) + "%"}</td>
+          <td class="py-1.5 mono text-right val-down">${r.worst == null ? "—" : money(r.worst)}</td>
+        </tr>`; }).join("")}</tbody></table></div>`;
+  } catch (e) {
+    el.innerHTML = `<span class="text-ink-faint text-xs">${escapeHTML(e.message)}</span>`;
+  }
+}
+document.getElementById("stopstudy-days").addEventListener("change", refreshStopStudy);
+
 async function refreshTrading() {
-  await Promise.all([refreshTradingStatus(), refreshTradingPerf(), refreshTradingPnl(), refreshTradingSummaries()]);
+  await Promise.all([refreshTradingStatus(), refreshTradingPerf(), refreshTradingPnl(), refreshTradingSummaries(), refreshStopStudy()]);
 }
 
 document.getElementById("trading-refresh-btn").addEventListener("click", refreshTrading);

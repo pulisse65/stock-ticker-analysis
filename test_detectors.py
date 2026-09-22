@@ -534,5 +534,39 @@ resp = client.get("/purgatory/leaderboard")
 check("leaderboard without Supabase -> 503", resp.status_code == 503)
 main._supabase_client = _saved_sb2
 
+# ---- stop-rule study ----
+print("STOPSTUDY:")
+r = main._push_sample({"a": 1}, "quote_path", {"mid": 1.0}, cap=2)
+r = main._push_sample(r, "quote_path", {"mid": 2.0}, cap=2)
+r = main._push_sample(r, "quote_path", {"mid": 3.0}, cap=2)
+check("push_sample caps and keeps other keys", r["a"] == 1 and [x["mid"] for x in r["quote_path"]] == [2.0, 3.0])
+# trade A: dips -35% then recovers to +20% at the hold (really stopped at 30% -> hold_mid known)
+A = {"fill": 2.00, "qty": 1, "actual_pnl": -70.0, "exit_reason": "stop_loss",
+     "path": [{"mid": 1.9}, {"mid": 1.3}, {"mid": 1.8}, {"mid": 2.4}], "hold_mid": 2.4}
+# trade B: bleeds monotonically to -60%, really stopped
+B = {"fill": 1.00, "qty": 2, "actual_pnl": -64.0, "exit_reason": "stop_loss",
+     "path": [{"mid": 0.9}, {"mid": 0.68}, {"mid": 0.5}, {"mid": 0.4}], "hold_mid": 0.4}
+# trade C: never near the stop, held to +10%
+C = {"fill": 3.00, "qty": 1, "actual_pnl": 30.0, "exit_reason": "hold",
+     "path": [{"mid": 2.9}, {"mid": 3.1}, {"mid": 3.3}], "hold_mid": None}
+# trade D: really stopped but shadow not finished -> excluded
+D = {"fill": 1.00, "qty": 1, "actual_pnl": -35.0, "exit_reason": "stop_loss", "path": [{"mid": 0.6}], "hold_mid": None}
+ev = main._evaluate_stop_rules([A, B, C, D], thresholds=[30, 50, None])
+check("unfinished shadow excluded", ev["n_trades"] == 4 and ev["n_usable"] == 3)
+r30 = next(x for x in ev["rules"] if x["threshold_pct"] == 30)
+r50 = next(x for x in ev["rules"] if x["threshold_pct"] == 50)
+rno = next(x for x in ev["rules"] if x["threshold_pct"] is None)
+# 30%: A stops at 1.3 (-70), B stops at 0.68 (-64), C holds +30 -> -104, 2 stopped
+check("30% rule replays the actual stops", r30["stopped"] == 2 and r30["pnl"] == -104.0, str(r30))
+# 50%: A never hits 50% -> hold_mid 2.4 (+40); B stops at 0.5 (-100); C +30 -> -30, 1 stopped
+check("50% rule lets A recover, still catches B", r50["stopped"] == 1 and r50["pnl"] == -30.0, str(r50))
+# none: A +40, B at hold 0.4 (-120), C +30 -> -50
+check("no-stop rule uses hold mids", rno["stopped"] == 0 and rno["pnl"] == -50.0 and rno["worst"] == -120.0, str(rno))
+check("labels", r30["label"] == "30%" and rno["label"] == "no stop")
+_saved_sb3 = main._supabase_client; main._supabase_client = None
+resp = client.get("/purgatory/stop-study")
+check("stop-study without Supabase -> 503", resp.status_code == 503)
+main._supabase_client = _saved_sb3
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
