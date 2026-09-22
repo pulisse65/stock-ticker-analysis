@@ -77,8 +77,10 @@ with ex-top-2 −$273 — not confirming. QQQ:put has fired once since 8/21 — 
 **Paper morning-hold experiment (started 2026-08-31):** hold-horizon curves showed morning
 signals keep developing past the 15-min exit (TSLA calls before 10:30 ET: net favorable
 +0.384% @15m → +0.542% @30m, n=17; pooled purgatory morning improves; midday decays).
-Paper legs entered before 10:30 ET now hold 25 min (`PAPER_MORNING_HOLD_MINUTES`); live
-keeps 15 everywhere. Decision rule: after ~15–20 paired morning TSLA-call trades, compare
+Paper legs entered before 10:30 ET held 25 min (`PAPER_MORNING_HOLD_MINUTES`) from 8/31 to
+9/21; live kept 15 everywhere. **Reverted to 15 on 2026-09-21** — the 9/21 sweep found the extra
+10 minutes added no underlying edge (net_f15 +.049 vs net_f25 +.042) and doubled the morning
+stop-out rate (18% → 35%). Any retest should make the stop hold-aware first. Decision rule: after ~15–20 paired morning TSLA-call trades, compare
 the paper-25m legs vs live-15m legs (and vs each leg's own f15/f25) — hold duration is
 derivable from `entry_filled_at` → `exit_filled_at`. Only then consider changing the live hold.
 

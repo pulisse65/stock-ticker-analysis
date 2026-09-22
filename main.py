@@ -2960,7 +2960,15 @@ ALPACA_TRADING_HOLD_MINUTES = int(os.environ.get("ALPACA_TRADING_HOLD_MINUTES", 
 # live-15min vs paper-extended pairing on identical entries. Live positions
 # and post-cutoff paper keep the standard hold; the stop-loss sweep protects
 # the extended minutes like any others. Set <= the base hold to disable.
-PAPER_MORNING_HOLD_MINUTES = int(os.environ.get("PAPER_MORNING_HOLD_MINUTES", "25"))
+#
+# 9/21 sweep verdict on the 8/31 experiment (25 min): the extra 10 minutes
+# added nothing to the underlying (morning net_f15 +.049 vs net_f25 +.042)
+# while the 30% stop got twice the time to fire — morning stop-out rate
+# 18% → 35%, avg leg +$18 → −$7 — and the 25-min legs manufactured every
+# "morning MSTR/SMCI" promotion mirage. Default back to the base hold so
+# paper and live legs are comparable again; the knob stays for a future,
+# stop-aware retest.
+PAPER_MORNING_HOLD_MINUTES = int(os.environ.get("PAPER_MORNING_HOLD_MINUTES", "15"))
 PAPER_MORNING_HOLD_CUTOFF_ET = os.environ.get("PAPER_MORNING_HOLD_CUTOFF_ET", "10:30").strip()
 # Stop-loss: close early when the option's live mid drops this % below the
 # entry fill. Caps the -$300 tail losses (AAPL 7/8 put was -35% within 5 min
