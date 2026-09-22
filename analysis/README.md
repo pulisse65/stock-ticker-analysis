@@ -129,3 +129,23 @@ sign. Otherwise leave it as a measurement feed.
 - Runner output was verified identical to `app.py -p TICKER DATE -j` on the same DB, so the
   platform scores the model exactly as shipped (incl. its `return_1d ≡ 0` and yield-curve
   ≡ 0 inference quirks — see `BULLSEYE_SETUP.md`).
+
+## Stop-rule study (started 2026-09-22)
+
+The 9/21 sweep's biggest structural finding: 98 stop exits = −$13.8k vs 412 hold exits = +$14.9k.
+Fills alone can't say what a different stop would have done (a stopped option's later price is never
+observed), so the platform now records the option quote path on every open paper position (every
+scan already quotes it for the stop check → `purgatory_orders.raw.quote_path`) and, after a stop,
+keeps quoting the contract until the original hold deadline (`raw.shadow`, with `hold_mid`).
+
+`GET /purgatory/stop-study?days=30` replays thresholds 10/15/20/25/30/40/50% and *no stop* over the
+real paths; the Trading tab shows it as "Stop-rule study". Trading behaviour is unchanged (the live
+and paper stop is still `ALPACA_TRADING_STOP_LOSS_PCT` = 30 — one knob for both accounts, which is
+why the study is shadow-tracked rather than an A/B on the paper account).
+
+Read with care: paths are one sample per scan (~4 min), so thresholds tighter than 30% are evaluated
+on a coarse grid (a 15% stop that would have fired between samples is missed); a "no stop" total
+ignores the tail risk a stop exists to cap — look at the *Worst* column, not just the total.
+Decision rule: at least ~60 replayable trades (≈3 weeks) before comparing rules; prefer the rule with
+the best total that does not materially worsen the worst trade; retest the 25-min morning hold only
+once the stop rule is settled.
