@@ -6,6 +6,11 @@ promote to live trading — in total, or inside specific time-of-day / day-of-we
 First run: 2026-08-21 → verdict in [results/2026-08-21-live-promotion-sweep.md](results/2026-08-21-live-promotion-sweep.md)
 (short version: nothing cleared the bar; 10 nominated, 6 adversarially verified, 18/18 skeptic refutes).
 
+Second run: 2026-09-21 → [results/2026-09-21-live-promotion-sweep.md](results/2026-09-21-live-promotion-sweep.md)
+(51 sessions; 9 nominated, 6 verified, 17/18 refutes; `purgatory:AAPL:call @09:45–11:30` CONDITIONAL
+and confirmed by forward evidence; live TSLA:call decay confirmed — net_f15 +.266 → −.134, paper −$806
+since 8/22; the 8/31 paper 25-min morning hold doubled stop-outs → revert; stops = −$13.8k of drain).
+
 ## How to rerun (ask Claude to "rerun the live-promotion sweep")
 
 1. **Pull fresh data** (any python with pandas; writes to `analysis/data/`):
@@ -64,6 +69,10 @@ multiple-comparisons objection. Pre-registered on 2026-08-21:
   small, so the +0.10%-in-30min threshold underrates it). Judge on post-8/31 signals.
 
 Revisit either after ~10–15 forward signals with positive paper fills.
+
+**9/21 update:** AAPL:call forward 8 sig 7W/0L/1F, 8 fills +$771, 0 stops — passes the bar on forward
+evidence alone (n=8 exactly; revisit at ~15). TSLA:put morning forward 6 sig 5/1/0 but fills +$118
+with ex-top-2 −$273 — not confirming. QQQ:put has fired once since 8/21 — untestable.
 
 **Paper morning-hold experiment (started 2026-08-31):** hold-horizon curves showed morning
 signals keep developing past the 15-min exit (TSLA calls before 10:30 ET: net favorable

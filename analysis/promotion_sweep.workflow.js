@@ -19,8 +19,10 @@ const DATES = (args && args.dates) || 'the collected sessions'
 const CONTEXT = `
 You are analyzing data from "Ticker Tracker", a 0DTE options signal platform, to decide which
 (strategy, ticker, direction) pairs are statistically strong enough to promote to LIVE real-money
-trading. Currently only purgatory:TSLA:call trades live. This is a statistics/engineering task —
-compute honest numbers, do not give investment advice.
+trading. Only purgatory:TSLA:call has ever traded live (since 8/18); its live breaker HALTED on
+2026-09-21 (18 live trades, +$1,136 all-time but −$381 over the last 14, drawdown $481 from the
+$1,617 peak, 4 stop-outs avg −$112). This is a statistics/engineering task — compute honest
+numbers, do not give investment advice.
 
 DATA FILES (already downloaded, read-only):
 1. ${SCRATCH}/signals.csv — signal rows covering ${DATES}.
@@ -46,9 +48,22 @@ PLATFORM FACTS YOU MUST RESPECT:
   time-of-day or day-of-week conditioning in the live gate today (that would be a new feature).
 - Only 'purgatory' is a trading strategy (has paper fills). All others are signals-only; promoting
   one would ALSO require adding it to STRATEGIES_TRADING — a bigger step. Note this on candidates.
-- purgatory AVGO call+put are disabled (PURGATORY_DISABLED_PAIRS) — not eligible.
-- purgatory:TSLA:call already trades live — EXCLUDE from candidates, but report its current
-  record as the benchmark bar that any new candidate is compared against.
+- purgatory AVGO call+put are manually disabled (PURGATORY_DISABLED_PAIRS) — not eligible.
+  The 30-day auto-disable gate has also muted purgatory INTC call+put, SPCX call, TSLL call,
+  market_wave INTC put, and many vwap_reclaim pairs — report if a candidate is currently auto-muted.
+- purgatory:TSLA:call is the live pair (now halted) — EXCLUDE from candidates, but report its full
+  record as the benchmark, split 7/9–8/21 (the 8/21 sweep saw 19W/2L/3F, wr 79%) vs 8/22–9/21.
+- PRE-REGISTERED on 2026-08-21 (judge these on signals AFTER the registration date — forward
+  evidence is immune to the multiple-comparisons objection): purgatory:TSLA:put @09:45–10:30,
+  purgatory:QQQ:put Mon–Thu, and (registered 8/31) purgatory:AAPL:call @09:45–11:30. Report each
+  one's post-registration record explicitly (n, W/L/F, wilson_lo, net_f15, paper fills).
+- Paper trader hold change 8/31: paper legs entered before 10:30 ET hold 25 min (was 15); live
+  held 15 everywhere. Hold duration is derivable in orders_raw.json from entry_filled_at →
+  exit_filled_at; compare 25-min vs 15-min morning legs where n allows.
+- vwap_reclaim was muted by the kill gate in August but is active again (306 signals / 51% in the
+  last 30 days) — treat its August gap as a data hole, not a regime.
+- market_wave is a newer signals-only strategy (263 signals / 60.5% last 30 days) — high n, no fills.
+- orb is disabled (6 signals total); kronos has 2 signals — ignore both.
 - bb_squeeze got skip windows ~8/13 (open_first_15, lunch_chop, early_afternoon_chop, close_chop);
   its pre-8/13 signals include time windows it can no longer fire in.
 - orb_ntz is plan-scored: its generic outcome/f15 metrics are known-misleading (signals carry their
@@ -136,7 +151,7 @@ and for each, also report the pair's UNRESTRICTED record so we can see what the 
     key: 'stability',
     prompt: `${CONTEXT}
 YOUR LENS: stability and recency. For each pair with n>=8 honest-scored signals: split the record
-into July (7/9-7/31) vs August (8/1-8/21) and into first-half vs second-half of its own signal
+into July (7/9-7/31), August (8/1-8/31) and September (9/1-9/21), and into first-half vs second-half of its own signal
 sequence; compute win_rate and net_f15 for each half. Flag pairs whose edge is concentrated in one
 hot week or has decayed recently (compute per-week win rates for the top pairs). Also build a
 per-session cumulative net_f15 curve for the top 5 pairs by win_rate (n>=10) and describe its shape
@@ -214,12 +229,13 @@ and a paper track record first). orb_ntz additionally is plan-scored — generic
   {
     key: 'regime',
     angle: `You are a REGIME/STABILITY skeptic. Refute on robustness grounds: recompute the
-candidate's record week-by-week and July-vs-August from the data. Refute if the edge is
+candidate's record week-by-week and July vs August vs September from the data. Refute if the edge is
 concentrated in one hot week or has flipped negative in the most recent 2 weeks, if signals
 cluster in <6 distinct sessions (session-level correlation makes n overstated — signals in the
 same session move together), or if the slice's sessions all share one regime (e.g. all trend days).
 Compute distinct-session count and best-single-session share of total wins. Compare against the
-benchmark pair purgatory:TSLA:call whose promotion bar was ~94% over many sessions.`,
+benchmark pair purgatory:TSLA:call: it looked like 79% (n=24) on 8/21 and then ran ~46% in
+September while its live account gave back $481 — that is exactly the decay you must rule out.`,
   },
 ]
 
