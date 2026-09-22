@@ -324,6 +324,12 @@ print("HOLD:")
 # 2026-07-08 is EDT: 13:51Z = 9:51 ET (before the 10:30 cutoff), 15:10Z = 11:10 ET
 morning = "2026-07-08T13:51:00+00:00"
 midday = "2026-07-08T15:10:00+00:00"
+# Default is now 15 (= base hold) since the 9/21 revert, which disables the
+# extension; exercise the mechanism by switching it on explicitly.
+check("default: extension off, paper morning entry holds the base 15",
+      main._hold_minutes_for_entry({"paper": True, "submitted_at": morning}) == 15)
+_saved_hold = main.PAPER_MORNING_HOLD_MINUTES
+main.PAPER_MORNING_HOLD_MINUTES = 25
 check("paper morning entry holds 25",
       main._hold_minutes_for_entry({"paper": True, "submitted_at": morning}) == 25)
 check("live morning entry keeps 15",
@@ -335,6 +341,7 @@ check("missing timestamp keeps 15",
 check("boundary: 10:29 ET extends, 10:30 ET does not",
       main._hold_minutes_for_entry({"paper": True, "submitted_at": "2026-07-08T14:29:00+00:00"}) == 25
       and main._hold_minutes_for_entry({"paper": True, "submitted_at": "2026-07-08T14:30:00+00:00"}) == 15)
+main.PAPER_MORNING_HOLD_MINUTES = _saved_hold
 
 # ---------------- Daily predictions (bullseye) ----------------
 print("DAILYPRED:")
