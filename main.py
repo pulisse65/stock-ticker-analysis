@@ -3666,30 +3666,36 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
 _ORDERS_PAGE_SIZE = 1000   # PostgREST/Supabase caps any single select at 1000 rows
 
 
-def _fetch_all_order_rows() -> list[dict]:
-    """Every row of the orders table, oldest first, paged past the PostgREST
-    1000-row cap. Both the all-time P&L view and the live circuit breaker
-    used a single unpaged select here; once the table passed 1000 rows
-    (2026-09-11) the newest trades silently dropped off — the dashboard
-    froze at +$1,505 and the breaker kept trading through a drawdown that
-    should have halted it. Pages until a short page comes back."""
-    if _supabase_client is None:
-        return []
+def _page_all(build_query, page_size: int = _ORDERS_PAGE_SIZE) -> list[dict]:
+    """Run a Supabase select in `page_size` pages until a short page comes
+    back, so growing tables don't silently truncate at PostgREST's 1000-row
+    cap. `build_query` must return a FRESH filtered+ordered query each call
+    (builders are mutable; re-using one would stack range headers). Every
+    all-rows / N-day read over signals or orders goes through here — the
+    orders cap hid four losing live trades from the P&L view and the
+    circuit breaker (2026-09-11 → 09-21); the signals tables crossed 1000
+    rows per 30 days the same month, quietly shrinking the stats table,
+    the strategy health block and the auto-disable gate to ~9 sessions."""
     rows: list[dict] = []
     start = 0
     while True:
-        res = (
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("*")
-            .order("submitted_at", desc=False)
-            .range(start, start + _ORDERS_PAGE_SIZE - 1)
-            .execute()
-        )
+        res = build_query().range(start, start + page_size - 1).execute()
         page = list(res.data or [])
         rows.extend(page)
-        if len(page) < _ORDERS_PAGE_SIZE:
+        if len(page) < page_size:
             return rows
-        start += _ORDERS_PAGE_SIZE
+        start += page_size
+
+
+def _fetch_all_order_rows() -> list[dict]:
+    """Every row of the orders table, oldest first (paged)."""
+    if _supabase_client is None:
+        return []
+    return _page_all(lambda: (
+        _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+        .select("*")
+        .order("submitted_at", desc=False)
+    ))
 
 
 def _match_order_rows(rows: list[dict]) -> list[dict]:
@@ -3842,14 +3848,14 @@ def _compute_daily_realized_pnl(date_str: str, account: str | None = None) -> di
     # hiding between two tabs. Key mirrors the order-row pairing key.
     outcome_by_key: dict[tuple, str | None] = {}
     try:
-        sig_res = (
+        sig_rows = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("strategy,ticker,signal,bar_time,outcome")
             .gte("bar_time", start)
             .lt("bar_time", end)
-            .execute()
-        )
-        for s in (sig_res.data or []):
+            .order("bar_time", desc=False)
+        ))
+        for s in sig_rows:
             k = (s.get("strategy") or "purgatory", s.get("ticker"),
                  s.get("signal"), s.get("bar_time"))
             outcome_by_key[k] = s.get("outcome")
@@ -4155,14 +4161,13 @@ def _get_disabled_pairs() -> set[tuple[str, str, str]]:
         return set(PURGATORY_DISABLED_PAIRS)
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        res = (
+        rows = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("strategy, ticker, signal, outcome, favorable_15m")
             .gte("bar_time", since)
             .not_.is_("outcome", "null")
-            .execute()
-        )
-        rows = list(res.data or [])
+            .order("bar_time", desc=False)
+        ))
     except Exception as exc:  # noqa: BLE001
         log.warning("Disabled-pairs query failed: %s", exc)
         _disabled_pairs_cache = (now, set(PURGATORY_DISABLED_PAIRS))
@@ -6629,16 +6634,16 @@ def purgatory_stats(days: int = 30, strategy: str | None = None):
     days = max(1, min(int(days), 365))
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     try:
-        q = (
-            _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
-            .select("strategy, ticker, signal, outcome, favorable_10m, favorable_15m, favorable_20m")
-            .gte("bar_time", since)
-            .not_.is_("outcome", "null")
-        )
-        if strategy:
-            q = q.eq("strategy", strategy)
-        res = q.execute()
-        rows = list(res.data or [])
+        def _q():
+            q = (
+                _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
+                .select("strategy, ticker, signal, outcome, favorable_10m, favorable_15m, favorable_20m")
+                .gte("bar_time", since)
+                .not_.is_("outcome", "null")
+                .order("bar_time", desc=False)
+            )
+            return q.eq("strategy", strategy) if strategy else q
+        rows = _page_all(_q)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Supabase stats query failed: {exc}") from exc
 
@@ -6771,14 +6776,14 @@ def _strategy_status_block() -> list[dict[str, Any]]:
     if _supabase_client is not None:
         try:
             since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-            res = (
+            rows = _page_all(lambda: (
                 _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
                 .select("strategy, outcome")
                 .gte("bar_time", since)
                 .not_.is_("outcome", "null")
-                .execute()
-            )
-            for r in (res.data or []):
+                .order("bar_time", desc=False)
+            ))
+            for r in rows:
                 k = r.get("strategy") or "purgatory"
                 c = counts.setdefault(k, {"n": 0, "wins": 0})
                 c["n"] += 1
@@ -6904,15 +6909,13 @@ def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
     start = f"{date_str}T00:00:00+00:00"
     end = f"{date_str}T23:59:59+00:00"
     try:
-        res = (
+        signals = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("*")
             .gte("bar_time", start)
             .lte("bar_time", end)
             .order("bar_time", desc=False)
-            .execute()
-        )
-        signals = list(res.data or [])
+        ))
     except Exception as exc:  # noqa: BLE001
         log.warning("Retro query failed: %s", exc)
         return None
@@ -7398,14 +7401,13 @@ def _compute_weekly_retro(dates: list[str]) -> dict[str, Any] | None:
         return None
     start, end = dates[0], dates[-1]
     try:
-        res = (
+        rows = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_SIGNALS_TABLE)
             .select("strategy, signal, outcome, favorable_15m")
             .gte("bar_time", f"{start}T00:00:00+00:00")
             .lte("bar_time", f"{end}T23:59:59+00:00")
-            .execute()
-        )
-        rows = list(res.data or [])
+            .order("bar_time", desc=False)
+        ))
     except Exception as exc:  # noqa: BLE001
         log.warning("Weekly retro signals query failed: %s", exc)
         rows = []
