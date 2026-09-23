@@ -54,16 +54,17 @@ PLATFORM FACTS YOU MUST RESPECT:
 - Only 'purgatory' is a trading strategy (has paper fills). All others are signals-only; promoting
   one would ALSO require adding it to STRATEGIES_TRADING — a bigger step. Note this on candidates.
 - purgatory AVGO call+put are manually disabled (PURGATORY_DISABLED_PAIRS) — not eligible.
-  The 30-day auto-disable gate has also muted purgatory INTC call+put, SPCX call, TSLL call,
+  The 30-day auto-disable gate has also muted purgatory INTC call+put, SPCX call, TSLL call, AMZN call,
   market_wave INTC put, and many vwap_reclaim pairs — report if a candidate is currently auto-muted.
 - purgatory:TSLA:call is the live pair (now halted) — EXCLUDE from candidates, but report its full
-  record as the benchmark, split 7/9–8/21 (the 8/21 sweep saw 19W/2L/3F, wr 79%) vs 8/22–9/21.
+  record as the benchmark, split 7/9–8/21 (the 8/21 sweep saw 19W/2L/3F, wr 79%) vs 8/22–9/22.
 - PRE-REGISTERED on 2026-08-21 (judge these on signals AFTER the registration date — forward
   evidence is immune to the multiple-comparisons objection): purgatory:TSLA:put @09:45–10:30,
   purgatory:QQQ:put Mon–Thu, and (registered 8/31) purgatory:AAPL:call @09:45–11:30. Report each
   one's post-registration record explicitly (n, W/L/F, wilson_lo, net_f15, paper fills).
-- Paper trader hold change 8/31: paper legs entered before 10:30 ET hold 25 min (was 15); live
-  held 15 everywhere. Hold duration is derivable in orders_raw.json from entry_filled_at →
+- Paper trader hold change 8/31: paper legs entered before 10:30 ET held 25 min (was 15); live
+  held 15 everywhere. REVERTED to 15 on 2026-09-21 (PR #27) — the 9/22 session ran at 15 min; the
+  9/21 sweep found the extra 10 min doubled morning stop-outs with no added underlying edge. Hold duration is derivable in orders_raw.json from entry_filled_at →
   exit_filled_at; compare 25-min vs 15-min morning legs where n allows.
 - vwap_reclaim was muted by the kill gate in August but is active again (306 signals / 51% in the
   last 30 days) — treat its August gap as a data hole, not a regime.
@@ -156,7 +157,7 @@ and for each, also report the pair's UNRESTRICTED record so we can see what the 
     key: 'stability',
     prompt: `${CONTEXT}
 YOUR LENS: stability and recency. For each pair with n>=8 honest-scored signals: split the record
-into July (7/9-7/31), August (8/1-8/31) and September (9/1-9/21), and into first-half vs second-half of its own signal
+into July (7/9-7/31), August (8/1-8/31) and September (9/1-9/22), and into first-half vs second-half of its own signal
 sequence; compute win_rate and net_f15 for each half. Flag pairs whose edge is concentrated in one
 hot week or has decayed recently (compute per-week win rates for the top pairs). Also build a
 per-session cumulative net_f15 curve for the top 5 pairs by win_rate (n>=10) and describe its shape
