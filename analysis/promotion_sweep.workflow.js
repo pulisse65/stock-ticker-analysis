@@ -2,7 +2,7 @@ export const meta = {
   name: 'live-promotion-sweep',
   description: 'Find signal pairs statistically worth promoting to live trading',
   phases: [
-    { title: 'Lenses', detail: '4 parallel analysis lenses over signals + paper fills' },
+    { title: 'Lenses', detail: '5 parallel analysis lenses over signals + paper fills' },
     { title: 'Verify', detail: '3 adversarial skeptics per candidate' },
   ],
 }
@@ -11,7 +11,8 @@ export const meta = {
 // skip windows, muted strategies, and plan-scored strategies drift over time.
 // Parameterized: pass {dataDir, python, dates} via Workflow args.
 // dataDir must contain signals.csv / orders.csv / signals_raw.json / orders_raw.json
-// (produced by analysis/pull_signals.py + analysis/pull_orders.py).
+// (produced by analysis/pull_signals.py + analysis/pull_orders.py) plus streak_lens.md /
+// streak_persistence.csv / streak_pairs.csv (produced by analysis/streak_lens.py).
 const SCRATCH = (args && args.dataDir) || './analysis/data'
 const PY = (args && args.python) ? `"${args.python}"` : 'python3'
 const DATES = (args && args.dates) || 'the collected sessions'
@@ -40,6 +41,10 @@ DATA FILES (already downloaded, read-only):
    entry_quote,exit_quote,execution_drag,signal_outcome,date,et_time,dow.
    pnl is realized $ P&L per round-trip. Only the 'purgatory' strategy places trades.
 3. ${SCRATCH}/signals_raw.json and ${SCRATCH}/orders_raw.json — full raw records incl. meta.
+4. ${SCRATCH}/streak_lens.md (+ streak_persistence.csv, streak_pairs.csv) — output of
+   analysis/streak_lens.py: does a pair's recent hot/cold record predict its NEXT signals?
+   Platform-wide tables (trailing-10 bucket, consecutive-wins, EWMA momentum -> next-signal win
+   rate vs the pair's OWN base rate) and every pair's current streak position / ride phase.
 
 RUN PYTHON WITH: ${PY} yourscript.py   (pandas 3.0.2 available; write scripts into ${SCRATCH}/)
 
@@ -174,10 +179,29 @@ Print the full table in your summary. Nominate per the bar (use signal stats for
 but ONLY nominate pairs whose fill P&L is positive and not outlier-dominated; put fill numbers in
 'evidence' and paper_pnl).`,
   },
+  {
+    key: 'streak',
+    prompt: `${CONTEXT}
+YOUR LENS: streak position and momentum persistence. Start from ${SCRATCH}/streak_lens.md (regenerate
+it with: ${PY} analysis/streak_lens.py ${SCRATCH}  — if the file is missing or older than signals.csv).
+Report, in your summary, the three persistence tables for purgatory AND all strategies: does a pair
+in the 'hot >=80%' trailing-10 bucket beat its OWN base rate on the next signal (excess_vs_base)? Does
+the consecutive-wins curve still show the 2-3-wins bump seen on 2026-09-23 (purgatory next1 82%/76%,
+n=33/29, decaying to 55% at 6+) — quote the current numbers WITH their Wilson lower bounds, and say
+plainly whether the bump has strengthened, weakened or vanished as n grew. Report the hot-regime
+lifespan (median signals from >=80% until <60%). Then list every pair with n>=8 that is in the
+'early' phase (2-3 consecutive wins) and every pair in the 'late' phase (6+) or >= the median
+lifespan into its regime — with base wr, wilson_lo, net_f15, paper fills. Explicitly place the
+pre-registered slices (TSLA:put morning, QQQ:put Mon-Thu, AAPL:call morning) and the halted live
+pair TSLA:call on the streak curve. Nominate ONLY pairs that already clear the bar on their own
+(n>=8, wr>=60%, wilson_lo>=0.45, net_f15>0) AND are in the early phase — put the phase and the
+persistence numbers in 'evidence'. Never nominate on streak alone; a hot record that does not beat
+the pair's own base rate is a description of the past, not a forecast, and you must say so.`,
+  },
 ]
 
 phase('Lenses')
-log('Running 4 analysis lenses over the honest-scored signals + paper fills')
+log('Running 5 analysis lenses over the honest-scored signals + paper fills (+ streak_lens.md)')
 const lensResults = await parallel(
   LENSES.map(l => () => agent(l.prompt, { label: `lens:${l.key}`, phase: 'Lenses', schema: LENS_SCHEMA }))
 )
@@ -235,7 +259,12 @@ cluster in <6 distinct sessions (session-level correlation makes n overstated �
 same session move together), or if the slice's sessions all share one regime (e.g. all trend days).
 Compute distinct-session count and best-single-session share of total wins. Compare against the
 benchmark pair purgatory:TSLA:call: it looked like 79% (n=24) on 8/21 and then ran ~46% in
-September while its live account gave back $481 — that is exactly the decay you must rule out.`,
+September while its live account gave back $481 — that is exactly the decay you must rule out.
+Also read ${SCRATCH}/streak_lens.md: state the candidate's current ride phase (consecutive wins),
+how many signals it is into its hot regime versus the platform's median hot-regime lifespan, and
+whether pairs in the 'hot >=80%' bucket beat their own base rate on the next signal (they did not
+on 9/23: excess −0.05 purgatory / −0.09 all). A candidate 'late' in its streak, or past the median
+lifespan, is grounds to refute or to demand the forward-evidence route.`,
   },
 ]
 

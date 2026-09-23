@@ -16,7 +16,7 @@ since 8/22; the 8/31 paper 25-min morning hold doubled stop-outs → revert; sto
 1. **Pull fresh data** (any python with pandas; writes to `analysis/data/`):
 
    ```bash
-   python analysis/pull_signals.py && python analysis/pull_orders.py
+   python analysis/pull_signals.py && python analysis/pull_orders.py && python analysis/streak_lens.py
    ```
 
 2. **Refresh the PLATFORM FACTS block** in `promotion_sweep.workflow.js` — live pairs,
@@ -40,9 +40,10 @@ since 8/22; the 8/31 paper 25-min morning hold doubled stop-outs → revert; sto
 
 - **Data**: every persisted signal (honest filter: `scored_from == 'alerted_at'` only) plus
   every closed paper option round-trip (real fills, realized $).
-- **Four parallel lenses**: whole-pair conviction · time-of-day & day-of-week slices ·
+- **Five parallel lenses**: whole-pair conviction · time-of-day & day-of-week slices ·
   stability/recency (half-splits, week-by-week, cumulative curves) · realized fills
-  (P&L, stop-outs, execution drag, outlier concentration).
+  (P&L, stop-outs, execution drag, outlier concentration) · streak position / momentum
+  persistence (`streak_lens.py`, added 2026-09-23 — see below).
 - **Candidate bar**: n ≥ 8 honest signals in the slice, win rate ≥ 60 %, Wilson 95 %
   lower bound ≥ 0.45, avg net_f15 > 0.
 - **Adversarial verification**: each top candidate faces three independent skeptics told
@@ -83,6 +84,37 @@ Paper legs entered before 10:30 ET held 25 min (`PAPER_MORNING_HOLD_MINUTES`) fr
 stop-out rate (18% → 35%). Any retest should make the stop hold-aware first. Decision rule: after ~15–20 paired morning TSLA-call trades, compare
 the paper-25m legs vs live-15m legs (and vs each leg's own f15/f25) — hold duration is
 derivable from `entry_filled_at` → `exit_filled_at`. Only then consider changing the live hold.
+
+## Streak lens (added 2026-09-23)
+
+Question: *can you catch a pair as its hot streak starts and ride it before it turns?*
+`analysis/streak_lens.py` answers it deterministically from `signals.csv` (+ `orders.csv`) and
+writes `data/streak_lens.md`, `data/streak_persistence.csv`, `data/streak_pairs.csv`, which the
+sweep's fifth lens and the regime skeptic read. Method: for every signal of every pair with ≥15
+honest signals, measure the pair's state *before* the signal (trailing-10 win rate, consecutive
+wins, EWMA half-life 8) and compare with that signal's outcome and the next five. A momentum effect
+must beat the pair's **own** base rate (`excess_vs_base`), not the platform's. Wilson lower bounds
+sit next to every cell.
+
+**First read (632 signal-states, 52 pairs, data through 9/22):**
+
+| state before the signal | purgatory next-signal wr | vs own base | all strategies | vs own base |
+|---|---|---|---|---|
+| trailing-10 ≥ 80 % ("hot") | 62 % (n=73) | −0.05 | 57 % (n=89) | −0.09 |
+| EWMA momentum > +.15 | 53 % (n=74) | −0.02 | 47 % (n=148) | −0.06 |
+| 2 consecutive wins | 82 % (n=33, Wilson 0.66) | +0.18 | 72 % (n=71, Wilson 0.60) | +0.12 |
+| 3 consecutive wins | 76 % (n=29, Wilson 0.58) | +0.10 | 72 % (n=53, Wilson 0.58) | +0.10 |
+| 6+ consecutive wins | 55 % (n=20, Wilson 0.34) | −0.12 | 50 % (n=26, Wilson 0.32) | −0.16 |
+
+Hot regimes (trailing-10 ≥ 80 %) that have ended lasted a median 10.5 signals before falling below
+60 % (8 ended / 18). Reading: a hot *record* and the leaderboard's EWMA momentum do not persist —
+they are descriptions of the past. The one bump is *early* in a streak (2–3 wins), fading by 6+;
+cells are thin, so this is a **pre-registered hypothesis to re-test on each rerun**, not a rule.
+Decision rule: the lens may only nominate pairs that already clear the candidate bar on their own
+and sit in the early phase; the regime skeptic treats "late" (6+) or past-median-lifespan as
+grounds to refute. `purgatory:AAPL:call` on 9/23: 19 signals into its regime, phase none (1 win) —
+its stronger structure is time-of-day (30 morning signals, 23W/0L/7F; all 3 losses outside
+09:45–11:30), tracked by the pre-registration above.
 
 ## Bullseye daily-prediction track (started 2026-09-06)
 
