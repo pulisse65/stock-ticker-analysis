@@ -11,6 +11,11 @@ Second run: 2026-09-21 → [results/2026-09-21-live-promotion-sweep.md](results/
 and confirmed by forward evidence; live TSLA:call decay confirmed — net_f15 +.266 → −.134, paper −$806
 since 8/22; the 8/31 paper 25-min morning hold doubled stop-outs → revert; stops = −$13.8k of drain).
 
+Third run: 2026-09-23 → [results/2026-09-23-live-promotion-sweep.md](results/2026-09-23-live-promotion-sweep.md)
+(52 sessions, first run with the streak lens; 9 nominated, 6 verified, 17/18 refutes; AAPL:call morning
+slipped CONDITIONAL → REJECTED 2/3 — forward record is one hot week and 95% of forward paper P&L came from
+the reverted 25-min hold; hot records do not persist platform-wide; only the 2–3-wins bump survives, shallow).
+
 ## How to rerun (ask Claude to "rerun the live-promotion sweep")
 
 1. **Pull fresh data** (any python with pandas; writes to `analysis/data/`):
@@ -70,6 +75,11 @@ multiple-comparisons objection. Pre-registered on 2026-08-21:
   small, so the +0.10%-in-30min threshold underrates it). Judge on post-8/31 signals.
 
 Revisit either after ~10–15 forward signals with positive paper fills.
+
+**9/23 update:** AAPL:call forward 9 sig 8W/0L/1F, 9 fills +$919, 0 stops — but 6 of 8 wins in 9/1–9/3 and
+$627 of the P&L from 25-min legs; judgement extended to ≥15 forward signals with ≥8 fills at the 15-min hold
+and net_f15 > 0 over the trailing two weeks. Optional new pre-registration 9/23: `purgatory:SMCI:call` (24 sig
+.708/.508/+.157, fills +$644), judged on post-9/23 signals.
 
 **9/21 update:** AAPL:call forward 8 sig 7W/0L/1F, 8 fills +$771, 0 stops — passes the bar on forward
 evidence alone (n=8 exactly; revisit at ~15). TSLA:put morning forward 6 sig 5/1/0 but fills +$118
