@@ -42,7 +42,9 @@ Do NOT touch: `ALPACA_API_KEY`/`SECRET` (paper + market data),
 `ALPACA_PAPER` (stays `1` — the paper client), `ALPACA_TRADING_ENABLED`
 (stays `1`), hold/stop/notional for paper. The TSLA record was earned
 under hold=15min, stop=30%; those settings govern both accounts — changing
-them invalidates the evidence you're acting on.
+them invalidates the evidence you're acting on. (The default stop became
+15% on 2026-10-03 on the strength of the stop-rule study, while live was
+halted and auto-disabled; any future live pair is judged on 15%-stop fills.)
 
 `SLACK_SIGNAL_SCOPE` options: `all` (default — today's behavior),
 `trading` (only signals from trading strategies), `live` (only signals

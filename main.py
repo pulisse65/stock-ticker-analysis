@@ -2973,7 +2973,12 @@ PAPER_MORNING_HOLD_CUTOFF_ET = os.environ.get("PAPER_MORNING_HOLD_CUTOFF_ET", "1
 # Stop-loss: close early when the option's live mid drops this % below the
 # entry fill. Caps the -$300 tail losses (AAPL 7/8 put was -35% within 5 min
 # and never recovered). Set <= 0 to disable.
-ALPACA_TRADING_STOP_LOSS_PCT = float(os.environ.get("ALPACA_TRADING_STOP_LOSS_PCT", "30"))
+# 30 → 15 on 2026-10-03: the shadow-tracked stop study (analysis/README.md,
+# "Stop-rule study") replayed 144 paper trades over 30 days — 15% was the only
+# threshold that beat the 30% rule on both total P&L (−$2,002 vs −$2,905) and
+# worst single trade (−$154 vs −$200). One knob for paper AND live; live is
+# halted + auto-disabled, so in effect this changes paper only.
+ALPACA_TRADING_STOP_LOSS_PCT = float(os.environ.get("ALPACA_TRADING_STOP_LOSS_PCT", "15"))
 # Entry spread gate: skip the trade when the option's quoted spread exceeds
 # this % of the mid. Added after the 2026-07-20 QQQ put — the underlying
 # moved favorably but a $1.40 fill vs ~$1.00 fair at entry ate the whole
