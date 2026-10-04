@@ -185,6 +185,27 @@ real paths; the Trading tab shows it as "Stop-rule study". Trading behaviour is 
 and paper stop is still `ALPACA_TRADING_STOP_LOSS_PCT` = 30 — one knob for both accounts, which is
 why the study is shadow-tracked rather than an A/B on the paper account).
 
+**Decision 2026-10-03 — stop moved to 15%.** The study cleared its 60-trade gate with 144 replayable
+paper trades over 30 days (9/3–10/2; 272 trades in the window, 144 with a complete quote path):
+
+| rule | 30-day replay total | worst trade | stopped |
+|---|---|---|---|
+| 10% | −$2,077 | −$154 | 94 |
+| **15%** | **−$2,002** | **−$154** | 66 |
+| 20% | −$2,590 | −$162 | 53 |
+| 30% (was current) | −$2,905 | −$200 | 32 |
+| no stop | −$2,783 | −$314 | 0 |
+
+15% is the only rule that beats 30% on both the total and the worst-trade column (10% ties on worst
+with a slightly worse total). Every row is negative because the book lost money in that window; the
+rule changes how much. Caveat: quotes are sampled once per scan (~4 min), so thresholds tighter than
+the realized stop are evaluated on a coarse grid and look slightly better than a tick-level stop
+would. `ALPACA_TRADING_STOP_LOSS_PCT` default is now 15 (one knob, paper and live; live was halted and
+auto-disabled at the time, so the change is paper-only in effect). Shadow tracking continues, so the
+20–50% and no-stop rows stay replayable after the switch; the 10% row is now the coarse one.
+Re-read after ~3 weeks on the new stop (≈10/24): the realized stop/hold split should move toward the
+15% replay row; if it does not, that is evidence against the replay's coarse-grid optimism.
+
 Read with care: paths are one sample per scan (~4 min), so thresholds tighter than 30% are evaluated
 on a coarse grid (a 15% stop that would have fired between samples is missed); a "no stop" total
 ignores the tail risk a stop exists to cap — look at the *Worst* column, not just the total.

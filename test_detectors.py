@@ -463,6 +463,12 @@ resp = client.post("/purgatory/score-daily-predictions")
 check("force-score without Supabase -> 503", resp.status_code == 503, str(resp.status_code))
 main.EXTERNAL_SIGNAL_TOKEN, main._supabase_client = _saved_tok, _saved_sb
 
+# ---- stop knob default (2026-10-03: 30 -> 15 per the stop-rule study) ----
+print("STOP KNOB:")
+check("ALPACA_TRADING_STOP_LOSS_PCT defaults to 15 (set via env to override)",
+      os.environ.get("ALPACA_TRADING_STOP_LOSS_PCT") is not None or main.ALPACA_TRADING_STOP_LOSS_PCT == 15.0,
+      f"got {main.ALPACA_TRADING_STOP_LOSS_PCT}")
+
 # ---- orders table paging past the PostgREST 1000-row cap ----
 print("ORDERS PAGING:")
 class _PagedQ:
