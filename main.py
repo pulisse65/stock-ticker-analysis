@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import requests
+import collections
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -982,6 +983,72 @@ def _cache_set(key: tuple, value: Any, ttl: int) -> None:
 # pass calls the three helpers below every minute so Render's logs show
 # the RSS trend and freed pages actually return to the OS.
 # (Also set MALLOC_ARENA_MAX=2 in the Render env — biggest single lever.)
+#
+# 2026-10-03 follow-up: RSS reached 435MB after 11 days up (274MB on 9/14).
+# Measured cause: the Trading/Alerts tabs poll /pnl, /leaderboard, /stats and
+# /stop-study every 60s, and since PR #29 every orders row carries a quote
+# path + shadow samples in `raw`, so each poll pulled ~all rows with heavy
+# JSON through the threadpool — six rounds moved RSS 435 → 454MB in 50s.
+# Fixes: (a) _fetch_all_order_rows selects only the columns the matcher
+# reads plus the four `raw` keys it uses, (b) those four endpoints are
+# served from a short TTL cache, (c) /healthz trims the heap every ~4 min
+# around the clock (the uptime cron hits it every 5 min) and keeps an RSS
+# ring buffer; GET /healthz?mem=1 returns it with gc/type counts.
+
+_RSS_RING: "collections.deque[tuple[int, float]]" = collections.deque(maxlen=2016)   # ~7 days @ 5 min
+_last_trim_at = 0.0
+_DASH_CACHE_TTL_S = int(os.environ.get("DASH_CACHE_TTL_S", "60"))
+
+
+def _mem_probe(trim_every_s: float = 240) -> float | None:
+    """Trim the heap if it has been >= trim_every_s since the last trim,
+    sample RSS into the ring, return RSS (MB). Called from the scan loop
+    (always trims) and from /healthz (rate-limited)."""
+    global _last_trim_at
+    now = time.time()
+    if now - _last_trim_at >= trim_every_s:
+        _malloc_trim()
+        _last_trim_at = now
+    rss = _rss_mb()
+    if rss is not None:
+        _RSS_RING.append((int(now), rss))
+    return rss
+
+
+def _mem_report() -> dict:
+    """Diagnostic payload for /healthz?mem=1: RSS history, the sizes of
+    every module-level container that can grow, and the dozen most common
+    live object types (a Python-level leak shows up here; a flat count with
+    rising RSS means allocator fragmentation instead)."""
+    import gc
+    objs = gc.get_objects()
+    top = collections.Counter(type(o).__name__ for o in objs).most_common(12)
+    return {
+        "rss_ring": list(_RSS_RING)[-288:],
+        "widget_cache": len(_WIDGET_CACHE),
+        "alerted_keys": len(_purgatory_alerted),
+        "signals_mem": len(_purgatory_signals),
+        "live_objects": len(objs),
+        "gc_counts": gc.get_count(),
+        "top_types": top,
+        "last_trim_at": int(_last_trim_at) or None,
+        "slim_orders": _slim_orders_ok,
+        "dash_cache_ttl_s": _DASH_CACHE_TTL_S,
+    }
+
+
+def _cached_json(key: tuple, compute, ttl: int | None = None):
+    """Serve a dashboard payload from the TTL cache. Exceptions propagate
+    (never cached). ttl <= 0 disables caching (tests)."""
+    ttl = _DASH_CACHE_TTL_S if ttl is None else ttl
+    if ttl <= 0:
+        return compute()
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    val = compute()
+    _cache_set(key, val, ttl)
+    return val
 
 def _sweep_widget_cache() -> int:
     """Drop expired widget-cache entries. Without this, a ticker browsed
@@ -3725,6 +3792,10 @@ def _evaluate_stop_rules(trades: list[dict], thresholds: list[float | None] | No
 
 @app.get("/purgatory/stop-study")
 def purgatory_stop_study(days: int = 30, account: str = "paper"):
+    return _cached_json(("dash", "stop-study", int(days), account), lambda: _stop_study_payload(days, account))
+
+
+def _stop_study_payload(days: int = 30, account: str = "paper"):
     """Replay every stop threshold (10% … 50%, and none) over the real
     option quote paths recorded on paper positions since `days` ago.
     Only trades with a complete path count; stopped trades need their
@@ -3957,10 +4028,49 @@ def _page_all(build_query, page_size: int = _ORDERS_PAGE_SIZE) -> list[dict]:
         start += page_size
 
 
+# Columns _match_order_rows actually reads, plus the four `raw` keys it uses
+# (PostgREST `alias:col->key` pulls one JSON key without the rest of `raw`,
+# which since PR #29 carries up to 60 quote-path samples per position).
+_ORDER_ROW_COLUMNS = (
+    "id, strategy, signal_ticker, signal_direction, signal_bar_time, paper, role, side, qty, "
+    "option_symbol, alpaca_order_id, alpaca_status, fill_price, filled_at, submitted_at, notional, "
+    "quote_at_submit:raw->quote_at_submit, attributed:raw->attributed, "
+    "exit_reason:raw->exit_reason, stop_basis:raw->stop_basis"
+)
+_ORDER_RAW_ALIASES = ("quote_at_submit", "attributed", "exit_reason", "stop_basis")
+_slim_orders_ok = True
+
+
+def _slim_order_row(r: dict) -> dict:
+    """Fold the aliased raw->key columns back into r['raw'] so every reader
+    sees the same shape as a select('*') row."""
+    raw = {}
+    for k in _ORDER_RAW_ALIASES:
+        v = r.pop(k, None)
+        if v is not None:
+            raw[k] = v
+    r["raw"] = raw
+    return r
+
+
 def _fetch_all_order_rows() -> list[dict]:
-    """Every row of the orders table, oldest first (paged)."""
+    """Every row of the orders table, oldest first (paged), with `raw`
+    reduced to the keys the matcher reads. Falls back to select('*') once
+    if the slim select is rejected (schema drift), and stays there."""
+    global _slim_orders_ok
     if _supabase_client is None:
         return []
+    if _slim_orders_ok:
+        try:
+            rows = _page_all(lambda: (
+                _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+                .select(_ORDER_ROW_COLUMNS)
+                .order("submitted_at", desc=False)
+            ))
+            return [_slim_order_row(r) for r in rows]
+        except Exception as exc:  # noqa: BLE001
+            _slim_orders_ok = False
+            log.warning("Slim orders select failed (%s); falling back to select(*) for this process", exc)
     return _page_all(lambda: (
         _supabase_client.table(_PURGATORY_ORDERS_TABLE)
         .select("*")
@@ -6238,8 +6348,7 @@ def purgatory_scan():
 
     # Memory hygiene + probe (see the Memory hygiene section for why)
     n_evicted = _sweep_widget_cache()
-    _malloc_trim()
-    rss = _rss_mb()
+    rss = _mem_probe(trim_every_s=0)
     if rss is not None:
         log.info("Scan memory: rss=%.1fMB · widget cache %d entries (%d evicted)",
                  rss, len(_WIDGET_CACHE), n_evicted)
@@ -6899,6 +7008,10 @@ def purgatory_signals_get(limit: int = 50, strategy: str | None = None, offset: 
 
 @app.get("/purgatory/stats")
 def purgatory_stats(days: int = 30, strategy: str | None = None):
+    return _cached_json(("dash", "stats", int(days), strategy), lambda: _stats_payload(days, strategy))
+
+
+def _stats_payload(days: int = 30, strategy: str | None = None):
     """Per-(strategy, ticker, direction) win rate + average favorable move
     at +15m over the last `days` days of signals with computed outcomes.
     Optional ?strategy= narrows to one strategy."""
@@ -7112,6 +7225,10 @@ def _build_leaderboard(signal_rows: list[dict], trades: list[dict], days: int,
 
 @app.get("/purgatory/leaderboard")
 def purgatory_leaderboard(days: int = 30, min_n: int = 5):
+    return _cached_json(("dash", "leaderboard", int(days), int(min_n)), lambda: _leaderboard_payload(days, min_n))
+
+
+def _leaderboard_payload(days: int = 30, min_n: int = 5):
     """Every scored pair, all-time and last-`days` records side by side,
     Wilson lower bound, momentum (EWMA vs history, last-10 vs prior-10,
     rolling sparkline), paper fill P&L, and live/disabled flags. Honest
@@ -7180,6 +7297,10 @@ def purgatory_orders_get(date: str | None = None, account: str | None = None):
 
 @app.get("/purgatory/pnl")
 def purgatory_pnl(account: str | None = None):
+    return _cached_json(("dash", "pnl", account), lambda: _pnl_payload(account))
+
+
+def _pnl_payload(account: str | None = None):
     """All-time realized P&L: per-day series (with running cumulative) plus
     rollups for today / trailing 7d / 30d / 180d / all time. Drives the
     Trading tab's performance chart and stat tiles. ?account=live|paper
@@ -8285,12 +8406,19 @@ def favicon():
 
 
 @app.get("/healthz")
-def healthz():
+def healthz(mem: int = 0):
     """Cheap liveness probe — no Supabase, Alpaca, or disk I/O. Use this as
     the keep-warm / uptime-monitor target so the instance stays awake (and
     cold boots report healthy fast) without hammering the heavy scan.
-    rss_mb tracks memory against the 512MB free-tier OOM limit."""
-    return {"ok": True, "ts": _now_iso(), "rss_mb": _rss_mb()}
+    rss_mb tracks memory against the 512MB free-tier OOM limit. Also trims
+    the heap at most every ~4 min (the uptime cron calls this every 5 min,
+    so trimming now runs around the clock, not only during market-hours
+    scans). ?mem=1 adds the RSS ring buffer and container/object counts."""
+    rss = _mem_probe()
+    out = {"ok": True, "ts": _now_iso(), "rss_mb": rss}
+    if mem:
+        out["mem"] = _mem_report()
+    return out
 
 
 @app.get("/")
