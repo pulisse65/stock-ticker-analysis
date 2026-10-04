@@ -3,6 +3,7 @@ import os, sys
 os.environ.setdefault("OPENROUTER_API_KEY", "x")
 sys.path.insert(0, "/Users/paululisse/Documents/Stock Ticker Analysis")
 import main
+main._DASH_CACHE_TTL_S = 0   # endpoint tests call the same routes with different fakes
 import pandas as pd
 
 # 2026-07-08 is EDT: 9:30 ET = 13:30 UTC
@@ -468,6 +469,57 @@ print("STOP KNOB:")
 check("ALPACA_TRADING_STOP_LOSS_PCT defaults to 15 (set via env to override)",
       os.environ.get("ALPACA_TRADING_STOP_LOSS_PCT") is not None or main.ALPACA_TRADING_STOP_LOSS_PCT == 15.0,
       f"got {main.ALPACA_TRADING_STOP_LOSS_PCT}")
+
+# ---- memory hygiene (2026-10-03): slim order select, fallback, cache, /healthz?mem ----
+print("MEM HYGIENE:")
+class _SlimQ:
+    def __init__(self, sb): self.sb = sb; self.a = self.b = None; self.cols = None
+    def select(self, cols): self.cols = cols; self.sb.selects.append(cols); return self
+    def order(self, *a, **k): return self
+    def range(self, a, b): self.a, self.b = a, b; return self
+    def execute(self):
+        if "raw->" in self.cols and self.sb.reject_slim: raise RuntimeError("400 column raw->x does not exist")
+        class R: pass
+        r = R()
+        if "raw->" in self.cols:
+            r.data = [{"id": 1, "role": "entry", "fill_price": 1.0, "quote_at_submit": {"bid": 1, "ask": 1.1, "mid": 1.05}, "attributed": None, "exit_reason": None, "stop_basis": None},
+                      {"id": 2, "role": "exit", "fill_price": 1.2, "quote_at_submit": None, "attributed": True, "exit_reason": "stop_loss", "stop_basis": "mid"}]
+        else:
+            r.data = [{"id": 1, "role": "entry", "raw": {"quote_at_submit": {"mid": 1.05}, "quote_path": [1, 2, 3]}}]
+        return r
+class _SlimSB:
+    def __init__(self, reject_slim=False): self.reject_slim = reject_slim; self.selects = []
+    def table(self, name): return _SlimQ(self)
+_saved_sb, _saved_ok = main._supabase_client, main._slim_orders_ok
+main._slim_orders_ok = True; main._supabase_client = _SlimSB()
+rows = main._fetch_all_order_rows()
+check("slim select asks for raw->keys, not raw", len(main._supabase_client.selects) == 1 and "raw->quote_at_submit" in main._supabase_client.selects[0] and ", raw," not in main._supabase_client.selects[0])
+check("slim rows: aliases folded into raw, None keys dropped",
+      rows[0]["raw"] == {"quote_at_submit": {"bid": 1, "ask": 1.1, "mid": 1.05}} and "quote_at_submit" not in rows[0]
+      and rows[1]["raw"] == {"attributed": True, "exit_reason": "stop_loss", "stop_basis": "mid"}, str(rows))
+main._slim_orders_ok = True; main._supabase_client = _SlimSB(reject_slim=True)
+rows = main._fetch_all_order_rows()
+check("slim select rejected -> falls back to select(*) and latches off",
+      rows and rows[0]["raw"].get("quote_path") == [1, 2, 3] and main._slim_orders_ok is False
+      and main._supabase_client.selects == [main._ORDER_ROW_COLUMNS, "*"], str(main._supabase_client.selects))
+rows = main._fetch_all_order_rows()
+check("latched: second call goes straight to select(*)", main._supabase_client.selects[-1] == "*" and len(main._supabase_client.selects) == 3)
+main._supabase_client, main._slim_orders_ok = _saved_sb, _saved_ok
+_calls = []
+v1 = main._cached_json(("dash", "test", 1), lambda: _calls.append(1) or {"n": len(_calls)}, ttl=60)
+v2 = main._cached_json(("dash", "test", 1), lambda: _calls.append(1) or {"n": len(_calls)}, ttl=60)
+check("_cached_json serves the second call from cache", v1 == v2 == {"n": 1} and len(_calls) == 1)
+v3 = main._cached_json(("dash", "test", 1), lambda: _calls.append(1) or {"n": len(_calls)}, ttl=0)
+check("_cached_json ttl<=0 bypasses the cache", v3 == {"n": 2})
+try:
+    main._cached_json(("dash", "test", 2), lambda: (_ for _ in ()).throw(RuntimeError("boom")), ttl=60)
+except RuntimeError: pass
+check("_cached_json never caches an exception", main._cache_get(("dash", "test", 2)) is None)
+main._WIDGET_CACHE.pop(("dash", "test", 1), None)
+from fastapi.testclient import TestClient as _TC
+_hz = _TC(main.app).get("/healthz?mem=1").json()
+check("/healthz?mem=1 returns ok + rss + mem report", _hz["ok"] is True and "rss_mb" in _hz and set(_hz["mem"]) >= {"rss_ring", "widget_cache", "alerted_keys", "signals_mem", "live_objects", "top_types"}, str(list(_hz.get("mem", {}).keys())))
+check("/healthz plain has no mem block", "mem" not in _TC(main.app).get("/healthz").json())
 
 # ---- orders table paging past the PostgREST 1000-row cap ----
 print("ORDERS PAGING:")
