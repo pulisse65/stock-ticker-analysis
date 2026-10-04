@@ -1033,6 +1033,7 @@ def _mem_report() -> dict:
         "top_types": top,
         "last_trim_at": int(_last_trim_at) or None,
         "slim_orders": _slim_orders_ok,
+        "malloc_arena_max": os.environ.get("MALLOC_ARENA_MAX"),
         "dash_cache_ttl_s": _DASH_CACHE_TTL_S,
     }
 

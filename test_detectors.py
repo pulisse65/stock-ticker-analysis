@@ -519,6 +519,7 @@ main._WIDGET_CACHE.pop(("dash", "test", 1), None)
 from fastapi.testclient import TestClient as _TC
 _hz = _TC(main.app).get("/healthz?mem=1").json()
 check("/healthz?mem=1 returns ok + rss + mem report", _hz["ok"] is True and "rss_mb" in _hz and set(_hz["mem"]) >= {"rss_ring", "widget_cache", "alerted_keys", "signals_mem", "live_objects", "top_types"}, str(list(_hz.get("mem", {}).keys())))
+check("/healthz?mem=1 reports MALLOC_ARENA_MAX (None when unset)", "malloc_arena_max" in _hz["mem"] and _hz["mem"]["malloc_arena_max"] == os.environ.get("MALLOC_ARENA_MAX"))
 check("/healthz plain has no mem block", "mem" not in _TC(main.app).get("/healthz").json())
 
 # ---- orders table paging past the PostgREST 1000-row cap ----
