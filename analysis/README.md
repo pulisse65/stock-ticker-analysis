@@ -73,8 +73,27 @@ multiple-comparisons objection. Pre-registered on 2026-08-21:
   80–82% positive-net hit rates at 15m/25m holds in both morning windows across 8–9 sessions
   (n=10–11 each) despite a mediocre generic win rate (its moves are consistently positive but
   small, so the +0.10%-in-30min threshold underrates it). Judge on post-8/31 signals.
+- *(added 2026-10-06)* `purgatory:MSTR:call` and `purgatory:SPCX:call`, **whole pairs, no window**
+  (MSTR's 09:45–10:30 slice was rejected 3/3 on 9/23 — do not re-slice). Records at registration,
+  from the live leaderboard on 10/6 (honest rows):
+
+  | pair | all-time n / wr / Wilson / net_f15 | last-30d n / wr / Wilson / net_f15 | paper fills all / 30d | stops |
+  |---|---|---|---|---|
+  | MSTR:call | 32 / .69 / .51 / +.093 | 18 / .61 / .39 / −.016 | 31 fills +$571 / 18 fills +$323 | 1 |
+  | SPCX:call | 21 / .76 / .55 / +.028 | 11 / .73 / .43 / +.285 | 20 fills +$26 / 10 fills +$291 | 5 |
+
+  Both clear the bar all-time and fail it on the 30-day window (MSTR cooling, SPCX was auto-muted for
+  most of September). **Judge on signals with bar_time ≥ 2026-10-07 only**, at ≥15 forward signals,
+  requiring: forward Wilson ≥ .45 and net_f15 > 0 (mean AND median); ≥8 fills at the 15-min hold
+  with positive total and no single fill above 50% of it; trailing-two-week net_f15 > 0 at judgement.
+  If the live account carries another pair at the time, remember the breaker is account-wide.
 
 Revisit either after ~10–15 forward signals with positive paper fills.
+
+**10/6 update:** AAPL:call morning passed its gate at n=15 (11W/1L/3F, Wilson .48; 15 fills +$1,852, 10 at the
+15-min hold +$1,225, 2 stops) — thin: median net_f15 −.013, one 9/30 fill = 52% of P&L, 15-min fills ex-9/30
+= +$1 on 8, AAPL +5.7% since registration, mirror AAPL:put 4/5/3. Owner activated it live the same evening
+via the new `@09:45-11:30` window gate (PR #35; GOING_LIVE.md). MSTR:call / SPCX:call pre-registered (above).
 
 **9/23 update:** AAPL:call forward 9 sig 8W/0L/1F, 9 fills +$919, 0 stops — but 6 of 8 wins in 9/1–9/3 and
 $627 of the P&L from 25-min legs; judgement extended to ≥15 forward signals with ≥8 fills at the 15-min hold

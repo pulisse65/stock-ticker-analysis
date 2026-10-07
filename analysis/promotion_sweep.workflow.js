@@ -60,8 +60,11 @@ PLATFORM FACTS YOU MUST RESPECT:
   record as the benchmark, split 7/9–8/21 (the 8/21 sweep saw 19W/2L/3F, wr 79%) vs 8/22–9/22.
 - PRE-REGISTERED on 2026-08-21 (judge these on signals AFTER the registration date — forward
   evidence is immune to the multiple-comparisons objection): purgatory:TSLA:put @09:45–10:30,
-  purgatory:QQQ:put Mon–Thu, and (registered 8/31) purgatory:AAPL:call @09:45–11:30. Report each
-  one's post-registration record explicitly (n, W/L/F, wilson_lo, net_f15, paper fills).
+  purgatory:QQQ:put Mon–Thu, (registered 8/31) purgatory:AAPL:call @09:45–11:30 — which passed its
+  15-signal gate on 10/6 and is the LIVE pair since 10/6 evening (window-gated; TSLA:call retired) —
+  and (registered 10/6, whole pairs) purgatory:MSTR:call and purgatory:SPCX:call, judged on bar_time
+  >= 2026-10-07 only. Report each one's post-registration record explicitly (n, W/L/F, wilson_lo,
+  net_f15 mean+median, paper fills at the 15-min hold, top-fill share).
 - Paper trader hold change 8/31: paper legs entered before 10:30 ET held 25 min (was 15); live
   held 15 everywhere. REVERTED to 15 on 2026-09-21 (PR #27) — the 9/22 session ran at 15 min; the
   9/21 sweep found the extra 10 min doubled morning stop-outs with no added underlying edge. Hold duration is derivable in orders_raw.json from entry_filled_at →
