@@ -3347,10 +3347,15 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
     if (ALPACA_PAPER and _live_trading_enabled()
             and (strategy, ticker, direction) in LIVE_TRADING_PAIRS):
         halt = _live_halt_status()
+        win_ok, win_why = _live_window_allows(strategy, ticker, direction, signal.get("bar_time"))
         if halt.get("halted"):
             log.warning("LIVE HALTED (%s) — skipping live entry for %s %s",
                         halt.get("reason"), ticker, direction)
             _notify_live_halt_once(halt)
+        elif not win_ok:
+            # Expected by design several times a day for a windowed pair —
+            # log only, no Slack. The paper leg above already took it.
+            log.info("LIVE skip (%s %s): %s", ticker, direction, win_why)
         elif not premium or premium <= 0:
             # Real money never trades at an unknown price; the paper leg
             # above already took the signal, so nothing is lost analytically.
@@ -4441,6 +4446,70 @@ def _parse_manual_disabled_pairs(raw: str) -> set[tuple[str, str, str]]:
     return out
 
 
+def _parse_live_pairs(raw: str) -> tuple[set[tuple[str, str, str]], dict[tuple[str, str, str], tuple[int, int]]]:
+    """Parse LIVE_TRADING_PAIRS. Each entry is 'strategy:TICKER:direction'
+    (or legacy 'TICKER:direction'), optionally followed by a time-of-day
+    window '@HH:MM-HH:MM' in ET, inclusive at both ends, e.g.
+    'purgatory:AAPL:call@09:45-11:30'. Returns (pairs, windows). A pair with
+    a malformed window is DROPPED (not traded all day) — real money fails
+    safe. Added 2026-10-06 so a pre-registered morning slice can go live
+    without trading the pair's afternoon record."""
+    pairs: set[tuple[str, str, str]] = set()
+    windows: dict[tuple[str, str, str], tuple[int, int]] = {}
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        spec, _, win = chunk.partition("@")
+        triples = _parse_manual_disabled_pairs(spec)
+        if len(triples) != 1:
+            if spec.strip():
+                log.warning("LIVE_TRADING_PAIRS: unparseable entry %r ignored", chunk)
+            continue
+        triple = next(iter(triples))
+        if win:
+            m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", win)
+            if not m:
+                log.warning("LIVE_TRADING_PAIRS: bad window in %r — pair dropped (fail safe)", chunk)
+                continue
+            h1, m1, h2, m2 = (int(x) for x in m.groups())
+            start, end = h1 * 60 + m1, h2 * 60 + m2
+            if not (0 <= start < end <= 24 * 60 and m1 < 60 and m2 < 60):
+                log.warning("LIVE_TRADING_PAIRS: inverted/invalid window in %r — pair dropped (fail safe)", chunk)
+                continue
+            windows[triple] = (start, end)
+        pairs.add(triple)
+    return pairs, windows
+
+
+def _fmt_window(w: tuple[int, int] | None) -> str | None:
+    if not w:
+        return None
+    return f"{w[0] // 60:02d}:{w[0] % 60:02d}-{w[1] // 60:02d}:{w[1] % 60:02d}"
+
+
+def _live_window_allows(strategy: str, ticker: str, direction: str,
+                        bar_time_iso: str | None) -> tuple[bool, str]:
+    """Time-of-day gate for the live leg. No window configured → allowed.
+    Otherwise the SIGNAL BAR time (ET) must fall inside the window,
+    inclusive at both ends — the same convention the promotion sweep and
+    the pre-registration used (minutes-since-midnight between start and
+    end). Unparseable bar time → not allowed (fail safe)."""
+    w = LIVE_TRADING_WINDOWS.get((strategy, ticker, direction))
+    if not w:
+        return True, "no window"
+    try:
+        bt = pd.Timestamp(bar_time_iso).tz_convert("America/New_York")
+        if pd.isna(bt):
+            raise ValueError("NaT")
+    except Exception:  # noqa: BLE001
+        return False, f"bar time {bar_time_iso!r} unparseable; window {_fmt_window(w)} not verifiable"
+    mins = bt.hour * 60 + bt.minute
+    if w[0] <= mins <= w[1]:
+        return True, f"bar {bt:%H:%M} ET inside window {_fmt_window(w)}"
+    return False, f"bar {bt:%H:%M} ET outside live window {_fmt_window(w)}"
+
+
 # Manually disabled pairs, on top of the automatic 30-day-record rule.
 # AVGO:call added 2026-07-08: -$363 on the day, 30d avg favorable -0.16%
 # (sits just above the -0.20% auto cutoff but has been a chronic drag).
@@ -4455,7 +4524,10 @@ PURGATORY_DISABLED_PAIRS = _parse_manual_disabled_pairs(
 # live is additive, scoped to exactly these triples, and inert while empty.
 # (Supersedes the short-lived TRADING_PAIRS_ALLOWLIST, which gated the single
 # shared client before the accounts were separated.)
-LIVE_TRADING_PAIRS = _parse_manual_disabled_pairs(
+# Optional per-pair time-of-day window: "purgatory:AAPL:call@09:45-11:30"
+# (ET, inclusive). Paper still trades the pair all day; only the live leg
+# is gated. See _parse_live_pairs / _live_window_allows and GOING_LIVE.md.
+LIVE_TRADING_PAIRS, LIVE_TRADING_WINDOWS = _parse_live_pairs(
     os.environ.get("LIVE_TRADING_PAIRS", "")
 )
 
@@ -7421,7 +7493,8 @@ def purgatory_status():
         "live_trading": {
             "keys_configured": _live_keys_present(),
             "active":          ALPACA_PAPER and _live_trading_enabled(),
-            "pairs":           [{"strategy": s, "ticker": t, "direction": d}
+            "pairs":           [{"strategy": s, "ticker": t, "direction": d,
+                                 "window": _fmt_window(LIVE_TRADING_WINDOWS.get((s, t, d)))}
                                 for s, t, d in sorted(LIVE_TRADING_PAIRS)],
             "notional_usd":    ALPACA_LIVE_NOTIONAL_USD,
             "max_trade_usd":   ALPACA_LIVE_MAX_TRADE_USD,
