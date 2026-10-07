@@ -464,6 +464,25 @@ resp = client.post("/purgatory/score-daily-predictions")
 check("force-score without Supabase -> 503", resp.status_code == 503, str(resp.status_code))
 main.EXTERNAL_SIGNAL_TOKEN, main._supabase_client = _saved_tok, _saved_sb
 
+# ---- live time-of-day window gate (2026-10-06) ----
+print("LIVE WINDOW:")
+pairs, wins = main._parse_live_pairs("purgatory:TSLA:call, AAPL:call@09:45-11:30 ,purgatory:MSTR:put@9:45-10:30")
+check("parser: legacy + windowed entries", pairs == {("purgatory","TSLA","call"),("purgatory","AAPL","call"),("purgatory","MSTR","put")} and wins == {("purgatory","AAPL","call"): (585, 690), ("purgatory","MSTR","put"): (585, 630)}, f"{pairs} {wins}")
+pairs, wins = main._parse_live_pairs("purgatory:AAPL:call@09:45-11:3x, purgatory:QQQ:put@11:30-09:45, purgatory:SMCI:call@25:00-26:00, purgatory:TSLA:put")
+check("parser: malformed / inverted / out-of-range windows DROP the pair (fail safe)", pairs == {("purgatory","TSLA","put")} and wins == {}, f"{pairs} {wins}")
+check("parser: empty -> inert", main._parse_live_pairs("") == (set(), {}))
+check("_fmt_window", main._fmt_window((585, 690)) == "09:45-11:30" and main._fmt_window(None) is None)
+_saved_w = main.LIVE_TRADING_WINDOWS
+main.LIVE_TRADING_WINDOWS = {("purgatory","AAPL","call"): (585, 690)}
+ok, why = main._live_window_allows("purgatory","AAPL","call","2026-10-06T14:19:00+00:00")   # 10:19 ET (EDT)
+check("gate: 10:19 ET inside 09:45-11:30", ok, why)
+check("gate: 09:45 and 11:30 boundaries inclusive", main._live_window_allows("purgatory","AAPL","call","2026-10-06T13:45:00+00:00")[0] and main._live_window_allows("purgatory","AAPL","call","2026-10-06T15:30:00+00:00")[0])
+check("gate: 09:44 and 11:31 outside", not main._live_window_allows("purgatory","AAPL","call","2026-10-06T13:44:00+00:00")[0] and not main._live_window_allows("purgatory","AAPL","call","2026-10-06T15:31:00+00:00")[0])
+check("gate: 14:41 ET (the 9/16 loss) outside", not main._live_window_allows("purgatory","AAPL","call","2026-09-16T18:41:00+00:00")[0])
+check("gate: unparseable bar time -> not allowed", not main._live_window_allows("purgatory","AAPL","call",None)[0] and not main._live_window_allows("purgatory","AAPL","call","garbage")[0])
+check("gate: pair without a window -> allowed", main._live_window_allows("purgatory","TSLA","call","garbage") == (True, "no window"))
+main.LIVE_TRADING_WINDOWS = _saved_w
+
 # ---- stop knob default (2026-10-03: 30 -> 15 per the stop-rule study) ----
 print("STOP KNOB:")
 check("ALPACA_TRADING_STOP_LOSS_PCT defaults to 15 (set via env to override)",

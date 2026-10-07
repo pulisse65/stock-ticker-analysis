@@ -33,7 +33,7 @@ advice — it's the plumbing, documented.
 | Var | Value | Note |
 | --- | --- | --- |
 | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_API_SECRET` | live keys | never paste in chat — straight into Render |
-| `LIVE_TRADING_PAIRS` | `purgatory:TSLA:call` | the ONLY pair that trades real money |
+| `LIVE_TRADING_PAIRS` | `purgatory:TSLA:call` or `purgatory:AAPL:call@09:45-11:30` | the ONLY pair(s) that trade real money; optional `@HH:MM-HH:MM` ET window gates the live leg by signal bar time (inclusive). A malformed window drops the pair — fail safe. |
 | `ALPACA_LIVE_NOTIONAL_USD` | your per-trade size | live sizing is its own knob; think in % of bankroll |
 | `ALPACA_LIVE_MAX_TRADE_USD` | optional, default 1.5× notional | hard cap per live trade — a pricier contract skips the live leg (Slack note); paper still trades it |
 | `SLACK_SIGNAL_SCOPE` | `live` (optional) | quiets paper/signals-only alerts; live entries/stops/exits still ping |
@@ -85,6 +85,28 @@ then set `LIVE_HALT_RESET_AT` to the current ISO timestamp (e.g.
 `2026-09-01T00:00:00Z`) so only trades after it count toward the breaker.
 
 - Emergency full stop remains: delete `LIVE_TRADING_PAIRS` and redeploy.
+
+## Time-of-day window (added 2026-10-06)
+
+`LIVE_TRADING_PAIRS` accepts `strategy:TICKER:direction@HH:MM-HH:MM` (ET, inclusive at
+both ends, judged on the signal's bar time — the same convention the promotion sweep uses).
+The paper account still trades the pair all day, so the outside-window record keeps
+accumulating as evidence; only the live leg is skipped (log line, no Slack).
+`GET /purgatory/status` → `live_trading.pairs[].window` shows what is in effect.
+
+Recipe for the pre-registered AAPL morning slice (it passed its 15-signal gate on 10/6 —
+read `analysis/results/` and the 10/6 judgement first; the pass rests on one fill and one
+up-month):
+
+1. `LIVE_TRADING_PAIRS` = `purgatory:AAPL:call@09:45-11:30` (replaces TSLA:call, which is
+   halted and auto-disabled).
+2. The breaker is account-wide and currently HALTED on the TSLA drawdown. Set
+   `LIVE_HALT_RESET_AT` to the current ISO timestamp so only trades after it count;
+   the three thresholds (−$150 cumulative, $300 give-back after 10 trades, last-10 avg
+   below −$25) then start fresh on AAPL fills.
+3. Stop is 15% (since 10/3). Hold is 15 min. Live notional/caps unchanged.
+4. Verify in `/purgatory/status`: `pairs[0].window == "09:45-11:30"`, `halt.halted == false`.
+
 - Friday caution: purgatory runs 49.1% on Fridays (n=55) vs 71.7% on
   Thursdays. If early live losers cluster on Fridays, that's the first
   lever.
