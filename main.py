@@ -6607,15 +6607,21 @@ def _bullseye_api_host() -> str | None:
         return None
 
 
-def _bullseye_api_get(path: str, timeout: float = 15, use: str = "token") -> tuple[int, Any]:
-    """One authenticated GET; returns (status_code, parsed JSON or text).
-    `use="secret"` sends BULLSEYE_API_SECRET as the header instead (to find
-    out which of the two values the author handed over is the real token)."""
+def _bullseye_api_headers() -> dict[str, str]:
+    """asset-tracking's trader auth (middleware/auth.go, Oct 2026): the API
+    key rides in `x-auth-token`, the secret in `x-secret-token`. A user token
+    (older scheme) is just `x-auth-token` alone — still works if no secret."""
+    h = {"x-auth-token": BULLSEYE_API_TOKEN, "Accept": "application/json"}
+    if BULLSEYE_API_SECRET:
+        h["x-secret-token"] = BULLSEYE_API_SECRET
+    return h
+
+
+def _bullseye_api_get(path: str, timeout: float = 15) -> tuple[int, Any]:
+    """One authenticated GET; returns (status_code, parsed JSON or text)."""
     if not _bullseye_api_configured():
         raise RuntimeError("Bullseye API not configured: set BULLSEYE_API_URL and BULLSEYE_API_TOKEN.")
-    header_val = BULLSEYE_API_SECRET if use == "secret" else BULLSEYE_API_TOKEN
-    r = requests.get(f"{BULLSEYE_API_URL}{path}", headers={"x-auth-token": header_val,
-                                                          "Accept": "application/json"}, timeout=timeout)
+    r = requests.get(f"{BULLSEYE_API_URL}{path}", headers=_bullseye_api_headers(), timeout=timeout)
     try:
         body = r.json()
     except ValueError:
@@ -6623,7 +6629,7 @@ def _bullseye_api_get(path: str, timeout: float = 15, use: str = "token") -> tup
     return r.status_code, body
 
 
-def _bullseye_api_probe(stock_id: int, use: str = "token") -> dict:
+def _bullseye_api_probe(stock_id: int) -> dict:
     """Fetch /api/predictions/{stock_id} and summarise without leaking
     anything secret. Safe to expose: the dashboard already shows these calls."""
     def _shape(v: str) -> dict:
@@ -6638,7 +6644,7 @@ def _bullseye_api_probe(stock_id: int, use: str = "token") -> dict:
         "secret_present": bool(BULLSEYE_API_SECRET),
         "token_shape": _shape(BULLSEYE_API_TOKEN),
         "secret_shape": _shape(BULLSEYE_API_SECRET),
-        "stock_id": int(stock_id), "use": use,
+        "stock_id": int(stock_id), "auth": "key+secret" if BULLSEYE_API_SECRET else "token",
         "ok": False, "status_code": None, "ticker": None,
         "n_predictions": 0, "latest": None, "error": None,
     }
@@ -6646,7 +6652,7 @@ def _bullseye_api_probe(stock_id: int, use: str = "token") -> dict:
         out["error"] = "not configured"
         return out
     try:
-        code, body = _bullseye_api_get(f"/api/predictions/{int(stock_id)}", use=use)
+        code, body = _bullseye_api_get(f"/api/predictions/{int(stock_id)}")
     except Exception as exc:  # noqa: BLE001
         out["error"] = f"{type(exc).__name__}: {exc}"[:200]
         return out
@@ -7130,10 +7136,10 @@ def purgatory_external_predictions_get(
 
 
 @app.get("/purgatory/bullseye-api/probe")
-def purgatory_bullseye_api_probe(stock_id: int = 7, use: str = "token"):
+def purgatory_bullseye_api_probe(stock_id: int = 7):
     """One authenticated read against the Bullseye/asset-tracking API.
-    Verifies the Render-side token without exposing it. use=token|secret."""
-    return _bullseye_api_probe(stock_id, use="secret" if use == "secret" else "token")
+    Verifies the Render-side key/secret without exposing them."""
+    return _bullseye_api_probe(stock_id)
 
 @app.get("/purgatory/signals")
 def purgatory_signals_get(limit: int = 50, strategy: str | None = None, offset: int = 0):
