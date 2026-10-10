@@ -669,11 +669,13 @@ def _fake_get(url, headers=None, timeout=None, **kw):
 _saved_req_get = main.requests.get; main.requests.get = _fake_get
 r = client.get("/purgatory/bullseye-api/probe?stock_id=9").json()
 check("probe ok parses ticker/latest", r["ok"] and r["ticker"] == "AAPL" and r["n_predictions"] == 2 and r["latest"]["forecast"] == "buy" and r["status_code"] == 200, str(r))
-check("probe sends x-auth-token, never echoes it", _seen["headers"]["x-auth-token"] == "hx7w" and "hx7w" not in str(r) and _seen["url"] == "https://example.test/api/predictions/9")
+check("probe sends key+secret headers, never echoes them", _seen["headers"]["x-auth-token"] == "hx7w" and _seen["headers"]["x-secret-token"] == "zq9v" and "hx7w" not in str(r) and r["auth"] == "key+secret" and _seen["url"] == "https://example.test/api/predictions/9")
 check("probe secret_present only", r["secret_present"] is True and "zq9v" not in str(r))
 check("probe shapes are metadata only", r["token_shape"] == {"len": 4, "hex": False, "quoted": False} and r["secret_shape"]["len"] == 4)
-r = client.get("/purgatory/bullseye-api/probe?stock_id=9&use=secret").json()
-check("probe use=secret sends the secret value", _seen["headers"]["x-auth-token"] == "zq9v" and r["use"] == "secret" and "zq9v" not in str(r))
+main.BULLSEYE_API_SECRET = ""
+r = client.get("/purgatory/bullseye-api/probe?stock_id=9").json()
+check("probe without secret sends token only", "x-secret-token" not in _seen["headers"] and r["auth"] == "token" and r["ok"])
+main.BULLSEYE_API_SECRET = "zq9v"
 r = client.get("/purgatory/bullseye-api/probe?stock_id=403").json()
 check("probe 403 reported", r["ok"] is False and r["status_code"] == 403 and "token rejected" in r["error"])
 r = client.get("/purgatory/bullseye-api/probe?stock_id=1").json()
