@@ -6580,6 +6580,88 @@ _daily_pred_last_run: dict[str, Any] = {"at": None, "scored": 0, "pending_due": 
 _FORECAST_NAMES = {0: "sell", 1: "hold", 2: "buy"}
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
+# ---- Bullseye pull-side API (asset-tracking Go server) -------------------
+# Added 2026-10-09. The author's asset-tracking server exposes the same
+# forecasts the Windows runner posts, behind a single `x-auth-token` header
+# (a per-user token; there is no request-side secret). Pulling from it lets
+# this service be the source of daily_predictions rows instead of the
+# Task-Scheduler box. Secrets live in env only and are never echoed: the
+# probe below reports host/status/ticker, nothing else.
+BULLSEYE_API_URL = os.environ.get("BULLSEYE_API_URL", "").strip().rstrip("/")
+BULLSEYE_API_TOKEN = os.environ.get("BULLSEYE_API_TOKEN", "").strip()
+BULLSEYE_API_SECRET = os.environ.get("BULLSEYE_API_SECRET", "").strip()   # presence only; unused by the API
+
+
+def _bullseye_api_configured() -> bool:
+    return bool(BULLSEYE_API_URL and BULLSEYE_API_TOKEN)
+
+
+def _bullseye_api_host() -> str | None:
+    if not BULLSEYE_API_URL:
+        return None
+    try:
+        from urllib.parse import urlparse
+        return urlparse(BULLSEYE_API_URL).netloc or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _bullseye_api_get(path: str, timeout: float = 15) -> tuple[int, Any]:
+    """One authenticated GET; returns (status_code, parsed JSON or text)."""
+    if not _bullseye_api_configured():
+        raise RuntimeError("Bullseye API not configured: set BULLSEYE_API_URL and BULLSEYE_API_TOKEN.")
+    r = requests.get(f"{BULLSEYE_API_URL}{path}", headers={"x-auth-token": BULLSEYE_API_TOKEN,
+                                                          "Accept": "application/json"}, timeout=timeout)
+    try:
+        body = r.json()
+    except ValueError:
+        body = (r.text or "")[:200]
+    return r.status_code, body
+
+
+def _bullseye_api_probe(stock_id: int) -> dict:
+    """Fetch /api/predictions/{stock_id} and summarise without leaking
+    anything secret. Safe to expose: the dashboard already shows these calls."""
+    out: dict[str, Any] = {
+        "configured": _bullseye_api_configured(),
+        "host": _bullseye_api_host(),
+        "secret_present": bool(BULLSEYE_API_SECRET),
+        "stock_id": int(stock_id),
+        "ok": False, "status_code": None, "ticker": None,
+        "n_predictions": 0, "latest": None, "error": None,
+    }
+    if not out["configured"]:
+        out["error"] = "not configured"
+        return out
+    try:
+        code, body = _bullseye_api_get(f"/api/predictions/{int(stock_id)}")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        return out
+    out["status_code"] = code
+    if code == 403:
+        out["error"] = "403 forbidden: token rejected"
+        return out
+    if code != 200 or not isinstance(body, dict):
+        out["error"] = f"unexpected response ({code})"
+        return out
+    data = body.get("data") or {}
+    stock = data.get("stock") or {}
+    preds = data.get("predictions") or []
+    out["ok"] = bool(body.get("success", True))
+    out["ticker"] = (stock.get("symbol") or stock.get("ticker") or stock.get("Symbol"))
+    out["n_predictions"] = len(preds)
+    if preds:
+        p0 = preds[0]
+        out["latest"] = {
+            "forecast":    _normalize_forecast(p0.get("forecast")),
+            "target_date": p0.get("target_date"),
+            "created_at":  p0.get("created_at"),
+        }
+    if not out["ticker"]:
+        out["stock_keys"] = sorted(stock.keys())[:12]   # helps map the id→ticker field name once
+    return out
+
 
 def _normalize_forecast(raw: Any) -> str | None:
     """Accept the int class (0/1/2) or a case-insensitive name; return
@@ -7033,6 +7115,13 @@ def purgatory_external_predictions_get(
         "ts":       _now_iso(),
     }
 
+
+
+@app.get("/purgatory/bullseye-api/probe")
+def purgatory_bullseye_api_probe(stock_id: int = 7):
+    """One authenticated read against the Bullseye/asset-tracking API.
+    Verifies the Render-side token without exposing it."""
+    return _bullseye_api_probe(stock_id)
 
 @app.get("/purgatory/signals")
 def purgatory_signals_get(limit: int = 50, strategy: str | None = None, offset: int = 0):
@@ -7509,6 +7598,7 @@ def purgatory_status():
             "buy_pct":       DAILY_PRED_BUY_PCT,
             "sell_pct":      DAILY_PRED_SELL_PCT,
             "last_score_run": _daily_pred_last_run,   # at / scored / pending_due of the most recent scorer pass
+            "api": {"configured": _bullseye_api_configured(), "host": _bullseye_api_host()},
         },
         "strategies":              _strategy_status_block(),
         "manual_disabled_pairs":   [{"strategy": s, "ticker": t, "direction": d}
