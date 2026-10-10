@@ -6667,7 +6667,9 @@ def _bullseye_api_probe(stock_id: int) -> dict:
     stock = data.get("stock") or {}
     preds = data.get("predictions") or []
     out["ok"] = bool(body.get("success", True))
-    out["ticker"] = (stock.get("symbol") or stock.get("ticker") or stock.get("Symbol"))
+    # asset-tracking's Stock serialises the symbol as `name` (long_name is the company).
+    out["ticker"] = (stock.get("name") or stock.get("symbol") or stock.get("ticker"))
+    out["long_name"] = stock.get("long_name")
     out["n_predictions"] = len(preds)
     if preds:
         p0 = preds[0]
