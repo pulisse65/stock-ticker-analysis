@@ -652,7 +652,7 @@ _saved_api = (main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_
 main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET = "", "", ""
 r = client.get("/purgatory/bullseye-api/probe").json()
 check("probe unconfigured", r["configured"] is False and r["ok"] is False and r["error"] == "not configured" and r["host"] is None)
-main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET = "https://example.test", "tok", "zq9v"
+main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET = "https://example.test", "hx7w", "zq9v"
 check("configured + host", main._bullseye_api_configured() and main._bullseye_api_host() == "example.test")
 _seen = {}
 class _FakeResp:
@@ -669,8 +669,10 @@ def _fake_get(url, headers=None, timeout=None, **kw):
 _saved_req_get = main.requests.get; main.requests.get = _fake_get
 r = client.get("/purgatory/bullseye-api/probe?stock_id=9").json()
 check("probe ok parses ticker/latest", r["ok"] and r["ticker"] == "AAPL" and r["n_predictions"] == 2 and r["latest"]["forecast"] == "buy" and r["status_code"] == 200, str(r))
-check("probe sends x-auth-token, never echoes it", _seen["headers"]["x-auth-token"] == "tok" and "tok" not in str(r) and _seen["url"] == "https://example.test/api/predictions/9")
+check("probe sends x-auth-token, never echoes it", _seen["headers"]["x-auth-token"] == "hx7w" and "hx7w" not in str(r) and _seen["url"] == "https://example.test/api/predictions/9")
 check("probe secret_present only", r["secret_present"] is True and "zq9v" not in str(r))
+r = client.get("/purgatory/bullseye-api/probe?stock_id=9&use=secret").json()
+check("probe use=secret sends the secret value", _seen["headers"]["x-auth-token"] == "zq9v" and r["use"] == "secret" and "zq9v" not in str(r))
 r = client.get("/purgatory/bullseye-api/probe?stock_id=403").json()
 check("probe 403 reported", r["ok"] is False and r["status_code"] == 403 and "token rejected" in r["error"])
 r = client.get("/purgatory/bullseye-api/probe?stock_id=1").json()
