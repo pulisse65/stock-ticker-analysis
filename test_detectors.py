@@ -646,5 +646,39 @@ resp = client.get("/purgatory/stop-study")
 check("stop-study without Supabase -> 503", resp.status_code == 503)
 main._supabase_client = _saved_sb3
 
+
+# ---------------- BULLSEYE API PROBE ----------------
+_saved_api = (main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET)
+main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET = "", "", ""
+r = client.get("/purgatory/bullseye-api/probe").json()
+check("probe unconfigured", r["configured"] is False and r["ok"] is False and r["error"] == "not configured" and r["host"] is None)
+main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET = "https://example.test", "tok", "zq9v"
+check("configured + host", main._bullseye_api_configured() and main._bullseye_api_host() == "example.test")
+_seen = {}
+class _FakeResp:
+    def __init__(self, code, body): self.status_code=code; self._b=body; self.text=str(body)
+    def json(self):
+        if isinstance(self._b, str): raise ValueError("not json")
+        return self._b
+def _fake_get(url, headers=None, timeout=None, **kw):
+    _seen["url"]=url; _seen["headers"]=headers
+    if url.endswith("/api/predictions/403"): return _FakeResp(403, "")
+    if url.endswith("/api/predictions/9"): return _FakeResp(200, {"success": True, "data": {"stock": {"symbol": "AAPL"},
+        "predictions": [{"forecast": 2, "target_date": "2026-10-16T00:00:00Z", "created_at": "2026-10-09T21:05:00Z"}, {"forecast": 1}]}})
+    return _FakeResp(500, "boom")
+_saved_req_get = main.requests.get; main.requests.get = _fake_get
+r = client.get("/purgatory/bullseye-api/probe?stock_id=9").json()
+check("probe ok parses ticker/latest", r["ok"] and r["ticker"] == "AAPL" and r["n_predictions"] == 2 and r["latest"]["forecast"] == "buy" and r["status_code"] == 200, str(r))
+check("probe sends x-auth-token, never echoes it", _seen["headers"]["x-auth-token"] == "tok" and "tok" not in str(r) and _seen["url"] == "https://example.test/api/predictions/9")
+check("probe secret_present only", r["secret_present"] is True and "zq9v" not in str(r))
+r = client.get("/purgatory/bullseye-api/probe?stock_id=403").json()
+check("probe 403 reported", r["ok"] is False and r["status_code"] == 403 and "token rejected" in r["error"])
+r = client.get("/purgatory/bullseye-api/probe?stock_id=1").json()
+check("probe non-200 reported", r["ok"] is False and r["status_code"] == 500 and "unexpected" in r["error"])
+main.requests.get = _saved_req_get
+st = client.get("/purgatory/status").json()
+check("status exposes api configured/host only", st["daily_predictions"]["api"] == {"configured": True, "host": "example.test"})
+main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET = _saved_api
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
