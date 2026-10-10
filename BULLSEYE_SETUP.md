@@ -186,3 +186,27 @@ Server-side knobs (Render env): `DAILY_PRED_BUY_PCT` (1.65),
 
 None of these are fixed here (the model is the author's); they're why the
 platform measures the model as shipped rather than as intended.
+
+## Pull-side API (added 2026-10-10)
+
+The author's asset-tracking server (`https://fi.konstantinos.rocks`) exposes
+`GET /api/predictions/{stock_id}` behind **trader auth**: API key in the
+`x-auth-token` header, secret in `x-secret-token` (see its
+`middleware/auth.go`). Render env:
+
+| var | value |
+|---|---|
+| `BULLSEYE_API_URL` | `https://fi.konstantinos.rocks` |
+| `BULLSEYE_API_KEY` (or `BULLSEYE_API_TOKEN`) | the 22-char key |
+| `BULLSEYE_API_SECRET` | the 44-char secret |
+
+Verify with `GET /purgatory/bullseye-api/probe?stock_id=7` — reports host,
+status, ticker, latest forecast; never echoes a secret.
+`/purgatory/status.daily_predictions.api` shows `{configured, host}`.
+
+**State at verification (2026-10-10):** auth OK (200). Only four stocks on
+his server carry predictions (ids 3 VOO, 7 SCHD, 21 VXUS, 113 CAT), all
+last written 2026-08-30. The daily 15-ticker forecasts still arrive only via
+the Windows runner posting to `/purgatory/external-predictions`, so the API
+is not yet a replacement source. Re-check if the author starts writing daily
+predictions into his own DB.
