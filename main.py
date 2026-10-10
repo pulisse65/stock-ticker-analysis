@@ -6679,7 +6679,10 @@ def _bullseye_api_probe(stock_id: int) -> dict:
             "created_at":  p0.get("created_at"),
         }
     if not out["ticker"]:
-        out["stock_keys"] = sorted(stock.keys())[:12]   # helps map the id→ticker field name once
+        # Public stock metadata only (no predictions, no auth) — enough to see
+        # where the symbol actually lives in this deployment's serialisation.
+        out["stock_raw"] = json.dumps({k: stock.get(k) for k in ("id", "name", "long_name", "url", "data")},
+                                      default=str)[:600]
     return out
 
 
