@@ -6588,7 +6588,8 @@ _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 # Task-Scheduler box. Secrets live in env only and are never echoed: the
 # probe below reports host/status/ticker, nothing else.
 BULLSEYE_API_URL = os.environ.get("BULLSEYE_API_URL", "").strip().rstrip("/")
-BULLSEYE_API_TOKEN = os.environ.get("BULLSEYE_API_TOKEN", "").strip()
+# Either name works: BULLSEYE_API_KEY was the name first suggested to the owner.
+BULLSEYE_API_TOKEN = (os.environ.get("BULLSEYE_API_TOKEN", "") or os.environ.get("BULLSEYE_API_KEY", "")).strip()
 BULLSEYE_API_SECRET = os.environ.get("BULLSEYE_API_SECRET", "").strip()   # presence only; unused by the API
 
 
