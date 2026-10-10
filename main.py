@@ -6626,10 +6626,18 @@ def _bullseye_api_get(path: str, timeout: float = 15, use: str = "token") -> tup
 def _bullseye_api_probe(stock_id: int, use: str = "token") -> dict:
     """Fetch /api/predictions/{stock_id} and summarise without leaking
     anything secret. Safe to expose: the dashboard already shows these calls."""
+    def _shape(v: str) -> dict:
+        # Non-secret metadata only: a valid asset-tracking token is the hex
+        # encoding of an AES-GCM blob, so length + hex-ness tells us whether
+        # the supplied value is even the right kind of thing.
+        return {"len": len(v), "hex": bool(v) and all(c in "0123456789abcdefABCDEF" for c in v),
+                "quoted": v[:1] in ("'", '"') or v[-1:] in ("'", '"')}
     out: dict[str, Any] = {
         "configured": _bullseye_api_configured(),
         "host": _bullseye_api_host(),
         "secret_present": bool(BULLSEYE_API_SECRET),
+        "token_shape": _shape(BULLSEYE_API_TOKEN),
+        "secret_shape": _shape(BULLSEYE_API_SECRET),
         "stock_id": int(stock_id), "use": use,
         "ok": False, "status_code": None, "ticker": None,
         "n_predictions": 0, "latest": None, "error": None,
