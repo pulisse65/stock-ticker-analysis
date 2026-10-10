@@ -663,12 +663,12 @@ class _FakeResp:
 def _fake_get(url, headers=None, timeout=None, **kw):
     _seen["url"]=url; _seen["headers"]=headers
     if url.endswith("/api/predictions/403"): return _FakeResp(403, "")
-    if url.endswith("/api/predictions/9"): return _FakeResp(200, {"success": True, "data": {"stock": {"symbol": "AAPL"},
+    if url.endswith("/api/predictions/9"): return _FakeResp(200, {"success": True, "data": {"stock": {"name": "AAPL", "long_name": "Apple Inc."},
         "predictions": [{"forecast": 2, "target_date": "2026-10-16T00:00:00Z", "created_at": "2026-10-09T21:05:00Z"}, {"forecast": 1}]}})
     return _FakeResp(500, "boom")
 _saved_req_get = main.requests.get; main.requests.get = _fake_get
 r = client.get("/purgatory/bullseye-api/probe?stock_id=9").json()
-check("probe ok parses ticker/latest", r["ok"] and r["ticker"] == "AAPL" and r["n_predictions"] == 2 and r["latest"]["forecast"] == "buy" and r["status_code"] == 200, str(r))
+check("probe ok parses ticker/latest", r["ok"] and r["ticker"] == "AAPL" and r["long_name"] == "Apple Inc." and r["n_predictions"] == 2 and r["latest"]["forecast"] == "buy" and r["status_code"] == 200, str(r))
 check("probe sends key+secret headers, never echoes them", _seen["headers"]["x-auth-token"] == "hx7w" and _seen["headers"]["x-secret-token"] == "zq9v" and "hx7w" not in str(r) and r["auth"] == "key+secret" and _seen["url"] == "https://example.test/api/predictions/9")
 check("probe secret_present only", r["secret_present"] is True and "zq9v" not in str(r))
 check("probe shapes are metadata only", r["token_shape"] == {"len": 4, "hex": False, "quoted": False} and r["secret_shape"]["len"] == 4)
