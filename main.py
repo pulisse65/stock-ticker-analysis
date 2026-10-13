@@ -3566,6 +3566,9 @@ def _sweep_pending_positions() -> int:
         if quote:
             raw["quote_at_submit"] = quote
         _persist_exit_row(entry, result, raw)
+        if quote:
+            _append_quote_sample(entry, quote)       # the hold-exit quote is the 15-min sample
+        _start_hold_study_tracking(entry, _safe_float(entry.get("fill_price")))
         n_closed += 1
         log.info("%s EXIT: %s %s %s x%s (status %s)",
                  "Paper" if paper else "LIVE",
@@ -3636,6 +3639,104 @@ def _estimate_stop_loss_from_underlying(entry: dict[str, Any],
 # ---------------------------------------------------------------------------
 _QUOTE_PATH_CAP = 60          # samples kept per entry (a 15-min hold at 4-min scans is ~5)
 _STOP_STUDY_THRESHOLDS: list[float | None] = [10, 15, 20, 25, 30, 40, 50, None]
+
+# ---- Hold-length study (shadow-tracked, no behaviour change) --------------
+# Added 2026-10-13. The hold is one fixed knob (ALPACA_TRADING_HOLD_MINUTES)
+# and the only evidence about longer holds is the reverted 8/31 paper
+# experiment plus underlying moves — never the option itself. So: after ANY
+# exit (hold or stop) keep quoting the contract until entry + HOLD_STUDY_MINUTES
+# (raw.hold_study.samples). The replay then prices exits at 15/20/25/30 min
+# on the same real quote path, with the current stop applied along it, so
+# every hold is judged on the same trade set. Live trading is untouched.
+HOLD_STUDY_MINUTES = int(os.environ.get("HOLD_STUDY_MINUTES", "30"))
+_HOLD_STUDY_HOLDS: list[int] = [15, 20, 25, 30]
+_HOLD_STUDY_TOLERANCE_S = 300      # a sample within ±5 min of the target counts as "the exit"
+
+
+def _start_hold_study_tracking(entry: dict, fill: float | None) -> None:
+    """Mark a just-closed entry so the sampler keeps quoting its contract
+    until entry + HOLD_STUDY_MINUTES. No-op if that moment has passed or
+    the row is already tracked."""
+    if _supabase_client is None or not entry.get("id") or HOLD_STUDY_MINUTES <= 0:
+        return
+    try:
+        ts = _parse_signal_ts(entry.get("submitted_at"))
+        if ts is None:
+            return
+        until = ts + timedelta(minutes=HOLD_STUDY_MINUTES)
+        if datetime.now(timezone.utc) >= until:
+            return
+        raw = dict(entry.get("raw") or {})
+        if isinstance(raw.get("hold_study"), dict):
+            return
+        raw["hold_study"] = {"until": until.isoformat(), "started_at": _now_iso(),
+                             "entry_fill": fill, "samples": [], "done": False}
+        entry["raw"] = raw
+        _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({"raw": raw}).eq("id", entry["id"]).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("hold-study start failed for %s: %s", entry.get("id"), exc)
+
+
+def _evaluate_hold_rules(trades: list[dict], holds: list[int] | None = None,
+                         stop_pct: float | None = None,
+                         tolerance_s: int = _HOLD_STUDY_TOLERANCE_S) -> dict[str, Any]:
+    """Pure. Each trade: {fill, qty, entry_t, path: [{t, mid}]}. For each hold
+    H the exit mid is the sample nearest entry+H (within tolerance); any
+    earlier sample sitting >= stop_pct below the fill stops the trade at
+    that mid first. A trade counts only when EVERY hold has an exit sample,
+    so all rows are scored on the same trades. P&L is mid-to-mid."""
+    holds = list(_HOLD_STUDY_HOLDS if holds is None else holds)
+    stop_pct = ALPACA_TRADING_STOP_LOSS_PCT if stop_pct is None else stop_pct
+    prepared = []
+    for t in trades:
+        fill = _safe_float(t.get("fill"))
+        t0 = _parse_signal_ts(t.get("entry_t"))
+        if not fill or fill <= 0 or t0 is None:
+            continue
+        samples: list[tuple[float, float]] = []
+        for smp in (t.get("path") or []):
+            ts = _parse_signal_ts(smp.get("t")); mid = _safe_float(smp.get("mid"))
+            if ts is None or mid is None:
+                continue
+            samples.append(((ts - t0).total_seconds(), mid))
+        samples.sort()
+        exits: dict[int, tuple[float, float]] = {}
+        for h in holds:
+            target = h * 60
+            cand = [x for x in samples if abs(x[0] - target) <= tolerance_s]
+            if not cand:
+                break
+            exits[h] = min(cand, key=lambda x: abs(x[0] - target))
+        if len(exits) != len(holds):
+            continue
+        prepared.append((fill, int(t.get("qty") or 1), samples, exits))
+    rules = []
+    for h in holds:
+        total = 0.0; stopped = 0; per: list[float] = []
+        for fill, qty, samples, exits in prepared:
+            ex_off, ex_mid = exits[h]
+            hit = None
+            if stop_pct and stop_pct > 0:
+                for off, mid in samples:
+                    if off > ex_off:
+                        break
+                    if (fill - mid) / fill * 100.0 >= stop_pct:
+                        hit = mid
+                        break
+            if hit is not None:
+                stopped += 1
+            pnl = ((hit if hit is not None else ex_mid) - fill) * 100 * qty
+            total += pnl; per.append(round(pnl, 2))
+        n = len(prepared); wins = sum(1 for v in per if v > 0)
+        srt = sorted(per)
+        rules.append({
+            "hold_min": h, "label": f"{h} min", "n": n, "stopped": stopped,
+            "pnl": round(total, 2), "avg": round(total / n, 2) if n else None,
+            "median": srt[len(srt) // 2] if srt else None,
+            "win_rate": round(wins / n, 3) if n else None,
+            "worst": srt[0] if srt else None, "best": srt[-1] if srt else None,
+        })
+    return {"n_trades": len(trades), "n_usable": len(prepared), "stop_pct": stop_pct, "rules": rules}
 
 
 def _push_sample(raw: dict | None, key: str, sample: dict, cap: int = _QUOTE_PATH_CAP) -> dict:
@@ -3710,31 +3811,49 @@ def _sample_shadow_paths() -> int:
         return 0
     now = datetime.now(timezone.utc)
     n = 0
+    quotes: dict[str, dict | None] = {}        # one quote per contract per pass
     for e in rows:
         raw = e.get("raw") or {}
         sh = raw.get("shadow")
-        if not isinstance(sh, dict) or sh.get("done") or not e.get("option_symbol"):
+        hs = raw.get("hold_study")
+        sh_active = isinstance(sh, dict) and not sh.get("done")
+        hs_active = isinstance(hs, dict) and not hs.get("done")
+        if not (sh_active or hs_active) or not e.get("option_symbol"):
             continue
-        until = _parse_signal_ts(sh.get("until"))
-        if until is None:
-            continue
-        q = _quote_snapshot(e["option_symbol"])
+        opt = e["option_symbol"]
+        if opt not in quotes:
+            quotes[opt] = _quote_snapshot(opt)
+        q = quotes[opt]
         if not q or q.get("mid") is None:
             continue
         sample = {"t": q.get("at") or _now_iso(), "mid": q.get("mid"), "bid": q.get("bid"), "ask": q.get("ask")}
-        sh = dict(sh)
-        sh["samples"] = (list(sh.get("samples") or []) + [sample])[-_QUOTE_PATH_CAP:]
-        if now >= until:
-            fill = _safe_float(e.get("fill_price")) or _safe_float(sh.get("entry_fill"))
-            qty = int(e.get("qty") or 1)
-            sh["hold_mid"] = q.get("mid")
-            sh["hold_pnl_est"] = round((float(q["mid"]) - fill) * 100 * qty, 2) if fill else None
-            sh["finalized_at"] = _now_iso()
-            sh["late_by_s"] = int((now - until).total_seconds())
-            sh["done"] = True
-        raw = {**raw, "shadow": sh}
+        new_raw = dict(raw)
+        if sh_active:
+            until = _parse_signal_ts(sh.get("until"))
+            if until is not None:
+                sh = dict(sh)
+                sh["samples"] = (list(sh.get("samples") or []) + [sample])[-_QUOTE_PATH_CAP:]
+                if now >= until:
+                    fill = _safe_float(e.get("fill_price")) or _safe_float(sh.get("entry_fill"))
+                    qty = int(e.get("qty") or 1)
+                    sh["hold_mid"] = q.get("mid")
+                    sh["hold_pnl_est"] = round((float(q["mid"]) - fill) * 100 * qty, 2) if fill else None
+                    sh["finalized_at"] = _now_iso()
+                    sh["late_by_s"] = int((now - until).total_seconds())
+                    sh["done"] = True
+                new_raw["shadow"] = sh
+        if hs_active:
+            until = _parse_signal_ts(hs.get("until"))
+            if until is not None:
+                hs = dict(hs)
+                hs["samples"] = (list(hs.get("samples") or []) + [sample])[-_QUOTE_PATH_CAP:]
+                if now >= until:
+                    hs["finalized_at"] = _now_iso()
+                    hs["late_by_s"] = int((now - until).total_seconds())
+                    hs["done"] = True
+                new_raw["hold_study"] = hs
         try:
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({"raw": raw}).eq("id", e["id"]).execute()
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE).update({"raw": new_raw}).eq("id", e["id"]).execute()
             n += 1
         except Exception as exc:  # noqa: BLE001
             log.debug("shadow update failed for %s: %s", e.get("id"), exc)
@@ -3874,6 +3993,102 @@ def _stop_study_payload(days: int = 30, account: str = "paper"):
     }
 
 
+@app.get("/purgatory/hold-study")
+def purgatory_hold_study(days: int = 30, account: str = "paper", strategy: str | None = None,
+                         ticker: str | None = None, direction: str | None = None,
+                         morning: int = 0, min_pair_n: int = 5):
+    return _cached_json(("dash", "hold-study", int(days), account, strategy, ticker, direction, int(morning), int(min_pair_n)),
+                        lambda: _hold_study_payload(days, account, strategy, ticker, direction, bool(morning), min_pair_n))
+
+
+def _hold_study_payload(days: int = 30, account: str = "paper", strategy: str | None = None,
+                        ticker: str | None = None, direction: str | None = None,
+                        morning: bool = False, min_pair_n: int = 5):
+    """Replay 15/20/25/30-minute holds (current stop applied) over the real
+    option quote paths: quote_path (during the hold) + shadow samples (after a
+    stop, to the hold deadline) + hold_study samples (after any exit, to
+    entry + HOLD_STUDY_MINUTES). `morning=1` keeps signals with bar_time in
+    the 09:45–11:30 ET live window. Per-pair rows for pairs with >= min_pair_n
+    usable trades."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Hold study requires Supabase.")
+    days = max(1, min(int(days), 365))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    paper_flag = account != "live"
+    try:
+        rows = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("*")
+            .gte("submitted_at", since)
+            .eq("paper", paper_flag)
+            .eq("role", "entry")
+            .order("submitted_at", desc=False)
+        ))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Hold-study query failed: {exc}") from exc
+    strategy = (strategy or "").strip().lower() or None
+    ticker = (ticker or "").strip().upper() or None
+    direction = (direction or "").strip().lower() or None
+    trades, pending, with_path = [], 0, 0
+    for e in rows:
+        st = e.get("strategy") or "purgatory"
+        if strategy and st != strategy:
+            continue
+        if ticker and e.get("signal_ticker") != ticker:
+            continue
+        if direction and e.get("signal_direction") != direction:
+            continue
+        if morning:
+            try:
+                bt = pd.Timestamp(e.get("signal_bar_time")).tz_convert("America/New_York")
+                if pd.isna(bt) or not (585 <= bt.hour * 60 + bt.minute <= 690):
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+        fill = _safe_float(e.get("fill_price"))
+        if fill is None:
+            continue
+        raw = e.get("raw") or {}
+        hs = raw.get("hold_study") or {}
+        if isinstance(hs, dict) and hs and not hs.get("done"):
+            pending += 1
+        path = list(raw.get("quote_path") or []) + list((raw.get("shadow") or {}).get("samples") or []) \
+            + list(hs.get("samples") or [])
+        if path:
+            with_path += 1
+        trades.append({
+            "pair": f"{st}:{e.get('signal_ticker')}:{e.get('signal_direction')}",
+            "fill": fill, "qty": int(e.get("qty") or 1), "entry_t": e.get("submitted_at"),
+            "path": [{"t": p.get("t"), "mid": p.get("mid")} for p in path],
+        })
+    study = _evaluate_hold_rules(trades)
+    by_pair: dict[str, list[dict]] = {}
+    for t in trades:
+        by_pair.setdefault(t["pair"], []).append(t)
+    pairs = []
+    for pair, ts in sorted(by_pair.items()):
+        ev = _evaluate_hold_rules(ts)
+        if ev["n_usable"] < max(1, int(min_pair_n)):
+            continue
+        pairs.append({"pair": pair, "n": ev["n_usable"],
+                      "pnl": {r["label"]: r["pnl"] for r in ev["rules"]},
+                      "stopped": {r["label"]: r["stopped"] for r in ev["rules"]},
+                      "worst": {r["label"]: r["worst"] for r in ev["rules"]}})
+    pairs.sort(key=lambda x: -x["n"])
+    return {
+        "days": days, "account": "paper" if paper_flag else "live",
+        "filters": {"strategy": strategy, "ticker": ticker, "direction": direction, "morning": morning},
+        "current_hold_minutes": ALPACA_TRADING_HOLD_MINUTES, "study_minutes": HOLD_STUDY_MINUTES,
+        "coverage": {"trades": len(trades), "with_path": with_path, "hold_study_pending": pending,
+                     "note": "exit mids are the sample nearest each hold (±5 min, one sample per scan); "
+                             "a trade counts only when every hold has one — rows share the same trade set; "
+                             "P&L is mid-to-mid (no execution drag)"},
+        "study": study,
+        "pairs": pairs,
+        "ts": _now_iso(),
+    }
+
+
 def _sweep_stop_losses() -> int:
     """Close any open entry whose option mid has dropped more than
     ALPACA_TRADING_STOP_LOSS_PCT below the entry fill price. Runs on every
@@ -3941,6 +4156,7 @@ def _sweep_stop_losses() -> int:
         if not result:
             continue
         _start_shadow_tracking(entry, fill, quote)
+        _start_hold_study_tracking(entry, fill)
         _persist_exit_row(entry, result, {"exit_reason": "stop_loss",
                                           "stop_basis": stop_basis,
                                           "loss_pct_at_trigger": round(loss_pct, 2),
@@ -7597,6 +7813,7 @@ def purgatory_status():
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
+        "hold_study":              {"minutes": HOLD_STUDY_MINUTES, "holds": _HOLD_STUDY_HOLDS},
         "paper_morning_hold": {
             "minutes":   PAPER_MORNING_HOLD_MINUTES,
             "cutoff_et": PAPER_MORNING_HOLD_CUTOFF_ET,

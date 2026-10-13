@@ -110,3 +110,5 @@ up-month):
 - Friday caution: purgatory runs 49.1% on Fridays (n=55) vs 71.7% on
   Thursdays. If early live losers cluster on Fridays, that's the first
   lever.
+
+**Hold-length study (2026-10-13):** after every exit the scanner keeps quoting the contract to entry+30 min; `GET /purgatory/hold-study` replays 15/20/25/30-minute holds on real option quotes. Decision rule and re-read date in `analysis/README.md`. The live hold stays 15 min until that rule is met.

@@ -685,5 +685,86 @@ st = client.get("/purgatory/status").json()
 check("status exposes api configured/host only", st["daily_predictions"]["api"] == {"configured": True, "host": "example.test"})
 main.BULLSEYE_API_URL, main.BULLSEYE_API_TOKEN, main.BULLSEYE_API_SECRET = _saved_api
 
+
+# ---------------- HOLD STUDY ----------------
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+def _iso(base, mins): return (base + _td(minutes=mins)).isoformat()
+_b = _dt(2026, 10, 13, 14, 20, tzinfo=_tz.utc)
+def _trade(fill, mids, qty=1, step=4):
+    return {"fill": fill, "qty": qty, "entry_t": _b.isoformat(),
+            "path": [{"t": _iso(_b, i * step), "mid": m} for i, m in enumerate(mids)]}
+# A: 1.00 -> rises steadily (samples every 4 min out to 32 min)
+A = _trade(1.00, [1.00, 1.05, 1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40])
+# B: 1.00 -> dips to -20% at 8 min (stop at 15%) then recovers to 1.30 by 30
+B = _trade(1.00, [1.00, 0.95, 0.80, 0.90, 1.00, 1.10, 1.20, 1.25, 1.30])
+# C: path ends at 16 min -> no sample near 25/30 -> unusable
+C = _trade(1.00, [1.00, 1.10, 1.20, 1.30, 1.40])
+ev = main._evaluate_hold_rules([A, B, C], stop_pct=15)
+check("hold study: C excluded (no late samples), same set for all rows", ev["n_trades"] == 3 and ev["n_usable"] == 2 and all(r["n"] == 2 for r in ev["rules"]))
+r = {x["hold_min"]: x for x in ev["rules"]}
+# A: exit mid nearest 15 min = sample at 16 (1.20) -> +20; 20 -> 1.25 (+25); 25 -> 24 min (1.30) +30; 30 -> 32 min? nearest of 28 (1.35) and 32 (1.40): 28 is 2 min off, 32 is 2 min off -> min() picks first (28) -> +35
+# B: stopped at 0.80 (-20) in every row
+check("hold study: A rises with the hold, B stops at 0.80 everywhere",
+      r[15]["pnl"] == 0.0 and r[20]["pnl"] == 5.0 and r[25]["pnl"] == 10.0 and r[30]["pnl"] == 15.0
+      and all(r[h]["stopped"] == 1 and r[h]["worst"] == -20.0 for h in (15, 20, 25, 30)), str(ev["rules"]))
+ev2 = main._evaluate_hold_rules([B], stop_pct=0)
+check("hold study: stop 0 disables the stop -> B exits at the hold mids", ev2["rules"][0]["stopped"] == 0 and ev2["rules"][-1]["pnl"] == 25.0)
+check("hold study: median/best/win_rate present", r[20]["median"] in (-20.0, 25.0) and r[20]["best"] == 25.0 and r[20]["win_rate"] == 0.5)
+ev3 = main._evaluate_hold_rules([{"fill": None, "qty": 1, "entry_t": _b.isoformat(), "path": []}])
+check("hold study: bad fill ignored", ev3["n_usable"] == 0 and ev3["rules"][0]["avg"] is None)
+
+class _UpdQ:
+    def __init__(self, sb): self.sb = sb; self.payload = None
+    def update(self, payload): self.payload = payload; return self
+    def eq(self, k, v): self.sb.updates.append((v, self.payload)); return self
+    def select(self, *a): return self
+    def gte(self, *a): return self
+    def order(self, *a, **k): return self
+    def execute(self):
+        class R: data = []
+        return R()
+class _UpdSB:
+    def __init__(self): self.updates = []
+    def table(self, name): return _UpdQ(self)
+_saved_sb4, _saved_hs = main._supabase_client, main.HOLD_STUDY_MINUTES
+main._supabase_client = _UpdSB(); main.HOLD_STUDY_MINUTES = 30
+_now = _dt.now(_tz.utc)
+e = {"id": 11, "submitted_at": (_now - _td(minutes=15)).isoformat(), "raw": {"quote_path": [{"mid": 1}]}}
+main._start_hold_study_tracking(e, 1.5)
+hs = e["raw"].get("hold_study")
+check("hold-study start: raw.hold_study set, quote_path kept, until = entry+30", isinstance(hs, dict) and hs["done"] is False and hs["entry_fill"] == 1.5 and e["raw"]["quote_path"] == [{"mid": 1}]
+      and abs((main._parse_signal_ts(hs["until"]) - (_now + _td(minutes=15))).total_seconds()) < 5 and main._supabase_client.updates[-1][0] == 11)
+n_before = len(main._supabase_client.updates)
+main._start_hold_study_tracking(e, 1.5)
+check("hold-study start: idempotent", len(main._supabase_client.updates) == n_before)
+e2 = {"id": 12, "submitted_at": (_now - _td(minutes=31)).isoformat(), "raw": {}}
+main._start_hold_study_tracking(e2, 1.0)
+check("hold-study start: no-op when entry+30 already passed", "hold_study" not in e2["raw"] and len(main._supabase_client.updates) == n_before)
+# sampler: one row with an active hold_study and a done shadow
+_saved_page, _saved_quote, _saved_en = main._page_all, main._quote_snapshot, main._alpaca_enabled
+rows = [{"id": 21, "option_symbol": "AAPL261017C00250000", "qty": 1, "fill_price": 1.0,
+         "raw": {"shadow": {"done": True, "samples": []},
+                 "hold_study": {"until": (_now + _td(minutes=10)).isoformat(), "samples": [], "done": False}}},
+        {"id": 22, "option_symbol": "AAPL261017C00250000", "qty": 1, "fill_price": 1.0,
+         "raw": {"hold_study": {"until": (_now - _td(seconds=30)).isoformat(), "samples": [{"mid": 1.1}], "done": False}}},
+        {"id": 23, "option_symbol": "MSFT261017C00500000", "qty": 1, "fill_price": 1.0, "raw": {"hold_study": {"done": True}}}]
+_qcalls = []
+main._page_all = lambda build, page_size=1000: rows
+main._quote_snapshot = lambda opt: _qcalls.append(opt) or {"mid": 1.2, "bid": 1.1, "ask": 1.3, "at": _now.isoformat()}
+main._alpaca_enabled = lambda: True
+main._supabase_client.updates.clear()
+n = main._sample_shadow_paths()
+ups = dict(main._supabase_client.updates)
+check("sampler: quotes each contract once per pass, skips done rows", _qcalls == ["AAPL261017C00250000"] and n == 2 and 23 not in ups)
+check("sampler: active hold_study gets a sample and stays open", ups[21]["raw"]["hold_study"]["samples"][0]["mid"] == 1.2 and ups[21]["raw"]["hold_study"]["done"] is False and ups[21]["raw"]["shadow"]["done"] is True)
+check("sampler: past-deadline hold_study finalizes", ups[22]["raw"]["hold_study"]["done"] is True and len(ups[22]["raw"]["hold_study"]["samples"]) == 2 and "finalized_at" in ups[22]["raw"]["hold_study"])
+main._page_all, main._quote_snapshot, main._alpaca_enabled = _saved_page, _saved_quote, _saved_en
+main._supabase_client = None
+resp = client.get("/purgatory/hold-study")
+check("hold-study without Supabase -> 503", resp.status_code == 503)
+main._supabase_client, main.HOLD_STUDY_MINUTES = _saved_sb4, _saved_hs
+st = client.get("/purgatory/status").json()
+check("status exposes hold_study knobs", st["hold_study"] == {"minutes": main.HOLD_STUDY_MINUTES, "holds": [15, 20, 25, 30]})
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
