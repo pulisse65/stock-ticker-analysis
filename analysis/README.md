@@ -231,3 +231,29 @@ ignores the tail risk a stop exists to cap — look at the *Worst* column, not j
 Decision rule: at least ~60 replayable trades (≈3 weeks) before comparing rules; prefer the rule with
 the best total that does not materially worsen the worst trade; retest the 25-min morning hold only
 once the stop rule is settled.
+
+## Hold-length study (added 2026-10-13, shadow-tracked)
+
+**Question.** The hold is one fixed knob (15 min, paper + live). Longer holds
+looked better on AAPL-call morning *underlying* moves (+0.13% at 15 → +0.30%
+at 30 min, n=15) but that gain sits entirely in the three hot weeks, and the
+8/31 25-min paper experiment doubled stop-outs. The option itself after the
+exit was never observed — until now.
+
+**Mechanism.** After ANY exit (hold or stop) the scan keeps quoting the
+contract until entry + `HOLD_STUDY_MINUTES` (30) → `raw.hold_study.samples`.
+`GET /purgatory/hold-study?days=30[&strategy=&ticker=&direction=&morning=1]`
+replays exits at 15/20/25/30 min on the merged real quote path
+(quote_path + shadow + hold_study), with the current 15% stop applied along
+it. Every row is scored on the same trade set (a trade counts only when each
+hold has a sample within ±5 min). Mid-to-mid, no drag. Per-pair rows at ≥5
+usable trades. Live behaviour unchanged.
+
+**Pre-registered decision rule.** Read at ≥60 usable paper trades platform-wide
+(≈2 weeks at the 10/12 volume) and, separately, at ≥15 usable
+`purgatory:AAPL:call` morning trades. Pick the hold with the best total that
+does not worsen `worst` by more than 25% versus the 15-min row **and** does
+not raise `stopped` by more than 50%. If no longer hold clears both, keep
+15. A change applies to paper first (`ALPACA_TRADING_HOLD_MINUTES`, one knob);
+live follows only after two further weeks of paper at the new hold with
+positive total. Re-read ≈ 2026-10-27.
