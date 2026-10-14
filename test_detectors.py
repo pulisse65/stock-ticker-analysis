@@ -494,6 +494,8 @@ print("MEM HYGIENE:")
 class _SlimQ:
     def __init__(self, sb): self.sb = sb; self.a = self.b = None; self.cols = None
     def select(self, cols): self.cols = cols; self.sb.selects.append(cols); return self
+    def gte(self, k, v): self.sb.bounds.append(("gte", k, v)); return self
+    def lt(self, k, v): self.sb.bounds.append(("lt", k, v)); return self
     def order(self, *a, **k): return self
     def range(self, a, b): self.a, self.b = a, b; return self
     def execute(self):
@@ -507,7 +509,7 @@ class _SlimQ:
             r.data = [{"id": 1, "role": "entry", "raw": {"quote_at_submit": {"mid": 1.05}, "quote_path": [1, 2, 3]}}]
         return r
 class _SlimSB:
-    def __init__(self, reject_slim=False): self.reject_slim = reject_slim; self.selects = []
+    def __init__(self, reject_slim=False): self.reject_slim = reject_slim; self.selects = []; self.bounds = []
     def table(self, name): return _SlimQ(self)
 _saved_sb, _saved_ok = main._supabase_client, main._slim_orders_ok
 main._slim_orders_ok = True; main._supabase_client = _SlimSB()
@@ -523,6 +525,9 @@ check("slim select rejected -> falls back to select(*) and latches off",
       and main._supabase_client.selects == [main._ORDER_ROW_COLUMNS, "*"], str(main._supabase_client.selects))
 rows = main._fetch_all_order_rows()
 check("latched: second call goes straight to select(*)", main._supabase_client.selects[-1] == "*" and len(main._supabase_client.selects) == 3)
+main._slim_orders_ok = True; main._supabase_client = _SlimSB()
+rows = main._fetch_all_order_rows("2026-10-14T00:00:00Z", "2026-10-15T00:00:00Z")
+check("bounded slim fetch applies gte/lt on submitted_at", main._supabase_client.bounds == [("gte", "submitted_at", "2026-10-14T00:00:00Z"), ("lt", "submitted_at", "2026-10-15T00:00:00Z")] and "raw->" in main._supabase_client.selects[-1] and rows[0]["raw"]["quote_at_submit"]["mid"] == 1.05)
 main._supabase_client, main._slim_orders_ok = _saved_sb, _saved_ok
 _calls = []
 v1 = main._cached_json(("dash", "test", 1), lambda: _calls.append(1) or {"n": len(_calls)}, ttl=60)

@@ -4275,29 +4275,38 @@ def _slim_order_row(r: dict) -> dict:
     return r
 
 
-def _fetch_all_order_rows() -> list[dict]:
-    """Every row of the orders table, oldest first (paged), with `raw`
-    reduced to the keys the matcher reads. Falls back to select('*') once
-    if the slim select is rejected (schema drift), and stays there."""
+def _fetch_all_order_rows(since: str | None = None, until: str | None = None) -> list[dict]:
+    """Rows of the orders table, oldest first (paged), with `raw` reduced to
+    the keys the matcher reads; `since`/`until` bound submitted_at
+    ([since, until) ISO strings). Falls back to select('*') once if the slim
+    select is rejected (schema drift), and stays there. Since 10/14 the
+    per-day summary uses this too: with quote_path + shadow + hold_study
+    samples on every entry, a select('*') day query timed out."""
     global _slim_orders_ok
     if _supabase_client is None:
         return []
+
+    def _bounded(q):
+        if since:
+            q = q.gte("submitted_at", since)
+        if until:
+            q = q.lt("submitted_at", until)
+        return q
+
     if _slim_orders_ok:
         try:
-            rows = _page_all(lambda: (
+            rows = _page_all(lambda: _bounded(
                 _supabase_client.table(_PURGATORY_ORDERS_TABLE)
                 .select(_ORDER_ROW_COLUMNS)
-                .order("submitted_at", desc=False)
-            ))
+            ).order("submitted_at", desc=False))
             return [_slim_order_row(r) for r in rows]
         except Exception as exc:  # noqa: BLE001
             _slim_orders_ok = False
             log.warning("Slim orders select failed (%s); falling back to select(*) for this process", exc)
-    return _page_all(lambda: (
+    return _page_all(lambda: _bounded(
         _supabase_client.table(_PURGATORY_ORDERS_TABLE)
         .select("*")
-        .order("submitted_at", desc=False)
-    ))
+    ).order("submitted_at", desc=False))
 
 
 def _match_order_rows(rows: list[dict]) -> list[dict]:
@@ -4427,14 +4436,7 @@ def _compute_daily_realized_pnl(date_str: str, account: str | None = None) -> di
         day = datetime.strptime(date_str, "%Y-%m-%d")
         start = day.strftime("%Y-%m-%dT00:00:00Z")
         end = (day + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
-        res = (
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("*")
-            .gte("submitted_at", start)
-            .lt("submitted_at", end)
-            .execute()
-        )
-        rows = res.data or []
+        rows = _fetch_all_order_rows(start, end)     # slim + paged (raw is heavy now)
     except Exception as exc:  # noqa: BLE001
         log.warning("P&L query failed: %s", exc)
         return None
