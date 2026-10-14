@@ -4275,6 +4275,17 @@ def _slim_order_row(r: dict) -> dict:
     return r
 
 
+def _looks_like_schema_rejection(exc: BaseException) -> bool:
+    """True only for errors that mean the `alias:raw->key` select itself is
+    invalid (PostgREST 400 / undefined column). Timeouts, 5xx and network
+    errors must NOT latch the slim path off — on 2026-10-14 a transient
+    error did exactly that and the per-day summary then timed out on
+    select('*') for the rest of the process."""
+    msg = str(exc).lower()
+    return any(k in msg for k in ("42703", "does not exist", "undefined column", "pgrst", "400", "bad request",
+                                  "could not find", "invalid", "parse"))
+
+
 def _fetch_all_order_rows(since: str | None = None, until: str | None = None) -> list[dict]:
     """Rows of the orders table, oldest first (paged), with `raw` reduced to
     the keys the matcher reads; `since`/`until` bound submitted_at
@@ -4301,8 +4312,10 @@ def _fetch_all_order_rows(since: str | None = None, until: str | None = None) ->
             ).order("submitted_at", desc=False))
             return [_slim_order_row(r) for r in rows]
         except Exception as exc:  # noqa: BLE001
+            if not _looks_like_schema_rejection(exc):
+                raise                      # transient (timeout, 5xx): don't poison the slim path
             _slim_orders_ok = False
-            log.warning("Slim orders select failed (%s); falling back to select(*) for this process", exc)
+            log.warning("Slim orders select rejected by schema (%s); falling back to select(*) for this process", exc)
     return _page_all(lambda: _bounded(
         _supabase_client.table(_PURGATORY_ORDERS_TABLE)
         .select("*")
