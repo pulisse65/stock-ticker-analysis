@@ -525,6 +525,22 @@ check("slim select rejected -> falls back to select(*) and latches off",
       and main._supabase_client.selects == [main._ORDER_ROW_COLUMNS, "*"], str(main._supabase_client.selects))
 rows = main._fetch_all_order_rows()
 check("latched: second call goes straight to select(*)", main._supabase_client.selects[-1] == "*" and len(main._supabase_client.selects) == 3)
+class _TimeoutSB(_SlimSB):
+    def table(self, name):
+        q = _SlimQ(self)
+        def _exec():
+            if "raw->" in q.cols: raise RuntimeError("HTTPSConnectionPool: Read timed out (read timeout=30)")
+            class R: data = [{"id": 1, "role": "entry", "raw": {}}]
+            return R()
+        q.execute = _exec
+        return q
+main._slim_orders_ok = True; main._supabase_client = _TimeoutSB()
+try:
+    main._fetch_all_order_rows(); _raised = False
+except RuntimeError:
+    _raised = True
+check("transient error on slim select propagates and does NOT latch", _raised and main._slim_orders_ok is True)
+check("_looks_like_schema_rejection: 400/42703 yes, timeout no", main._looks_like_schema_rejection(RuntimeError("400 column raw->x does not exist")) and main._looks_like_schema_rejection(RuntimeError('{"code":"42703"}')) and not main._looks_like_schema_rejection(RuntimeError("Read timed out")) and not main._looks_like_schema_rejection(RuntimeError("502 Bad Gateway")))
 main._slim_orders_ok = True; main._supabase_client = _SlimSB()
 rows = main._fetch_all_order_rows("2026-10-14T00:00:00Z", "2026-10-15T00:00:00Z")
 check("bounded slim fetch applies gte/lt on submitted_at", main._supabase_client.bounds == [("gte", "submitted_at", "2026-10-14T00:00:00Z"), ("lt", "submitted_at", "2026-10-15T00:00:00Z")] and "raw->" in main._supabase_client.selects[-1] and rows[0]["raw"]["quote_at_submit"]["mid"] == 1.05)
