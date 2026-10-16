@@ -210,3 +210,26 @@ last written 2026-08-30. The daily 15-ticker forecasts still arrive only via
 the Windows runner posting to `/purgatory/external-predictions`, so the API
 is not yet a replacement source. Re-check if the author starts writing daily
 predictions into his own DB.
+
+### 2026-10-15 outage: the 1000-row sweep cap (fixed PRs #48–#50)
+
+Signals stopped at 14:56 ET on 10/15. Cause chain: the sweep's "which
+entries are still open" read fetched *all* exit rows with a bare select,
+capped at PostgREST's 1000 rows. Paper trading three strategies (since 10/9)
+pushed the orders table past 1000 exits that afternoon → newest exits fell
+off → every recently closed entry looked open → each scan re-closed ~175
+positions (Alpaca 404 → synthetic `no_position` exit rows), ran ~3 min, and
+cron-job.org disabled the `Stock Cron` job after 25 timeouts.
+
+Fixes: both sweep reads paged + bounded to 3 days (#48); shadow sampler off
+the request path (#49); `POST /purgatory/scan` now acknowledges at once and
+runs the pass in a thread (#50) — `status.scan.last_duration_s` shows the
+real pass time, `?sync=1` runs in-line.
+
+**Recovery steps (account side):**
+1. cron-job.org → `Stock Cron` → re-enable. It should now get a sub-second 200.
+2. Delete the junk exit rows (count first, then delete), with the signal token
+   in your shell, never in chat:
+   `curl -s -X POST -H "X-Signal-Token: $EXTERNAL_SIGNAL_TOKEN" "https://tickertracker.dev/purgatory/admin/prune-synthetic-exits?days=7&dry_run=1"`
+   then the same with `dry_run=0`.
+3. Watch `/purgatory/status` → `last_scan_at` advancing and `scan.last_duration_s` < 60.
