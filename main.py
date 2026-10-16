@@ -3398,38 +3398,48 @@ def _safe_float(v: Any) -> float | None:
         return None
 
 
+_SWEEP_LOOKBACK_DAYS = 3     # an entry older than this with no exit is dead, not open
+
+
 def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
-    """Entries older than `min_age_minutes` that don't yet have a matching
-    exit row. Only returns entries that actually filled."""
+    """Entries older than `min_age_minutes` (and younger than
+    _SWEEP_LOOKBACK_DAYS) that don't yet have a matching exit row.
+
+    Both reads are PAGED and bounded. Until 2026-10-16 the exits read was a
+    bare select capped at PostgREST's 1000 rows: once the orders table held
+    >1000 exits (the afternoon of 10/15, after paper widened to three
+    strategies) recent exits fell off the end, every recently closed entry
+    looked open, and each scan re-"closed" ~175 positions (Alpaca 404 →
+    synthetic exit rows), ran ~3 min and got the cron job disabled."""
     if _supabase_client is None:
         return []
-    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=min_age_minutes)).isoformat()
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(minutes=min_age_minutes)).isoformat()
+    since = (now - timedelta(days=_SWEEP_LOOKBACK_DAYS)).isoformat()
     try:
-        entries_res = (
+        entries = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
             .select("*")
             .eq("role", "entry")
+            .gte("submitted_at", since)
             .lt("submitted_at", cutoff)
-            .execute()
-        )
-        entries = entries_res.data or []
+            .order("submitted_at", desc=False)
+        ))
         if not entries:
             return []
-        exits_res = (
+        exit_rows = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
             .select("strategy,signal_ticker,signal_direction,signal_bar_time,paper")
             .eq("role", "exit")
-            .execute()
-        )
+            .gte("submitted_at", since)
+            .order("submitted_at", desc=False)
+        ))
         # paper joins the key: the live and paper legs of one signal are
-        # separate positions and must open/close independently. It MUST be
-        # in the select above — without it every exit defaulted to paper,
-        # live entries never matched their exits, and the sweep re-closed
-        # (and re-Slacked) the same live position every scan pass.
+        # separate positions and must open/close independently.
         closed = {
             (r.get("strategy") or "purgatory", r["signal_ticker"], r["signal_direction"],
              r["signal_bar_time"], bool(r.get("paper", True)))
-            for r in (exits_res.data or [])
+            for r in exit_rows
         }
         return [
             e for e in entries
@@ -3439,6 +3449,70 @@ def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         log.warning("Sweep query failed: %s", exc)
         return []
+
+
+def _select_synthetic_exit_ids(exit_rows: list[dict]) -> list:
+    """Pure. Given exit rows (id, key fields, paper, alpaca_status,
+    fill_price, submitted_at), return ids of the duplicate exits written by
+    the re-close loop: for each (strategy, ticker, direction, bar_time,
+    paper) keep ONE row — the earliest with a fill_price, else the earliest
+    — and mark every other row whose alpaca_status is 'no_position'."""
+    groups: dict[tuple, list[dict]] = {}
+    for r in exit_rows:
+        k = (r.get("strategy") or "purgatory", r.get("signal_ticker"), r.get("signal_direction"),
+             r.get("signal_bar_time"), bool(r.get("paper", True)))
+        groups.setdefault(k, []).append(r)
+    doomed: list = []
+    for rows in groups.values():
+        if len(rows) < 2:
+            continue
+        rows = sorted(rows, key=lambda r: str(r.get("submitted_at") or ""))
+        keep = next((r for r in rows if r.get("fill_price") is not None), rows[0])
+        for r in rows:
+            if r is keep:
+                continue
+            if (r.get("alpaca_status") or "").lower() == "no_position":
+                doomed.append(r.get("id"))
+    return [d for d in doomed if d is not None]
+
+
+@app.post("/purgatory/admin/prune-synthetic-exits")
+def purgatory_prune_synthetic_exits(request: Request, days: int = 7, dry_run: int = 1):
+    """Delete the duplicate 'no_position' exit rows left by the 10/15–16
+    re-close loop. Token-gated (X-Signal-Token). dry_run=1 (default) only
+    counts; dry_run=0 deletes in batches of 100."""
+    if not EXTERNAL_SIGNAL_TOKEN:
+        raise HTTPException(503, "Admin endpoints disabled: set EXTERNAL_SIGNAL_TOKEN.")
+    supplied = request.headers.get("X-Signal-Token", "")
+    if not hmac.compare_digest(supplied, EXTERNAL_SIGNAL_TOKEN):
+        raise HTTPException(401, "Bad or missing X-Signal-Token header.")
+    if _supabase_client is None:
+        raise HTTPException(503, "Requires Supabase.")
+    days = max(1, min(int(days), 60))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        rows = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("id,strategy,signal_ticker,signal_direction,signal_bar_time,paper,alpaca_status,fill_price,submitted_at")
+            .eq("role", "exit")
+            .gte("submitted_at", since)
+            .order("submitted_at", desc=False)
+        ))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Query failed: {exc}") from exc
+    doomed = _select_synthetic_exit_ids(rows)
+    deleted = 0
+    if not dry_run:
+        for k in range(0, len(doomed), 100):
+            batch = doomed[k:k + 100]
+            try:
+                _supabase_client.table(_PURGATORY_ORDERS_TABLE).delete().in_("id", batch).execute()
+                deleted += len(batch)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Prune batch failed: %s", exc)
+                break
+    return {"days": days, "exit_rows_scanned": len(rows), "synthetic": len(doomed),
+            "dry_run": bool(dry_run), "deleted": deleted, "ts": _now_iso()}
 
 
 def _persist_exit_row(entry: dict, result: dict, raw: dict) -> None:

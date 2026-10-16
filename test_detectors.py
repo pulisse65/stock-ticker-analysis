@@ -787,5 +787,56 @@ main._supabase_client, main.HOLD_STUDY_MINUTES = _saved_sb4, _saved_hs
 st = client.get("/purgatory/status").json()
 check("status exposes hold_study knobs", st["hold_study"] == {"minutes": main.HOLD_STUDY_MINUTES, "holds": [15, 20, 25, 30]})
 
+
+# ---------------- SWEEP PAGING + SYNTHETIC EXIT PRUNE ----------------
+_K = dict(strategy="purgatory", signal_ticker="AAPL", signal_direction="call", signal_bar_time="2026-10-15T14:00:00+00:00", paper=True)
+ex = [dict(id=1, alpaca_status="filled", fill_price=1.2, submitted_at="2026-10-15T14:15:00Z", **_K),
+      dict(id=2, alpaca_status="no_position", fill_price=None, submitted_at="2026-10-15T14:19:00Z", **_K),
+      dict(id=3, alpaca_status="no_position", fill_price=None, submitted_at="2026-10-15T14:23:00Z", **_K),
+      dict(id=4, alpaca_status="no_position", fill_price=None, submitted_at="2026-10-15T15:00:00Z", **{**_K, "signal_bar_time": "2026-10-15T14:40:00+00:00"}),
+      dict(id=5, alpaca_status="no_position", fill_price=None, submitted_at="2026-10-15T15:04:00Z", **{**_K, "signal_bar_time": "2026-10-15T14:40:00+00:00"}),
+      dict(id=6, alpaca_status="filled", fill_price=0.9, submitted_at="2026-10-15T14:17:00Z", **{**_K, "paper": False})]
+d = main._select_synthetic_exit_ids(ex)
+check("prune: keeps the filled exit, drops no_position dupes; lone/first-of-kind kept; live leg separate", sorted(d) == [2, 3, 5], str(d))
+check("prune: single exits never selected", main._select_synthetic_exit_ids(ex[:1]) == [])
+
+class _PageQ:
+    def __init__(self, sb): self.sb = sb; self.role = None; self.filters = []
+    def select(self, cols): self.cols = cols; return self
+    def eq(self, k, v):
+        if k == "role": self.role = v
+        return self
+    def gte(self, k, v): self.filters.append(("gte", v)); return self
+    def lt(self, k, v): self.filters.append(("lt", v)); return self
+    def order(self, *a, **k): return self
+    def range(self, a, b): self.a, self.b = a, b; return self
+    def execute(self):
+        src = self.sb.entries if self.role == "entry" else self.sb.exits
+        self.sb.calls.append((self.role, self.a, self.b))
+        class R: pass
+        r = R(); r.data = src[self.a:self.b + 1]; return r
+class _PageSB:
+    def __init__(self, entries, exits): self.entries, self.exits, self.calls = entries, exits, []
+    def table(self, name): return _PageQ(self)
+_now_iso = (_dt.now(_tz.utc) - _td(minutes=40)).isoformat()
+ents = [dict(id=100 + i, role="entry", strategy="purgatory", signal_ticker=f"T{i}", signal_direction="call",
+             signal_bar_time=f"2026-10-16T14:{i % 60:02d}:00+00:00", paper=True, submitted_at=_now_iso) for i in range(3)]
+# 1500 exits: the first 1000 are unrelated, the LAST three close entries T0, T1 (so only T2 is open)
+exits = [dict(role="exit", strategy="purgatory", signal_ticker=f"X{i}", signal_direction="put", signal_bar_time="x", paper=True) for i in range(1498)]
+exits += [dict(role="exit", strategy="purgatory", signal_ticker="T0", signal_direction="call", signal_bar_time="2026-10-16T14:00:00+00:00", paper=True),
+          dict(role="exit", strategy="purgatory", signal_ticker="T1", signal_direction="call", signal_bar_time="2026-10-16T14:01:00+00:00", paper=True)]
+_saved_sb5 = main._supabase_client; main._supabase_client = _PageSB(ents, exits)
+open_e = main._fetch_open_entries_for_sweep(0)
+check("sweep: exits are paged past 1000 -> only the truly open entry remains", [e["signal_ticker"] for e in open_e] == ["T2"], str([e["signal_ticker"] for e in open_e]))
+check("sweep: exits read used 2 pages and a lookback bound", [c for c in main._supabase_client.calls if c[0] == "exit"] == [("exit", 0, 999), ("exit", 1000, 1999)])
+main._supabase_client = _saved_sb5
+_saved_tok2 = main.EXTERNAL_SIGNAL_TOKEN; main.EXTERNAL_SIGNAL_TOKEN = "t0k"
+resp = client.post("/purgatory/admin/prune-synthetic-exits")
+check("prune endpoint: 401 without token", resp.status_code == 401)
+main.EXTERNAL_SIGNAL_TOKEN = ""
+resp = client.post("/purgatory/admin/prune-synthetic-exits", headers={"X-Signal-Token": "t0k"})
+check("prune endpoint: 503 when admin token unset", resp.status_code == 503)
+main.EXTERNAL_SIGNAL_TOKEN = _saved_tok2
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
