@@ -855,5 +855,30 @@ check("async sampler: runs in a thread, skips while busy, runs again when free",
 main._sample_shadow_paths = _saved_sampler
 _time.sleep(0.05)
 
+
+# ---------------- ASYNC SCAN ENDPOINT ----------------
+_saved_pass, _saved_en2, _saved_async = main._run_scan_pass, main._alpaca_enabled, main.SCAN_ASYNC
+_sev = _th.Event(); _pruns = []
+def _slow_pass():
+    _pruns.append(1); _sev.wait(2.0); return {"scanned": 15, "duration_s": 0.1, "ts": "x"}
+main._run_scan_pass = _slow_pass; main._alpaca_enabled = lambda: True; main.SCAN_ASYNC = True
+r1 = client.post("/purgatory/scan").json(); _time.sleep(0.05)
+r2 = client.post("/purgatory/scan").json()
+check("scan async: first poke accepted, second skipped while running", r1["accepted"] is True and r1["running"] is True and r2["accepted"] is False and len(_pruns) == 1, f"{r1} {r2}")
+_sev.set(); _time.sleep(0.15)
+st = client.get("/purgatory/status").json()
+check("status.scan shows last duration after the pass", st["scan"]["running"] is False and st["scan"]["last_duration_s"] == 0.1 and st["scan"]["async"] is True, str(st["scan"]))
+r3 = client.post("/purgatory/scan").json()
+check("scan async: next poke carries the previous summary", r3["accepted"] is True and r3["last"]["scanned"] == 15)
+_sev.set(); _time.sleep(0.15)
+main._run_scan_pass = lambda: {"scanned": 3, "duration_s": 0.0, "ts": "y"}
+r4 = client.post("/purgatory/scan?sync=1").json()
+check("scan ?sync=1 runs in-line and returns the full result", r4 == {"scanned": 3, "duration_s": 0.0, "ts": "y"})
+main.SCAN_ASYNC = False
+check("SCAN_ASYNC=0 -> in-line", client.post("/purgatory/scan").json()["scanned"] == 3)
+main._alpaca_enabled = lambda: False
+check("scan without Alpaca keys -> 503", client.post("/purgatory/scan").status_code == 503)
+main._run_scan_pass, main._alpaca_enabled, main.SCAN_ASYNC = _saved_pass, _saved_en2, _saved_async
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
