@@ -998,6 +998,10 @@ def _cache_set(key: tuple, value: Any, ttl: int) -> None:
 _RSS_RING: "collections.deque[tuple[int, float]]" = collections.deque(maxlen=2016)   # ~7 days @ 5 min
 _last_trim_at = 0.0
 _DASH_CACHE_TTL_S = int(os.environ.get("DASH_CACHE_TTL_S", "60"))
+# The two shadow studies read 30 days of heavy `raw` (quote paths); a lone
+# dashboard viewer polling every 60 s recomputed them each time and pushed
+# RSS to ~450 MB on 10/16. They change slowly — cache them for 10 min.
+_STUDY_CACHE_TTL_S = int(os.environ.get("STUDY_CACHE_TTL_S", "600"))
 
 
 def _mem_probe(trim_every_s: float = 240) -> float | None:
@@ -1029,12 +1033,14 @@ def _mem_report() -> dict:
         "alerted_keys": len(_purgatory_alerted),
         "signals_mem": len(_purgatory_signals),
         "live_objects": len(objs),
+        "threads": threading.active_count(),
         "gc_counts": gc.get_count(),
         "top_types": top,
         "last_trim_at": int(_last_trim_at) or None,
         "slim_orders": _slim_orders_ok,
         "malloc_arena_max": os.environ.get("MALLOC_ARENA_MAX"),
         "dash_cache_ttl_s": _DASH_CACHE_TTL_S,
+        "study_cache_ttl_s": _STUDY_CACHE_TTL_S,
     }
 
 
@@ -3711,7 +3717,7 @@ def _estimate_stop_loss_from_underlying(entry: dict[str, Any],
 # so tighter thresholds are evaluated on a coarse path — stated in the
 # endpoint output. Live trading behaviour is untouched.
 # ---------------------------------------------------------------------------
-_QUOTE_PATH_CAP = 60          # samples kept per entry (a 15-min hold at 4-min scans is ~5)
+_QUOTE_PATH_CAP = 45          # samples kept per entry per key (1-min cron: a 30-min window is ~30). Samples are {t, mid} only since 10/16 — bid/ask doubled raw size and no reader used them.
 _STOP_STUDY_THRESHOLDS: list[float | None] = [10, 15, 20, 25, 30, 40, 50, None]
 
 # ---- Hold-length study (shadow-tracked, no behaviour change) --------------
@@ -3834,8 +3840,7 @@ def _append_quote_sample(entry: dict, quote: dict) -> None:
     if _supabase_client is None or not entry.get("id"):
         return
     try:
-        sample = {"t": quote.get("at") or _now_iso(), "mid": quote.get("mid"),
-                  "bid": quote.get("bid"), "ask": quote.get("ask")}
+        sample = {"t": quote.get("at") or _now_iso(), "mid": quote.get("mid")}
         raw = _push_sample(entry.get("raw"), "quote_path", sample)
         if "hold_deadline" not in raw:
             dl = _hold_deadline_for_entry(entry)
@@ -3900,7 +3905,7 @@ def _sample_shadow_paths() -> int:
         q = quotes[opt]
         if not q or q.get("mid") is None:
             continue
-        sample = {"t": q.get("at") or _now_iso(), "mid": q.get("mid"), "bid": q.get("bid"), "ask": q.get("ask")}
+        sample = {"t": q.get("at") or _now_iso(), "mid": q.get("mid")}
         new_raw = dict(raw)
         if sh_active:
             until = _parse_signal_ts(sh.get("until"))
@@ -4013,7 +4018,8 @@ def _evaluate_stop_rules(trades: list[dict], thresholds: list[float | None] | No
 
 @app.get("/purgatory/stop-study")
 def purgatory_stop_study(days: int = 30, account: str = "paper"):
-    return _cached_json(("dash", "stop-study", int(days), account), lambda: _stop_study_payload(days, account))
+    return _cached_json(("dash", "stop-study", int(days), account), lambda: _stop_study_payload(days, account),
+                        ttl=_STUDY_CACHE_TTL_S)
 
 
 def _stop_study_payload(days: int = 30, account: str = "paper"):
@@ -4030,7 +4036,7 @@ def _stop_study_payload(days: int = 30, account: str = "paper"):
     try:
         rows = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("*")
+            .select("id, strategy, signal_ticker, signal_direction, signal_bar_time, paper, role, qty, fill_price, submitted_at, raw")
             .gte("submitted_at", since)
             .eq("paper", paper_flag)
             .order("submitted_at", desc=False)
@@ -4094,7 +4100,8 @@ def purgatory_hold_study(days: int = 30, account: str = "paper", strategy: str |
                          ticker: str | None = None, direction: str | None = None,
                          morning: int = 0, min_pair_n: int = 5):
     return _cached_json(("dash", "hold-study", int(days), account, strategy, ticker, direction, int(morning), int(min_pair_n)),
-                        lambda: _hold_study_payload(days, account, strategy, ticker, direction, bool(morning), min_pair_n))
+                        lambda: _hold_study_payload(days, account, strategy, ticker, direction, bool(morning), min_pair_n),
+                        ttl=_STUDY_CACHE_TTL_S)
 
 
 def _hold_study_payload(days: int = 30, account: str = "paper", strategy: str | None = None,
@@ -4114,7 +4121,7 @@ def _hold_study_payload(days: int = 30, account: str = "paper", strategy: str | 
     try:
         rows = _page_all(lambda: (
             _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("*")
+            .select("id, strategy, signal_ticker, signal_direction, signal_bar_time, paper, role, qty, fill_price, submitted_at, raw")
             .gte("submitted_at", since)
             .eq("paper", paper_flag)
             .eq("role", "entry")
