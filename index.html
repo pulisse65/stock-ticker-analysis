@@ -3551,14 +3551,23 @@ function _lbSpark(vals) {
   const cls = last >= 0.6 ? "tone-bullish-text" : (last <= 0.4 ? "tone-bearish-text" : "text-ink-dim");
   return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="${cls}" aria-hidden="true"><line x1="0" y1="${h / 2}" x2="${w}" y2="${h / 2}" stroke="currentColor" stroke-opacity="0.15" stroke-dasharray="2 2"/><polyline points="${pts}" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>`;
 }
+let _lbSeq = 0;
 async function refreshLeaderboard() {
   const el = document.getElementById("lb-table");
   const days = document.getElementById("lb-days").value;
   const minn = document.getElementById("lb-minn").value;
+  // The leaderboard query takes several seconds; say so, and drop any
+  // response that arrives after a newer request was issued (changing N or
+  // the window twice in a row used to let the older answer win the race).
+  const seq = ++_lbSeq;
+  if (!_lbData) el.innerHTML = `<span class="text-ink-faint">Loading leaderboard…</span>`;
+  document.getElementById("lb-meta").textContent = "loading…";
   try {
     const r = await fetch(`/purgatory/leaderboard?days=${days}&min_n=${minn}`);
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
-    _lbData = await r.json();
+    const data = await r.json();
+    if (seq !== _lbSeq) return;          // stale: a newer request is in flight
+    _lbData = data;
     // Every known strategy is selectable, not only those with pairs at the
     // current N floor — otherwise a young strategy (PD-LVL at N ≥ 10) never
     // appears in the list and looks unfilterable. Picking one with no pairs
