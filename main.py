@@ -6078,7 +6078,7 @@ def purgatory_pnl(account: str | None = None):
             "all_time":   _rollup(None),
         },
         "total_trades": len(trades),
-        "paper":        ALPACA_PAPER,
+        "account":      account if account in ("live", "paper") else "all",
         "ts":           _now_iso(),
     }
 
