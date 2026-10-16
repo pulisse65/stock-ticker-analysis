@@ -880,5 +880,17 @@ main._alpaca_enabled = lambda: False
 check("scan without Alpaca keys -> 503", client.post("/purgatory/scan").status_code == 503)
 main._run_scan_pass, main._alpaca_enabled, main.SCAN_ASYNC = _saved_pass, _saved_en2, _saved_async
 
+
+# ---------------- MEM DIET ----------------
+_saved_sb6 = main._supabase_client; main._supabase_client = _UpdSB()
+e = {"id": 31, "submitted_at": _dt.now(_tz.utc).isoformat(), "raw": {}}
+main._append_quote_sample(e, {"at": "2026-10-16T15:00:00Z", "mid": 1.25, "bid": 1.2, "ask": 1.3})
+check("quote samples carry t + mid only", e["raw"]["quote_path"] == [{"t": "2026-10-16T15:00:00Z", "mid": 1.25}] and "hold_deadline" in e["raw"])
+main._supabase_client = _saved_sb6
+r = client.get("/healthz?mem=1").json()
+check("healthz mem reports thread count", isinstance(r["mem"].get("threads"), int) and r["mem"]["threads"] >= 1)
+check("quote path cap lowered", main._QUOTE_PATH_CAP == 45)
+check("study cache ttl default 600 and reported", main._STUDY_CACHE_TTL_S == 600 and r["mem"]["study_cache_ttl_s"] == 600)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

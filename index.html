@@ -3559,9 +3559,14 @@ async function refreshLeaderboard() {
     const r = await fetch(`/purgatory/leaderboard?days=${days}&min_n=${minn}`);
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
     _lbData = await r.json();
+    // Every known strategy is selectable, not only those with pairs at the
+    // current N floor — otherwise a young strategy (PD-LVL at N ≥ 10) never
+    // appears in the list and looks unfilterable. Picking one with no pairs
+    // at this floor shows "No pairs match" rather than hiding the option.
     const stratSel = document.getElementById("lb-strategy");
     const have = new Set([...stratSel.options].map(o => o.value));
-    [...new Set(_lbData.rows.map(x => x.strategy))].sort().forEach(k => {
+    const known = new Set([...Object.keys(STRATEGY_LABELS), ..._lbData.rows.map(x => x.strategy)]);
+    [...known].sort().forEach(k => {
       if (!have.has(k)) { const o = document.createElement("option"); o.value = k; o.textContent = STRATEGY_LABELS[k] || k; stratSel.appendChild(o); }
     });
     renderLeaderboard();
