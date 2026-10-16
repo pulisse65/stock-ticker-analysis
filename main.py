@@ -6601,13 +6601,49 @@ def _fire_signal(sig: dict[str, Any]) -> bool:
     return True
 
 
+# Scan execution model (changed 2026-10-16). A scan pass now takes ~30 s
+# (three paper strategies, quote paths on every open position, two shadow
+# studies) — right at cron-job.org's 30 s request timeout, which counts a
+# slow 200 as a failure and disables the job after 25 of them (9/11 and
+# 10/15 outages). So the endpoint acknowledges immediately and runs the
+# pass in a daemon thread; a pass still running makes the next poke a no-op.
+# ?sync=1 (or SCAN_ASYNC=0) keeps the old in-line behaviour for manual runs.
+SCAN_ASYNC = os.environ.get("SCAN_ASYNC", "1").strip().lower() not in ("0", "false", "no")
+_scan_lock = threading.Lock()
+_last_scan_result: dict[str, Any] | None = None
+
+
 @app.post("/purgatory/scan")
-def purgatory_scan():
-    """Run one scan pass for every watched ticker, then back-fill outcomes
-    on any matured signals. Called by external cron every 1-4 min during
-    market hours."""
+def purgatory_scan(sync: int = 0):
+    """Poke the scanner. Default: start one pass in the background and return
+    at once (`accepted`, `running`, `last` = previous pass summary). With
+    ?sync=1 run the pass in-line and return its full result."""
     if not _alpaca_enabled():
         raise HTTPException(503, "Purgatory scan requires ALPACA_API_KEY and ALPACA_API_SECRET env vars.")
+    if sync or not SCAN_ASYNC:
+        return _run_scan_pass()
+    if not _scan_lock.acquire(blocking=False):
+        return {"accepted": False, "running": True, "last": _last_scan_result, "ts": _now_iso()}
+
+    def _go():
+        global _last_scan_result
+        try:
+            _last_scan_result = _run_scan_pass()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Scan pass failed: %s", exc)
+            _last_scan_result = {"error": f"{type(exc).__name__}: {exc}"[:200], "ts": _now_iso()}
+        finally:
+            _scan_lock.release()
+
+    threading.Thread(target=_go, name="scan-pass", daemon=True).start()
+    return {"accepted": True, "running": True, "last": _last_scan_result, "ts": _now_iso()}
+
+
+def _run_scan_pass() -> dict[str, Any]:
+    """One scan pass for every watched ticker, then back-fill outcomes on
+    matured signals, sweep positions, run the studies. Returns the summary
+    (with duration_s)."""
+    t_start = time.monotonic()
 
     # Heartbeat for the UI: lets the Alerts tab show "scanner alive, last
     # scan Xs ago" instead of leaving cron health a guessing game.
@@ -6765,6 +6801,7 @@ def purgatory_scan():
         "retro_fired":     retro_fired,
         "weekly_retro_fired": weekly_fired,
         "rss_mb":          rss,
+        "duration_s":      round(time.monotonic() - t_start, 1),
         "ts":              _now_iso(),
     }
 
@@ -7964,6 +8001,9 @@ def purgatory_status():
                                     for s, t, d in disabled],
         "supabase_signals":        _supabase_client is not None,
         "last_scan_at":            _last_scan_at,
+        "scan":                    {"async": SCAN_ASYNC, "running": _scan_lock.locked(),
+                                    "last_duration_s": (_last_scan_result or {}).get("duration_s"),
+                                    "last_error": (_last_scan_result or {}).get("error")},
         "ts":                      _now_iso(),
     }
 
