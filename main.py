@@ -3934,6 +3934,28 @@ def _sample_shadow_paths() -> int:
     return n
 
 
+_sampler_lock = threading.Lock()
+
+
+def _run_shadow_sampler_async() -> bool:
+    """Start _sample_shadow_paths in a daemon thread; False if one is still
+    running (that pass is skipped — the next scan picks the samples up)."""
+    if not _sampler_lock.acquire(blocking=False):
+        log.info("Shadow sampler still running from the previous pass; skipping this one")
+        return False
+
+    def _go():
+        try:
+            _sample_shadow_paths()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Shadow sampler failed: %s", exc)
+        finally:
+            _sampler_lock.release()
+
+    threading.Thread(target=_go, name="shadow-sampler", daemon=True).start()
+    return True
+
+
 def _evaluate_stop_rules(trades: list[dict], thresholds: list[float | None] | None = None) -> dict[str, Any]:
     """Pure. Each trade: {fill, qty, actual_pnl, exit_reason, path: [{t, mid}],
     hold_mid}. `path` is the quote path from entry to the hold deadline
@@ -6688,10 +6710,11 @@ def purgatory_scan():
         n_closed += _sweep_pending_positions()
     except Exception as exc:  # noqa: BLE001
         log.warning("Auto-trade sweep failed: %s", exc)
-    try:
-        _sample_shadow_paths()               # stop-rule study: quote stopped contracts to their hold deadline
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Shadow sampler failed: %s", exc)
+    # Stop-rule + hold-length studies: quote closed contracts off the request
+    # path. Since 10/16 this runs in a daemon thread — in-line it pushed the
+    # scan to ~33 s against cron-job.org's 30 s limit. Skips if the previous
+    # pass is still sampling, so threads never pile up.
+    _run_shadow_sampler_async()
 
     # Re-check the live circuit breaker when order state changed this pass,
     # so a breach alerts within one scan of the closing trade instead of

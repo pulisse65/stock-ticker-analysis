@@ -838,5 +838,22 @@ resp = client.post("/purgatory/admin/prune-synthetic-exits", headers={"X-Signal-
 check("prune endpoint: 503 when admin token unset", resp.status_code == 503)
 main.EXTERNAL_SIGNAL_TOKEN = _saved_tok2
 
+
+# ---------------- ASYNC SAMPLER ----------------
+import threading as _th, time as _time
+_ev = _th.Event(); _ran = []
+_saved_sampler = main._sample_shadow_paths
+def _slow_sampler():
+    _ran.append(1); _ev.wait(2.0); return 0
+main._sample_shadow_paths = _slow_sampler
+first = main._run_shadow_sampler_async()
+_time.sleep(0.05)
+second = main._run_shadow_sampler_async()
+_ev.set(); _time.sleep(0.1)
+third = main._run_shadow_sampler_async(); _time.sleep(0.1)
+check("async sampler: runs in a thread, skips while busy, runs again when free", first is True and second is False and third is True and len(_ran) == 2, f"{first} {second} {third} {_ran}")
+main._sample_shadow_paths = _saved_sampler
+_time.sleep(0.05)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
