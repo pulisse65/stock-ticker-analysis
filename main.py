@@ -4026,6 +4026,27 @@ def purgatory_stop_study(days: int = 30, account: str = "paper", strategy: str |
                         ttl=_STUDY_CACHE_TTL_S)
 
 
+_STOP_STUDY_DEADLINE_SLACK_S = 90   # one scan of slack past the deadline
+
+
+def _cap_path_at_deadline(path: list[dict], deadline) -> list[dict]:
+    """Drop quote samples taken after the hold deadline (+ one scan of slack).
+    `deadline` may be an ISO string or a datetime; unknown deadline keeps
+    the path as is. Samples without a parseable `t` are dropped too."""
+    if not path or deadline is None:
+        return path
+    dl = _parse_signal_ts(deadline) if isinstance(deadline, str) else deadline
+    if dl is None:
+        return path
+    limit = dl + timedelta(seconds=_STOP_STUDY_DEADLINE_SLACK_S)
+    out = []
+    for smp in path:
+        ts = _parse_signal_ts(smp.get("t")) if smp.get("t") else None
+        if ts is not None and ts <= limit:
+            out.append(smp)
+    return out
+
+
 def _stop_study_trade_detail(t: dict, stop_pct: float) -> dict:
     """One audit row per replayed trade: the lowest mid on its path, where
     the current stop rule would have fired in the replay, and what really
@@ -4116,6 +4137,12 @@ def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | 
         if path:
             tracked += 1
         path += list(sh.get("samples") or [])
+        # Only samples inside the hold window can trigger a stop. Samples at
+        # or after the deadline are the hold exit itself (same price, wrong
+        # label) or quotes recorded after the position was already closed
+        # (pending-exit rows kept being quoted, and some of those quotes are
+        # garbage). Found 2026-10-21 via ?detail=1; cap the replay path here.
+        path = _cap_path_at_deadline(path, raw.get("hold_deadline") or _hold_deadline_for_entry(e))
         trades.append({
             "ticker": e.get("signal_ticker"), "direction": e.get("signal_direction"),
             "bar_time": e.get("signal_bar_time"),
