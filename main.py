@@ -4026,11 +4026,11 @@ def purgatory_stop_study(days: int = 30, account: str = "paper", strategy: str |
                         ttl=_STUDY_CACHE_TTL_S)
 
 
-_STOP_STUDY_DEADLINE_SLACK_S = 90   # one scan of slack past the deadline
+_STOP_STUDY_DEADLINE_SLACK_S = 0    # the hold sweep closes at the deadline; nothing after it can stop in reality
 
 
 def _cap_path_at_deadline(path: list[dict], deadline) -> list[dict]:
-    """Drop quote samples taken after the hold deadline (+ one scan of slack).
+    """Drop quote samples taken after the hold deadline.
     `deadline` may be an ISO string or a datetime; unknown deadline keeps
     the path as is. Samples without a parseable `t` are dropped too."""
     if not path or deadline is None:
