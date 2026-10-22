@@ -892,5 +892,43 @@ check("healthz mem reports thread count", isinstance(r["mem"].get("threads"), in
 check("quote path cap lowered", main._QUOTE_PATH_CAP == 45)
 check("study cache ttl default 600 and reported", main._STUDY_CACHE_TTL_S == 600 and r["mem"]["study_cache_ttl_s"] == 600)
 
+# ---------------- STOP-STUDY PAIR FILTERS ----------------
+class _StopQ:
+    def __init__(self, rows): self.rows, self.a, self.b = rows, 0, None
+    def select(self, *a, **k): return self
+    def gte(self, *a, **k): return self
+    def eq(self, *a, **k): return self
+    def order(self, *a, **k): return self
+    def range(self, a, b): self.a, self.b = a, b; return self
+    def execute(self):
+        class R: pass
+        r = R(); r.data = self.rows[self.a:(self.b or len(self.rows)) + 1]; return r
+class _StopSB:
+    def __init__(self, rows): self.rows = rows
+    def table(self, name): return _StopQ(self.rows)
+def _ss_pair(strategy, tkr, direction, bar, fill, xfill, reason):
+    return [dict(id=1, role="entry", strategy=strategy, signal_ticker=tkr, signal_direction=direction, signal_bar_time=bar,
+                 paper=True, qty=1, fill_price=fill, submitted_at=bar,
+                 raw={"quote_path": [{"t": bar, "mid": fill}, {"t": bar, "mid": xfill}]}),
+            dict(id=2, role="exit", strategy=strategy, signal_ticker=tkr, signal_direction=direction, signal_bar_time=bar,
+                 paper=True, qty=1, fill_price=xfill, submitted_at=bar, raw={"exit_reason": reason})]
+_ss_rows = (_ss_pair("purgatory", "AAPL", "call", "2026-10-20T14:00:00+00:00", 1.0, 1.5, "hold")
+            + _ss_pair("purgatory", "MSTR", "call", "2026-10-20T14:01:00+00:00", 3.0, 2.5, "stop_loss")
+            + _ss_pair("vwap_reclaim", "AAPL", "put", "2026-10-20T14:02:00+00:00", 1.0, 0.8, "stop_loss"))
+_saved_sb6 = main._supabase_client; main._supabase_client = _StopSB(_ss_rows)
+_all = main._stop_study_payload(30, "paper")
+_aapl = main._stop_study_payload(30, "paper", "purgatory", "aapl", "CALL")
+_mstr = main._stop_study_payload(30, "paper", ticker="MSTR")
+_none = main._stop_study_payload(30, "paper", strategy="market_wave")
+main._supabase_client = _saved_sb6
+check("stop-study: unfiltered sees all three trades", _all["coverage"]["trades"] == 3 and _all["realized"]["stop"]["n"] == 2, str(_all["coverage"]))
+check("stop-study: strategy+ticker+direction filter is case-insensitive and keeps one trade",
+      _aapl["coverage"]["trades"] == 1 and _aapl["realized"]["hold"]["pnl"] == 50.0 and _aapl["filter"] == {"strategy": "purgatory", "ticker": "AAPL", "direction": "call"}, str(_aapl["coverage"]) + str(_aapl["realized"]))
+check("stop-study: ticker-only filter", _mstr["coverage"]["trades"] == 1 and _mstr["realized"]["stop"]["pnl"] == -50.0, str(_mstr["realized"]))
+check("stop-study: filter with no matches returns empty study, not an error", _none["coverage"]["trades"] == 0, str(_none["coverage"]))
+resp = client.get("/purgatory/stop-study?days=30&strategy=purgatory&ticker=AAPL&direction=call")
+check("stop-study endpoint accepts pair filters", resp.status_code in (200, 503), str(resp.status_code))
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

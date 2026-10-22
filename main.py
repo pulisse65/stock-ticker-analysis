@@ -4017,12 +4017,15 @@ def _evaluate_stop_rules(trades: list[dict], thresholds: list[float | None] | No
 
 
 @app.get("/purgatory/stop-study")
-def purgatory_stop_study(days: int = 30, account: str = "paper"):
-    return _cached_json(("dash", "stop-study", int(days), account), lambda: _stop_study_payload(days, account),
+def purgatory_stop_study(days: int = 30, account: str = "paper", strategy: str | None = None,
+                         ticker: str | None = None, direction: str | None = None):
+    return _cached_json(("dash", "stop-study", int(days), account, strategy, ticker, direction),
+                        lambda: _stop_study_payload(days, account, strategy, ticker, direction),
                         ttl=_STUDY_CACHE_TTL_S)
 
 
-def _stop_study_payload(days: int = 30, account: str = "paper"):
+def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | None = None,
+                        ticker: str | None = None, direction: str | None = None):
     """Replay every stop threshold (10% … 50%, and none) over the real
     option quote paths recorded on paper positions since `days` ago.
     Only trades with a complete path count; stopped trades need their
@@ -4043,10 +4046,19 @@ def _stop_study_payload(days: int = 30, account: str = "paper"):
         ))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Stop-study query failed: {exc}") from exc
+    strategy = (strategy or "").strip().lower() or None
+    ticker = (ticker or "").strip().upper() or None
+    direction = (direction or "").strip().lower() or None
     entries: dict[tuple, dict] = {}
     exits: dict[tuple, dict] = {}
     for r in rows:
         k = (r.get("strategy") or "purgatory", r.get("signal_ticker"), r.get("signal_direction"), r.get("signal_bar_time"))
+        if strategy and k[0] != strategy:
+            continue
+        if ticker and (k[1] or "").upper() != ticker:
+            continue
+        if direction and (k[2] or "").lower() != direction:
+            continue
         if r.get("role") == "entry":
             entries[k] = r
         elif r.get("role") == "exit":
@@ -4085,6 +4097,7 @@ def _stop_study_payload(days: int = 30, account: str = "paper"):
         b["pnl"] = round(b["pnl"], 2)
     return {
         "days": days, "account": "paper" if paper_flag else "live",
+        "filter": {"strategy": strategy, "ticker": ticker, "direction": direction},
         "current_stop_pct": ALPACA_TRADING_STOP_LOSS_PCT,
         "realized": realized,
         "coverage": {"trades": len(trades), "with_path": tracked,
