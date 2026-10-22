@@ -930,5 +930,46 @@ resp = client.get("/purgatory/stop-study?days=30&strategy=purgatory&ticker=AAPL&
 check("stop-study endpoint accepts pair filters", resp.status_code in (200, 503), str(resp.status_code))
 
 
+# ---------------- TRADING_DIRECTIONS GATE + STOP-STUDY DETAIL ----------------
+import os as _os
+_saved_env_dir = _os.environ.get("TRADING_DIRECTIONS")
+_os.environ["TRADING_DIRECTIONS"] = "call"
+check("directions csv: 'call' -> {'call'}", main._parse_direction_csv() == {"call"})
+_os.environ["TRADING_DIRECTIONS"] = "Put, CALL"
+check("directions csv: case/space tolerant", main._parse_direction_csv() == {"call", "put"})
+_os.environ["TRADING_DIRECTIONS"] = "bogus"
+check("directions csv: unknown-only falls back to both", main._parse_direction_csv() == {"call", "put"})
+_os.environ.pop("TRADING_DIRECTIONS", None)
+check("directions csv: unset -> both", main._parse_direction_csv() == {"call", "put"})
+if _saved_env_dir is not None: _os.environ["TRADING_DIRECTIONS"] = _saved_env_dir
+_saved_dirs, _saved_en3, _saved_sel = main.TRADING_DIRECTIONS, main.ALPACA_TRADING_ENABLED, main._select_option_contract
+_calls = []
+main.TRADING_DIRECTIONS = {"call"}; main.ALPACA_TRADING_ENABLED = True
+main._select_option_contract = lambda *a, **k: _calls.append(a) or None
+_saved_alp = main._alpaca_enabled; main._alpaca_enabled = lambda: True
+main._maybe_place_trade_for_signal({"strategy": "purgatory", "ticker": "AAPL", "signal": "put", "price": 100.0, "bar_time": "2026-10-21T14:00:00+00:00"})
+check("direction gate: put signal places nothing when only calls are enabled", _calls == [], str(_calls))
+main._maybe_place_trade_for_signal({"strategy": "purgatory", "ticker": "AAPL", "signal": "call", "price": 100.0, "bar_time": "2026-10-21T14:00:00+00:00"})
+check("direction gate: call signal still reaches contract selection", len(_calls) == 1, str(_calls))
+main.TRADING_DIRECTIONS, main.ALPACA_TRADING_ENABLED, main._select_option_contract, main._alpaca_enabled = _saved_dirs, _saved_en3, _saved_sel, _saved_alp
+resp = client.get("/purgatory/status")
+check("status reports trading_directions", resp.status_code == 200 and sorted(resp.json().get("trading_directions") or []) == sorted(main.TRADING_DIRECTIONS), str(resp.json().get("trading_directions")))
+# detail rows: a hold trade whose path dipped 20% (replay would stop, reality held) must be flagged
+_dt = {"ticker": "MSTR", "direction": "call", "bar_time": "2026-10-20T14:00:00+00:00", "fill": 4.0, "qty": 1,
+       "actual_pnl": 60.0, "exit_reason": "hold", "hold_mid": None,
+       "path": [{"t": "a", "mid": 4.0}, {"t": "b", "mid": 3.1}, {"t": "c", "mid": 4.6}]}
+row = main._stop_study_trade_detail(_dt, 15.0)
+check("stop detail: finds the lowest mid and flags replay/realized disagreement",
+      row["min_mid"] == 3.1 and row["min_mid_pct"] == -22.5 and row["replay_stop_at"] == "b" and row["replay_pnl"] == -90.0 and row["disagree"] is True, str(row))
+_dt2 = dict(_dt, exit_reason="stop_loss", hold_mid=4.6, actual_pnl=-90.0)
+row2 = main._stop_study_trade_detail(_dt2, 15.0)
+check("stop detail: a real stop that replays as a stop does not disagree", row2["disagree"] is False and row2["replay_pnl"] == -90.0, str(row2))
+_saved_sb7 = main._supabase_client; main._supabase_client = _StopSB(_ss_rows)
+_d = main._stop_study_payload(30, "paper", detail=True)
+_nd = main._stop_study_payload(30, "paper")
+main._supabase_client = _saved_sb7
+check("stop-study detail=1 returns per-trade rows (stopped trades without hold_mid excluded), default omits them", "trades" in _d and len(_d["trades"]) == 1 and "trades" not in _nd, str(list(_d)))
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
