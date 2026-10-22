@@ -3294,6 +3294,8 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
 
     ticker = signal["ticker"]
     direction = signal["signal"]     # 'call' | 'put'
+    if direction not in TRADING_DIRECTIONS:
+        return None   # direction switched off for order placement (signals still scored)
     spot = float(signal["price"])
 
     contract = _select_option_contract(ticker, spot, direction)
@@ -4018,14 +4020,43 @@ def _evaluate_stop_rules(trades: list[dict], thresholds: list[float | None] | No
 
 @app.get("/purgatory/stop-study")
 def purgatory_stop_study(days: int = 30, account: str = "paper", strategy: str | None = None,
-                         ticker: str | None = None, direction: str | None = None):
-    return _cached_json(("dash", "stop-study", int(days), account, strategy, ticker, direction),
-                        lambda: _stop_study_payload(days, account, strategy, ticker, direction),
+                         ticker: str | None = None, direction: str | None = None, detail: int = 0):
+    return _cached_json(("dash", "stop-study", int(days), account, strategy, ticker, direction, int(detail)),
+                        lambda: _stop_study_payload(days, account, strategy, ticker, direction, bool(detail)),
                         ttl=_STUDY_CACHE_TTL_S)
 
 
+def _stop_study_trade_detail(t: dict, stop_pct: float) -> dict:
+    """One audit row per replayed trade: the lowest mid on its path, where
+    the current stop rule would have fired in the replay, and what really
+    happened. Lets a replay/realized disagreement be traced to a sample."""
+    fill = float(t["fill"]); qty = int(t.get("qty") or 1)
+    mids = [(_safe_float(p.get("mid")), p.get("t")) for p in (t.get("path") or [])]
+    mids = [(m, at) for m, at in mids if m is not None]
+    min_mid, min_at = (min(mids, key=lambda x: x[0]) if mids else (None, None))
+    hit = next(((m, at) for m, at in mids if (fill - m) / fill * 100.0 >= stop_pct), None)
+    if hit is not None:
+        replay_pnl = (hit[0] - fill) * 100 * qty
+    elif t.get("exit_reason") == "stop_loss":
+        replay_pnl = ((float(t["hold_mid"]) - fill) * 100 * qty) if t.get("hold_mid") is not None else None
+    else:
+        replay_pnl = float(t.get("actual_pnl") or 0.0)
+    return {
+        "ticker": t.get("ticker"), "direction": t.get("direction"), "bar_time": t.get("bar_time"),
+        "fill": fill, "qty": qty, "samples": len(mids),
+        "min_mid": min_mid, "min_mid_at": min_at,
+        "min_mid_pct": round((min_mid - fill) / fill * 100.0, 1) if min_mid is not None else None,
+        "replay_stop_at": hit[1] if hit else None,
+        "replay_stop_mid": hit[0] if hit else None,
+        "replay_pnl": round(replay_pnl, 2) if replay_pnl is not None else None,
+        "actual_exit": t.get("exit_reason"), "actual_pnl": t.get("actual_pnl"),
+        "hold_mid": t.get("hold_mid"),
+        "disagree": bool(hit) != (t.get("exit_reason") == "stop_loss"),
+    }
+
+
 def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | None = None,
-                        ticker: str | None = None, direction: str | None = None):
+                        ticker: str | None = None, direction: str | None = None, detail: bool = False):
     """Replay every stop threshold (10% … 50%, and none) over the real
     option quote paths recorded on paper positions since `days` ago.
     Only trades with a complete path count; stopped trades need their
@@ -4087,6 +4118,7 @@ def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | 
         path += list(sh.get("samples") or [])
         trades.append({
             "ticker": e.get("signal_ticker"), "direction": e.get("signal_direction"),
+            "bar_time": e.get("signal_bar_time"),
             "fill": fill, "qty": qty, "actual_pnl": round(pnl, 2), "exit_reason": reason,
             "path": [{"t": p.get("t"), "mid": p.get("mid")} for p in path],
             "hold_mid": sh.get("hold_mid") if reason == "stop_loss" else None,
@@ -4095,7 +4127,13 @@ def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | 
     evaluated = _evaluate_stop_rules([t for t in trades if t["path"]])
     for b in realized.values():
         b["pnl"] = round(b["pnl"], 2)
+    detail_rows = None
+    if detail:
+        detail_rows = [_stop_study_trade_detail(t, ALPACA_TRADING_STOP_LOSS_PCT)
+                       for t in trades if t["path"] and not (t["exit_reason"] == "stop_loss" and t["hold_mid"] is None)]
+        detail_rows.sort(key=lambda r: (not r["disagree"], r["bar_time"] or ""))
     return {
+        **({"trades": detail_rows} if detail_rows is not None else {}),
         "days": days, "account": "paper" if paper_flag else "live",
         "filter": {"strategy": strategy, "ticker": ticker, "direction": direction},
         "current_stop_pct": ALPACA_TRADING_STOP_LOSS_PCT,
@@ -5235,6 +5273,25 @@ def _parse_strategy_csv(env_name: str, default: tuple[str, ...] | set[str]) -> s
 _DEFAULT_ENABLED = tuple(k for k in _ALL_STRATEGIES if k != "orb")
 STRATEGIES_ENABLED = _parse_strategy_csv("STRATEGIES_ENABLED", _DEFAULT_ENABLED)
 STRATEGIES_TRADING = _parse_strategy_csv("STRATEGIES_TRADING", {"purgatory"}) & STRATEGIES_ENABLED
+
+
+def _parse_direction_csv(env_name: str = "TRADING_DIRECTIONS") -> set[str]:
+    """Which signal directions may place orders (paper and live alike):
+    "call", "put" or "call,put" (default). Signals of a switched-off
+    direction are still detected, scored and shown — they just never
+    become positions. Added 2026-10-21 after the 90-day read: purgatory
+    puts −$7.3k vs calls +$3.4k, and puts lose under every stop rule."""
+    raw = os.environ.get(env_name, "").strip().lower()
+    if not raw:
+        return {"call", "put"}
+    vals = {x.strip() for x in raw.split(",") if x.strip()}
+    unknown = vals - {"call", "put"}
+    if unknown:
+        log.warning("%s contains unknown directions %s — ignored", env_name, sorted(unknown))
+    return (vals & {"call", "put"}) or {"call", "put"}
+
+
+TRADING_DIRECTIONS = _parse_direction_csv()
 
 # --- Strategy kill gate (auto-mute) ---
 #
@@ -7982,6 +8039,7 @@ def purgatory_status():
         "trading_notional_usd":    ALPACA_TRADING_NOTIONAL_USD,
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
+        "trading_directions":      sorted(TRADING_DIRECTIONS),
         "hold_study":              {"minutes": HOLD_STUDY_MINUTES, "holds": _HOLD_STUDY_HOLDS},
         "paper_morning_hold": {
             "minutes":   PAPER_MORNING_HOLD_MINUTES,

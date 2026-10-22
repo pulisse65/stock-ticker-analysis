@@ -967,11 +967,21 @@
             <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Stop-rule study<span class="tip-q" data-tip="Every scan quotes each open paper position for the stop check; those quotes are now kept as a price path. When a position is stopped out, its contract keeps being quoted until the original 15-minute hold time, so we learn what the trade would have been worth had it not been stopped. Each row replays one stop threshold over those real paths. Nothing about the trading behaviour changes.">?</span></h3>
             <p class="text-[11px] text-ink-faint mt-0.5 max-w-3xl">What the paper book would have made under a different stop, replayed on real option quotes. The current rule is highlighted. <b>No stop</b> means the hold timer is the only exit. Paths are sampled once per scan, so thresholds tighter than the current stop sit on a coarse grid.</p>
           </div>
-          <select id="stopstudy-days" class="input px-2 py-1 text-xs">
-            <option value="7">Last 7 days</option>
-            <option value="30" selected>Last 30 days</option>
-            <option value="90">Last 90 days</option>
-          </select>
+          <div class="flex items-center gap-2 flex-wrap">
+            <select id="stopstudy-strategy" class="input px-2 py-1 text-xs" title="Strategy">
+              <option value="" selected>All strategies</option>
+            </select>
+            <select id="stopstudy-direction" class="input px-2 py-1 text-xs" title="Direction">
+              <option value="" selected>Calls + puts</option>
+              <option value="call">Calls only</option>
+              <option value="put">Puts only</option>
+            </select>
+            <select id="stopstudy-days" class="input px-2 py-1 text-xs">
+              <option value="7">Last 7 days</option>
+              <option value="30" selected>Last 30 days</option>
+              <option value="90">Last 90 days</option>
+            </select>
+          </div>
         </div>
         <div id="stopstudy-body" class="text-sm text-ink-dim">—</div>
       </section>
@@ -3914,11 +3924,28 @@ function _buildTradingPnlChart(days) {
   });
 }
 
+let _stopSeq = 0;
+function _fillStopStudyStrategies() {
+  const sel = document.getElementById("stopstudy-strategy");
+  if (!sel || sel.options.length > 1) return;
+  for (const [k, label] of Object.entries(STRATEGY_LABELS)) {
+    const o = document.createElement("option"); o.value = k; o.textContent = label; sel.appendChild(o);
+  }
+}
 async function refreshStopStudy() {
   const el = document.getElementById("stopstudy-body");
+  _fillStopStudyStrategies();
   const days = document.getElementById("stopstudy-days").value;
+  const strategy = document.getElementById("stopstudy-strategy").value;
+  const direction = document.getElementById("stopstudy-direction").value;
+  const seq = ++_stopSeq;
+  el.innerHTML = `<span class="text-ink-faint text-xs">Replaying…</span>`;
   try {
-    const r = await fetch(`/purgatory/stop-study?days=${days}&account=paper`);
+    const qs = new URLSearchParams({ days, account: "paper" });
+    if (strategy) qs.set("strategy", strategy);
+    if (direction) qs.set("direction", direction);
+    const r = await fetch(`/purgatory/stop-study?${qs}`);
+    if (seq !== _stopSeq) return;   // a newer filter change superseded this response
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
     const d = await r.json();
     const rz = d.realized, cv = d.coverage, st = d.study;
@@ -3958,7 +3985,9 @@ async function refreshStopStudy() {
     el.innerHTML = `<span class="text-ink-faint text-xs">${escapeHTML(e.message)}</span>`;
   }
 }
-document.getElementById("stopstudy-days").addEventListener("change", refreshStopStudy);
+for (const id of ["stopstudy-days", "stopstudy-strategy", "stopstudy-direction"]) {
+  document.getElementById(id).addEventListener("change", refreshStopStudy);
+}
 
 async function refreshTrading() {
   await Promise.all([refreshTradingStatus(), refreshTradingPerf(), refreshTradingPnl(), refreshTradingSummaries(), refreshStopStudy()]);
