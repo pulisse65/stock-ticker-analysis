@@ -973,13 +973,13 @@ check("stop-study detail=1 returns per-trade rows (stopped trades without hold_m
 
 # ---------------- STOP-STUDY PATH CAPPED AT HOLD DEADLINE ----------------
 _cap_path = [{"t": "2026-10-13T14:13:00+00:00", "mid": 4.6}, {"t": "2026-10-13T14:27:30+00:00", "mid": 4.4},
-             {"t": "2026-10-13T14:28:30+00:00", "mid": 3.8},   # 60 s past the deadline: the hold-exit sample, kept (slack)
+             {"t": "2026-10-13T14:28:30+00:00", "mid": 3.8},   # 60 s past the deadline: hold sweep already closed it, dropped
              {"t": "2026-10-13T15:39:15+00:00", "mid": 0.73},  # 72 min later: garbage after close, dropped
              {"mid": 1.0}]                                      # no timestamp: dropped
 _capped = main._cap_path_at_deadline(_cap_path, "2026-10-13T14:27:30+00:00")
-check("deadline cap: keeps in-window + one scan of slack, drops late and untimed samples", [p["mid"] for p in _capped] == [4.6, 4.4, 3.8], str(_capped))
+check("deadline cap: keeps in-window samples only, drops post-deadline and untimed samples", [p["mid"] for p in _capped] == [4.6, 4.4], str(_capped))
 check("deadline cap: unknown deadline keeps the path", main._cap_path_at_deadline(_cap_path, None) is _cap_path)
-check("deadline cap: datetime deadline accepted", len(main._cap_path_at_deadline(_cap_path, _dt(2026, 10, 13, 14, 27, 30, tzinfo=_tz.utc))) == 3)
+check("deadline cap: datetime deadline accepted", len(main._cap_path_at_deadline(_cap_path, _dt(2026, 10, 13, 14, 27, 30, tzinfo=_tz.utc))) == 2)
 # end-to-end: a held trade with a garbage post-close sample must not replay as a stop
 _late_rows = [dict(id=9, role="entry", strategy="purgatory", signal_ticker="MSTR", signal_direction="call", signal_bar_time="2026-10-13T14:12:00+00:00",
                    paper=True, qty=1, fill_price=4.6, submitted_at="2026-10-13T14:13:00+00:00",
