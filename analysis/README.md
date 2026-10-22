@@ -257,3 +257,52 @@ not raise `stopped` by more than 50%. If no longer hold clears both, keep
 15. A change applies to paper first (`ALPACA_TRADING_HOLD_MINUTES`, one knob);
 live follows only after two further weeks of paper at the new hold with
 positive total. Re-read ≈ 2026-10-27.
+
+## 90-day read and direction switch (2026-10-21)
+
+Asked by the owner after the third live AAPL-call fill stopped out (live −$184
+on 3 trades → breaker halted). Full data package, tables and the external
+review brief live in `analysis/handoff/2026-10-21/`.
+
+**Findings (paper, 7/24–10/21, 1,117 round-trips).**
+- Hold exits +$24.5k on 800 trades, stop exits −$34.4k on 317 → net −$9.9k.
+  "Hold exits are profitable" is survivorship: the stop column already holds
+  every trade that fell 15%. The honest counterfactual is the stop study's
+  **no stop** row.
+- Stops realize −24.7% of notional on a 15% rule (median −22.5%): the check
+  runs once per scan and the exit sells at the bid. ≈$40 per stop past the
+  line, ≈$13k of the 90-day loss.
+- Purgatory calls +$3.4k vs puts −$7.3k. Per-pair replay (new filters,
+  after the deadline-cap fix below): purgatory calls 15% +$2,114 vs no-stop
+  +$1,614 on 110 replayable trades; puts lose under every rule (15%
+  −$2,412, no-stop −$3,837). The 15% rule is the best or within noise of
+  the best on every slice.
+- Longer holds are worse: hold study at 309 usable trades, 15 min −$3,534,
+  30 min −$4,921 with more stops.
+- The 10/9 widening to `vwap_reclaim,market_wave` lost −$6.0k in 8 sessions
+  (26–27% fill win rate). Reverted to `STRATEGIES_TRADING=purgatory` 10/21.
+- AAPL call: Aug +$1,278 (83%), Sep +$2,031 (71%), Oct −$379 (1/8, 4 stops).
+  Paper and live agree it went cold the week it went live.
+- MSTR call (purgatory): 43 fills +$1,178, 51% wr, 1 stop in 90 days; signal
+  record 45 at 71% (Wilson .57). Pre-registered forward read (bar ≥ 10/7):
+  n=13 of 15, 10W/2L/1F, Wilson .50, net_f15 +.46 / +.26, 12 fills +$607,
+  top fill 36%. Clears every criterion except n. Re-read Fri 2026-10-23.
+
+**Changes shipped.** PR #55 `GET /purgatory/stop-study?strategy=&ticker=&direction=`;
+PR #56 `TRADING_DIRECTIONS` env (default `call,put`; `call` stops placing put
+orders on paper and live while puts stay scored as signals), `?detail=1`
+per-trade audit rows with a `disagree` flag, dashboard strategy/direction
+selects on the stop-rule card.
+
+**Replay defect found and fixed the same day (PRs #57, #58).** `detail=1`
+showed the replay counting (a) the sample taken at the hold deadline as a
+stop and (b) quotes recorded after the position had already closed, some
+of them garbage (MSTR 4.60 → 0.73). Paths are now capped at the hold
+deadline. Before the fix the replay claimed no-stop beat 15% on calls by
+~$2.6k; after it, 15% is best. Corrected table:
+`analysis/handoff/2026-10-21/REPLAY_RESULTS.md`. Lesson: read the
+per-trade disagree rows before quoting any counterfactual.
+
+**Not changed, on purpose.** The stop knob stays at 15%: after the fix it
+is the best rule on every slice. Live stays halted by the breaker.
+Recommended next setting (owner's call): `TRADING_DIRECTIONS=call`.

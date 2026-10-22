@@ -112,3 +112,12 @@ up-month):
   lever.
 
 **Hold-length study (2026-10-13):** after every exit the scanner keeps quoting the contract to entry+30 min; `GET /purgatory/hold-study` replays 15/20/25/30-minute holds on real option quotes. Decision rule and re-read date in `analysis/README.md`. The live hold stays 15 min until that rule is met.
+
+## Direction switch (added 2026-10-21)
+
+`TRADING_DIRECTIONS` (Render env, default `call,put`) decides which signal
+directions may place orders on **both** accounts. Set it to `call` to stop
+every put order while puts keep being detected, scored and shown on the
+leaderboard. Verify with `/purgatory/status` → `trading_directions`.
+Rationale: 90-day paper read, purgatory puts −$7.3k vs calls +$3.4k and
+negative under every stop rule (analysis/README.md, 2026-10-21 section).
