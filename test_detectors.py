@@ -993,5 +993,50 @@ _r15 = next(r for r in _lp["study"]["rules"] if r["label"] == "15%")
 check("stop-study: post-close garbage sample no longer triggers a replay stop", _r15["stopped"] == 0 and _r15["pnl"] == 0.0 and _lp["trades"][0]["disagree"] is False, str(_r15) + str(_lp["trades"][0]))
 
 
+# ---------------- REVIEW FIXES: SIZING, PARTIAL CLOSE, PNL ACCOUNT FLAG ----------------
+check("sizing: unknown premium -> 1 contract (never size against an estimate)", main._size_contracts(None, 500, 750) == 1 and main._size_contracts(0, 500, 750) == 1)
+check("sizing: $1.92 premium, $500 notional -> 2 contracts (not 15)", main._size_contracts(1.92, 500, 750) == 2)
+check("sizing: $0.33 premium -> 15 contracts, debit $495 under cap", main._size_contracts(0.33, 500, 750) == 15)
+check("sizing: cap binds: $500 notional, $300 cap, $0.40 premium -> 7 not 12", main._size_contracts(0.40, 500, 300) == 7)
+check("sizing: one lot above cap still returns 1 (caller skips the entry)", main._size_contracts(14.6, 500, 750) == 1)
+check("PAPER_MAX_TRADE_USD defaults to 750", main.PAPER_MAX_TRADE_USD == 750.0)
+# entry path: a one-lot debit above the cap is skipped before any order
+_saved_q, _saved_sub, _saved_sel2 = main._quote_snapshot, main._alpaca_submit_market_order, main._select_option_contract
+_saved_en4, _saved_alp2 = main.ALPACA_TRADING_ENABLED, main._alpaca_enabled
+_orders_sent = []
+main.ALPACA_TRADING_ENABLED = True; main._alpaca_enabled = lambda: True
+main._select_option_contract = lambda *a, **k: {"symbol": "MSFT260731C00500000", "strike_price": 500, "expiration_date": "2026-07-31", "close_price": 14.0}
+main._quote_snapshot = lambda sym: {"bid": 14.09, "ask": 14.67, "mid": 14.38, "spread_pct": 4.03}
+main._alpaca_submit_market_order = lambda sym, qty, side, paper=True: _orders_sent.append((sym, qty)) or {"id": "o1", "status": "accepted"}
+_r = main._maybe_place_trade_for_signal({"strategy": "purgatory", "ticker": "MSFT", "signal": "call", "price": 500.0, "bar_time": "2026-10-21T14:00:00+00:00"})
+check("entry: $1,438 one-lot debit > $750 cap -> skipped, no order", _r is None and _orders_sent == [], str(_orders_sent))
+main._quote_snapshot = lambda sym: None
+_saved_persist = main._persist_order_row; main._persist_order_row = lambda row: None
+_r = main._maybe_place_trade_for_signal({"strategy": "purgatory", "ticker": "MSFT", "signal": "call", "price": 500.0, "bar_time": "2026-10-21T14:01:00+00:00"})
+check("entry: no quote -> exactly 1 contract, prior close never used for sizing", _orders_sent == [("MSFT260731C00500000", 1)], str(_orders_sent))
+main._persist_order_row = _saved_persist
+main._quote_snapshot, main._alpaca_submit_market_order, main._select_option_contract = _saved_q, _saved_sub, _saved_sel2
+main.ALPACA_TRADING_ENABLED, main._alpaca_enabled = _saved_en4, _saved_alp2
+# partial close: qty param sent; rejection falls back to close-all; 404 -> no_position
+_del_calls = []
+class _Resp:
+    def __init__(self, code, body="{}"): self.status_code, self.text = code, body
+    def json(self): return {"status": "accepted", "qty_closed": "partial" if "qty" in self.text else "all"}
+def _fake_delete(url, headers=None, params=None, timeout=None):
+    _del_calls.append(params)
+    if params and params.get("qty") == 99: return _Resp(422, "qty exceeds position")
+    if "GONE" in url: return _Resp(404)
+    return _Resp(200, "qty" if params else "all")
+_saved_req_delete = main.requests.delete; main.requests.delete = _fake_delete
+_saved_api = main._trading_api; main._trading_api = lambda paper: ("https://x", {})
+r1 = main._alpaca_close_position("AAPL1", paper=True, qty=2)
+r2 = main._alpaca_close_position("AAPL1", paper=True, qty=99)
+r3 = main._alpaca_close_position("GONE", paper=True, qty=1)
+main.requests.delete = _saved_req_delete; main._trading_api = _saved_api
+check("close: qty=2 sent as ?qty=2", _del_calls[0] == {"qty": 2} and r1["qty_closed"] == "partial", str(_del_calls[:1]) + str(r1))
+check("close: rejected partial falls back to close-all", _del_calls[1] == {"qty": 99} and _del_calls[2] is None and r2["qty_closed"] == "all", str(_del_calls[1:3]))
+check("close: 404 -> no_position synthetic", r3 == {"status": "no_position"})
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

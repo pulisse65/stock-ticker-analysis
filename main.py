@@ -3059,6 +3059,21 @@ ALPACA_TRADING_STOP_LOSS_PCT = float(os.environ.get("ALPACA_TRADING_STOP_LOSS_PC
 # edge. Wide-spread moments are exactly when market orders get robbed.
 # Set <= 0 to disable. No quote available → gate can't run, entry proceeds.
 ALPACA_TRADING_MAX_SPREAD_PCT = float(os.environ.get("ALPACA_TRADING_MAX_SPREAD_PCT", "10"))
+# Hard debit cap per entry for the paper leg (the live leg has its own,
+# LIVE_MAX_TRADE_USD). Added 2026-10-21 after the external review found
+# $2,880 and $4,380 paper entries on a $500 book.
+PAPER_MAX_TRADE_USD = float(os.environ.get("PAPER_MAX_TRADE_USD", "750"))
+
+
+def _size_contracts(premium: float | None, notional: float, max_trade_usd: float) -> int:
+    """Contracts to buy: notional / premium, floored, never above the debit
+    cap, and exactly one when the premium is unknown (never size against
+    an estimate — the fill can be 5–10x the estimate)."""
+    if not premium or premium <= 0:
+        return 1
+    qty = max(1, int(notional / (premium * 100)))
+    cap_qty = int(max_trade_usd / (premium * 100)) if max_trade_usd > 0 else qty
+    return max(1, min(qty, cap_qty))
 _PURGATORY_ORDERS_TABLE = "purgatory_orders"
 
 
@@ -3241,18 +3256,28 @@ def _alpaca_submit_market_order(option_symbol: str, qty: int, side: str,
         return None
 
 
-def _alpaca_close_position(option_symbol: str, paper: bool = True) -> dict | None:
-    """DELETE /v2/positions/{symbol}. Returns a synthetic 'no_position' dict
-    on 404 so callers can log the exit attempt without re-trying forever."""
+def _alpaca_close_position(option_symbol: str, paper: bool = True, qty: int | None = None) -> dict | None:
+    """DELETE /v2/positions/{symbol}[?qty=N]. With `qty`, closes only that
+    many contracts so two entries in the same contract exit on their own
+    timers (the 2026-10-21 review found overlapping entries sharing one
+    exit, cutting holds to 9–13 min). If the partial close is rejected
+    (position smaller than qty), falls back to closing the whole position.
+    Returns a synthetic 'no_position' dict on 404 so callers can log the
+    exit attempt without re-trying forever."""
     base, headers = _trading_api(paper)
+    params = {"qty": int(qty)} if qty else None
     try:
         r = requests.delete(
             f"{base}/v2/positions/{option_symbol}",
-            headers=headers,
+            headers=headers, params=params,
             timeout=15,
         )
         if r.status_code == 404:
             return {"status": "no_position"}
+        if r.status_code >= 400 and params:
+            log.warning("Partial close (qty %s) rejected for %s: %s — closing whole position",
+                        qty, option_symbol, r.text[:120])
+            return _alpaca_close_position(option_symbol, paper=paper, qty=None)
         if r.status_code >= 400:
             log.warning("Close position failed (%s, %s) for %s: %s",
                         r.status_code, "paper" if paper else "LIVE",
@@ -3312,13 +3337,18 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
                  contract["symbol"], quote["bid"], quote["ask"])
         return None
 
-    premium = (quote or {}).get("mid") or _estimate_option_premium(contract)
+    # Size only against a live quote. The prior-close fallback sized two
+    # 2026-10-14 puts at 15 lots against a stale $0.33 close that filled at
+    # $1.92 / $2.92 ($2,880 / $4,380 debits on a $500 book). Unknown premium
+    # now means one contract, and a one-lot debit above the cap is skipped.
+    premium = (quote or {}).get("mid")
+    if premium and premium > 0 and premium * 100 > PAPER_MAX_TRADE_USD:
+        log.info("Entry skipped for %s %s: one contract costs $%.0f > $%.0f cap (%s)",
+                 ticker, direction, premium * 100, PAPER_MAX_TRADE_USD, contract["symbol"])
+        return None
 
     def _enter(paper: bool, notional: float) -> dict | None:
-        if premium and premium > 0:
-            qty = max(1, int(notional / (premium * 100)))
-        else:
-            qty = 1   # premium unknown → conservative single contract
+        qty = _size_contracts(premium, notional, PAPER_MAX_TRADE_USD)
         order = _alpaca_submit_market_order(contract["symbol"], qty, "buy", paper=paper)
         if not order:
             return None
@@ -3639,7 +3669,7 @@ def _sweep_pending_positions() -> int:
         paper = bool(entry.get("paper", True))
 
         quote = _quote_snapshot(opt)
-        result = _alpaca_close_position(opt, paper=paper)
+        result = _alpaca_close_position(opt, paper=paper, qty=int(qty))
         if not result:
             continue
 
@@ -4167,7 +4197,7 @@ def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | 
         "realized": realized,
         "coverage": {"trades": len(trades), "with_path": tracked,
                      "shadow_pending": sum(1 for t in trades if t["exit_reason"] == "stop_loss" and t["hold_mid"] is None and t["path"]),
-                     "note": "quote paths are sampled once per scan (~4 min); thresholds tighter than the realized stop are evaluated on that coarse grid"},
+                     "note": "quote paths are sampled once per scan (~1 min since 2026-10-16, ~4 min before); thresholds tighter than the realized stop are evaluated on that grid. Held trades exit at their real fill; stopped trades exit at the recorded hold-time mid"},
         "study": evaluated,
         "ts": _now_iso(),
     }
@@ -4333,7 +4363,7 @@ def _sweep_stop_losses() -> int:
             continue
 
         paper = bool(entry.get("paper", True))
-        result = _alpaca_close_position(opt, paper=paper)
+        result = _alpaca_close_position(opt, paper=paper, qty=int(entry.get("qty") or 1))
         if not result:
             continue
         _start_shadow_tracking(entry, fill, quote)
@@ -8009,7 +8039,8 @@ def _pnl_payload(account: str | None = None):
             "all_time":   _rollup(None),
         },
         "total_trades": len(trades),
-        "paper":        ALPACA_PAPER,
+        "paper":        (account != "live") if account in ("live", "paper") else ALPACA_PAPER,
+        "account":      account or ("paper" if ALPACA_PAPER else "live"),
         "ts":           _now_iso(),
     }
 
