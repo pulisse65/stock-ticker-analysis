@@ -7,14 +7,18 @@ the statistics and the engineering decisions before any more real money goes in.
 ## 1. What the system is
 
 - **Ticker Tracker** (tickertracker.dev): a FastAPI + vanilla JS app that scans
-  ~24 tickers on 1-minute bars every minute during US market hours, fires
+  17 watchlist tickers on 1-minute bars every minute during US market hours, fires
   directional signals ("call" / "put") from ten rule-based detectors, scores
   each signal on the underlying 5–30 minutes later, and auto-trades a subset
   as short-dated options through Alpaca.
-- **Signal scoring.** A signal is a *win* if the underlying moves ≥ +0.05%
-  in the signal direction at the 15-minute mark (the 0.05% is a stand-in for
-  option spread cost); `net_f15 = f15 − 0.05` where `f15` is the signed
-  favorable move in % at 15 minutes. `f5..f30` are the same at other horizons.
+- **Signal scoring.** `f5..f30` are the signed favorable underlying moves
+  (%) at 5–30 minutes after the signal bar. The stored `outcome` label is
+  *win* when the **best** of those moves, net of a 0.05% spread stand-in,
+  exceeds +0.10% (flat within ±0.10%, loss below). That is a 30-minute-best
+  label, not a fixed 15-minute hit rate; for a 15-minute hold use
+  `f15 ≥ +0.05` directly (`net_f15 = f15 − 0.05`). Both are reported in
+  `REVIEW_RESPONSE.md`. (Corrected 2026-10-22; the first version of this
+  brief described the label wrongly.)
   Only rows with `scored_from == 'alerted_at'` are honest (scored forward
   from the moment the alert fired); the rest were back-filled and are
   excluded from every number below.
@@ -23,9 +27,11 @@ the statistics and the engineering decisions before any more real money goes in.
   notional (qty = notional / premium, min 1), exit at a 15-minute hold timer
   or a 15% stop on the option's mid price, checked once per scan. Entry and
   exit are market orders; realized P&L includes bid/ask drag.
-- **Live book.** One pair only: `purgatory:AAPL:call`, 09:45–11:30 ET window,
-  since 2026-10-06. Three fills so far, −$184; the account-level breaker
-  halted it on 2026-10-21 (cumulative loss ≤ −$150).
+- **Live book.** Currently one pair: `purgatory:AAPL:call`, 09:45–11:30 ET
+  window, since 2026-10-06: three fills, −$184; the account-level breaker
+  halted it on 2026-10-21 (cumulative loss ≤ −$150). Before that the live
+  account traded `purgatory:TSLA:call` 2026-08-18 → 09-21 (18 trades,
+  +$1,136), so the live ledger holds 21 trades, +$952 all time.
 - **Strategies.** `purgatory` (the original breakout/pullback detector), plus
   `vwap_reclaim`, `market_wave`, `orb_ntz`, `pd_level`, `bb_squeeze`,
   `ema_pullback`, `vwap_reversion` (signals only unless named in
@@ -53,7 +59,8 @@ the statistics and the engineering decisions before any more real money goes in.
 | `raw/pnl_paper.json`, `raw/pnl_live.json` | per-day realized P&L series with rollups. |
 | `raw/leaderboard_30d.json`, `raw/leaderboard_90d.json` | per-pair signal records (all / window / momentum / paper fills). |
 | `raw/stop_study_*.json` | the stop-rule replay (see §4) platform-wide and per slice. `*_detail_*.json` carry one audit row per replayed trade. |
-| `raw/hold_study_*.json` | the hold-length replay (15/20/25/30-minute exits on real option quote paths, 15% stop applied). |
+| `raw/hold_study_*.json` | the hold-length replay (15/20/25/30-minute exits on real option quote paths, 15% stop applied; exit mid = nearest sample within ±5 min of each horizon, so not exact-minute executions). |
+| `EXTERNAL_REVIEW_chatgpt_sol.md`, `REVIEW_RESPONSE.md` | the independent review received 2026-10-22 and the point-by-point response. |
 | `raw/bullseye_external_predictions.json` | a friend's daily ML forecasts (buy/hold/sell per ticker) and their scored accuracy; a side track, not used for trading. |
 
 All money figures are USD on a $500-notional paper book. Times in raw JSON
@@ -61,24 +68,32 @@ are UTC; `et_time` columns are America/New_York.
 
 ## 3. Headline numbers the owner has already seen
 
-Paper, 2026-07-24 → 10-21, 1,117 round-trips (90-day window):
+Paper, `orders.csv`, `account == paper`, 2026-07-24 ≤ date ≤ 10-21:
+1,123 round-trips, −$10,604 (corrected 2026-10-22; the first version of
+this table was built from a merge that dropped six rows). Win = pnl > 0.
 
 | slice | n | P&L | win rate | stops |
 |---|---|---|---|---|
-| hold exits | 800 | +$24,497 | 48% | — |
-| stop exits | 317 | −$34,366 | 0% | 317 |
-| purgatory calls | 378 | +$3,445 | 42% | 92 |
-| purgatory puts | 409 | −$7,293 | 33% | 104 |
-| vwap_reclaim (10/12–10/21 only) | 197 | −$3,690 | 27% | 73 |
-| market_wave (10/12–10/21 only) | 133 | −$2,331 | 26% | 48 |
+| hold exits | 806 | +$23,744 | 47.4% | — |
+| stop exits | 317 | −$34,348 | 0.3% | 317 |
+| purgatory calls | 382 | +$2,892 | 41.9% | 91 |
+| purgatory calls excluding AAPL | 343 | −$122 | 39.9% | 85 |
+| purgatory puts | 411 | −$7,475 | 32.8% | 105 |
+| vwap_reclaim (10/12–10/21 only) | 197 | −$3,690 | 27.4% | 73 |
+| market_wave (10/12–10/21 only) | 133 | −$2,331 | 25.6% | 48 |
 
-- Stopped trades realize −24.7% of notional (median −22.5%) against a 15%
-  rule: roughly $40 per stop of slippage past the line.
-- AAPL call (the live pair): Aug +$1,278 (83% wr), Sep +$2,031 (71%), Oct
-  −$379 (1 win in 8, 4 stops). Live: 3 fills, 2 stops, −$184.
-- MSTR call: 43 fills +$1,178, 51% wr, 1 stop in 90 days; 45 honest signals
-  at 71% (Wilson .57). Forward sample since 10-07: 13 of the 15 required,
-  10W/2L/1F, Wilson .50, net_f15 +.46 mean / +.26 median, 12 fills +$607.
+- Stops by rule era (the stop was 30% until 2026-10-03, 15% since): 127
+  stops at mean −34.4% of debit under the 30% rule; 190 at mean −18.2%
+  (median −18.4%) under the 15% rule, ≈ $15 per stop beyond the line.
+- AAPL call (the live pair): Aug +$1,278 (10/12), Sep +$2,179 (11/15), Oct
+  −$379 (1/8, 4 stops). Live: 3 fills, 2 stops, −$184.
+- MSTR call: 43 fills +$1,178, 22/43 profitable, 1 stop in 90 days. Signal
+  record, 45 honest rows: stored label 32/45 = 71% (Wilson .57); fixed-15
+  endpoint 25/44 = 56.8% (Wilson .42). Forward sample since 10-07: 13
+  signals of the 15 required, 10W/2L/1F on the stored label; 12 observed
+  `f15` (one missing), 10/12 ≥ +0.05, net mean +.46 / median +.26; 12
+  fills +$607, largest 36% of total; four of those fills held 9–22 minutes
+  rather than 15 (cause and fix in `REVIEW_RESPONSE.md`).
 - Hold study (309 usable trades, mid-to-mid): 15-min −$3,534, 20 −$4,406,
   25 −$3,704, 30 −$4,921. Longer holds add stops and lose more.
 
@@ -87,7 +102,9 @@ Paper, 2026-07-24 → 10-21, 1,117 round-trips (90-day window):
 Since 2026-09-22 every open position's option mid is recorded once per scan
 (`raw.quote_path`), and stopped positions keep being quoted to their hold
 deadline. The replay applies each threshold (10–50%, none) to those paths.
-It is **mid-to-mid** (no spread cost), covers only trades with a path
+Pricing basis: stopped trades exit at the triggering sample's mid (or the
+recorded hold-time mid when the replay lets them run); held trades exit at
+their real fill. No spread cost on the mid legs. It covers only trades with a path
 (~4 weeks), and on 2026-10-21 two defects were found and fixed the same
 day: samples at/after the hold deadline and quotes recorded after the
 position had already closed (some of them garbage, e.g. MSTR 4.60 → 0.73)

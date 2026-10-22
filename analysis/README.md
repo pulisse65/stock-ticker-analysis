@@ -306,3 +306,24 @@ per-trade disagree rows before quoting any counterfactual.
 **Not changed, on purpose.** The stop knob stays at 15%: after the fix it
 is the best rule on every slice. Live stays halted by the breaker.
 Recommended next setting (owner's call): `TRADING_DIRECTIONS=call`.
+
+**External review (2026-10-22).** An independent quant review of the
+handoff package reproduced every table and found three errors in the brief
+(win-label definition, a six-row merge error in the headline table, stop
+slippage pooled across the 30%→15% rule change) plus two ledger defects
+now fixed in PR #59 (prior-close sizing → 15-lot fills; close-by-symbol
+sharing one exit across overlapping entries). Files:
+`analysis/handoff/2026-10-21/EXTERNAL_REVIEW_chatgpt_sol.md` and
+`REVIEW_RESPONSE.md`.
+
+**MSTR:call pre-registration, hardened 2026-10-22 (supersedes the 10/06
+wording for this pair).** One read only, at the close of the first session
+on which there are ≥ 15 honest `purgatory:MSTR:call` signals with bar_time
+≥ 2026-10-07. Endpoint: fixed 15-minute, `f15 ≥ +0.05`; a missing `f15`
+counts as a non-win and stays in the denominator. Pass requires Wilson
+lower bound ≥ .45 on that endpoint, net_f15 mean and median > 0, ≥ 8 paper
+fills positive at the 15-minute hold with the largest < 50% of the total,
+and no fill held outside 14–16 minutes counted as a 15-minute fill. If it
+fails, it fails; no re-reads, no substitute window or threshold. The
+reviewer's stricter quote-ledger protocol (section 4 of the review) is the
+proposed follow-on validation and is not adopted until the owner decides.
