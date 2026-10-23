@@ -327,3 +327,15 @@ and no fill held outside 14–16 minutes counted as a 15-minute fill. If it
 fails, it fails; no re-reads, no substitute window or threshold. The
 reviewer's stricter quote-ledger protocol (section 4 of the review) is the
 proposed follow-on validation and is not adopted until the owner decides.
+
+**MSTR:call pre-registered read — DONE 2026-10-23 (first session with n ≥ 15; no re-read).**
+17 honest forward signals (bar ≥ 10/07). Hardened rule (fixed-15 endpoint,
+missing f15 = non-win): 10/17 = 58.8%, Wilson lower .360 < .45 → **FAIL**.
+net_f15 mean +.185 / median +.189 (16 observed) passed; trailing-2wk +.132
+passed. Fills: 15, +$448, 8 positive, 2 stops, largest $220 = 49% of total
+(passes <50% by $4); clean 14–16-min holds 9, 5 positive, +$436. Under the
+original 10/06 wording (stored 30-min-best label) it would have passed:
+13W/2L/2F, Wilson .527 — which is exactly the gap the 10/22 review flagged.
+The four 10/23 signals were all stored "win"/"flat" with negative f15. Not
+promotable under the binding rule. Any further test is the reviewer's
+quote-ledger protocol, owner's decision.
