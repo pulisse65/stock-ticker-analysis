@@ -1001,7 +1001,7 @@ _DASH_CACHE_TTL_S = int(os.environ.get("DASH_CACHE_TTL_S", "60"))
 # The two shadow studies read 30 days of heavy `raw` (quote paths); a lone
 # dashboard viewer polling every 60 s recomputed them each time and pushed
 # RSS to ~450 MB on 10/16. They change slowly — cache them for 10 min.
-_STUDY_CACHE_TTL_S = int(os.environ.get("STUDY_CACHE_TTL_S", "600"))
+_STUDY_CACHE_TTL_S = int(os.environ.get("STUDY_CACHE_TTL_S", "1800"))
 
 
 def _mem_probe(trim_every_s: float = 240) -> float | None:
@@ -1034,6 +1034,7 @@ def _mem_report() -> dict:
         "signals_mem": len(_purgatory_signals),
         "live_objects": len(objs),
         "threads": threading.active_count(),
+        "study_rows_cache": _study_rows_cache_stats(),
         "gc_counts": gc.get_count(),
         "top_types": top,
         "last_trim_at": int(_last_trim_at) or None,
@@ -4048,6 +4049,68 @@ def _evaluate_stop_rules(trades: list[dict], thresholds: list[float | None] | No
     return {"n_trades": len(trades), "n_usable": len(usable), "rules": out}
 
 
+# --- Study row cache (egress) ---
+# Both shadow studies read every order row in the window WITH `raw` (quote
+# paths): ~20 MB per 30-day read, recomputed every STUDY_CACHE_TTL_S while
+# the Trading tab is open. That was ~7 GB of Supabase egress in October
+# against a 5 GB free allowance. Rows older than a couple of hours never
+# change (paths stop at the hold deadline, hold-study samples at entry+30),
+# so keep them in-process and only re-read the recent slice.
+_STUDY_RECENT_HOURS = 3
+_STUDY_ROW_COLS = "id, strategy, signal_ticker, signal_direction, signal_bar_time, paper, role, qty, fill_price, submitted_at, raw"
+_study_rows_cache: dict[bool, dict[str, dict]] = {True: {}, False: {}}   # paper_flag -> {id: row}
+_study_rows_floor: dict[bool, str | None] = {True: None, False: None}    # oldest submitted_at fully loaded
+_study_rows_lock = threading.Lock()
+
+
+def _slim_study_row(r: dict) -> dict:
+    raw = r.get("raw") or {}
+    keep = {k: raw.get(k) for k in ("quote_path", "shadow", "hold_study", "exit_reason", "hold_deadline") if k in raw}
+    return {**{k: r.get(k) for k in ("id", "strategy", "signal_ticker", "signal_direction", "signal_bar_time",
+                                       "paper", "role", "qty", "fill_price", "submitted_at")}, "raw": keep}
+
+
+def _study_rows(since_iso: str, paper_flag: bool) -> list[dict]:
+    """Order rows (entries + exits) with submitted_at >= since_iso, served
+    from the in-process cache plus one small read of the recent slice."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Requires Supabase.")
+    now = datetime.now(timezone.utc)
+    recent_since = (now - timedelta(hours=_STUDY_RECENT_HOURS)).isoformat()
+    with _study_rows_lock:
+        cache = _study_rows_cache[paper_flag]
+        floor = _study_rows_floor[paper_flag]
+        # 1. older range not yet loaded (first call, or a longer window than before)
+        if floor is None or since_iso < floor:
+            upper = floor or recent_since
+            older = _page_all(lambda: (
+                _supabase_client.table(_PURGATORY_ORDERS_TABLE).select(_STUDY_ROW_COLS)
+                .gte("submitted_at", since_iso).lt("submitted_at", upper)
+                .eq("paper", paper_flag).order("submitted_at", desc=False)))
+            for r in older:
+                cache[r["id"]] = _slim_study_row(r)
+            _study_rows_floor[paper_flag] = since_iso
+        # 2. the recent slice always comes fresh (paths/samples still being appended)
+        recent = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE).select(_STUDY_ROW_COLS)
+            .gte("submitted_at", max(since_iso, recent_since))
+            .eq("paper", paper_flag).order("submitted_at", desc=False)))
+        for r in recent:
+            cache[r["id"]] = _slim_study_row(r)
+        # 3. drop rows older than a year so the cache never grows unbounded
+        cutoff = (now - timedelta(days=366)).isoformat()
+        for rid in [k for k, v in cache.items() if (v.get("submitted_at") or "") < cutoff]:
+            cache.pop(rid, None)
+        rows = [v for v in cache.values() if (v.get("submitted_at") or "") >= since_iso]
+    rows.sort(key=lambda r: r.get("submitted_at") or "")
+    return rows
+
+
+def _study_rows_cache_stats() -> dict[str, Any]:
+    return {"paper_rows": len(_study_rows_cache[True]), "live_rows": len(_study_rows_cache[False]),
+            "floor_paper": _study_rows_floor[True], "recent_hours": _STUDY_RECENT_HOURS}
+
+
 @app.get("/purgatory/stop-study")
 def purgatory_stop_study(days: int = 30, account: str = "paper", strategy: str | None = None,
                          ticker: str | None = None, direction: str | None = None, detail: int = 0):
@@ -4119,13 +4182,9 @@ def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     paper_flag = account != "live"
     try:
-        rows = _page_all(lambda: (
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("id, strategy, signal_ticker, signal_direction, signal_bar_time, paper, role, qty, fill_price, submitted_at, raw")
-            .gte("submitted_at", since)
-            .eq("paper", paper_flag)
-            .order("submitted_at", desc=False)
-        ))
+        rows = _study_rows(since, paper_flag)
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Stop-study query failed: {exc}") from exc
     strategy = (strategy or "").strip().lower() or None
@@ -4227,14 +4286,9 @@ def _hold_study_payload(days: int = 30, account: str = "paper", strategy: str | 
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     paper_flag = account != "live"
     try:
-        rows = _page_all(lambda: (
-            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
-            .select("id, strategy, signal_ticker, signal_direction, signal_bar_time, paper, role, qty, fill_price, submitted_at, raw")
-            .gte("submitted_at", since)
-            .eq("paper", paper_flag)
-            .eq("role", "entry")
-            .order("submitted_at", desc=False)
-        ))
+        rows = [r for r in _study_rows(since, paper_flag) if r.get("role") == "entry"]
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(502, f"Hold-study query failed: {exc}") from exc
     strategy = (strategy or "").strip().lower() or None
