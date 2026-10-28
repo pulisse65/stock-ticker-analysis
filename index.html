@@ -986,6 +986,18 @@
         <div id="stopstudy-body" class="text-sm text-ink-dim">—</div>
       </section>
 
+      <!-- Swing book (weekly cloud + momentum, paper stock) -->
+      <section class="card p-4">
+        <div class="flex items-start justify-between gap-3 flex-wrap mb-2">
+          <div>
+            <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">Swing book<span class="tip-q" data-tip="A separate paper STOCK book, pre-registered 2026-10-27 (SWING_BOOK.md). Once a week it holds the top 5 watchlist names that closed the prior week above their weekly Ichimoku cloud, ranked by 12-week return, equal weight. Benchmarks: equal-weight watchlist and SPY from the first rebalance. Read after 13 weeks.">?</span></h3>
+            <p class="text-[11px] text-ink-faint mt-0.5 max-w-3xl">Weekly cloud regime + 12-week momentum, top 5, equal weight, rebalanced Monday 09:35 ET. Paper stock, never options, never live.</p>
+          </div>
+          <div id="swing-pills" class="flex items-center gap-2 flex-wrap text-xs"></div>
+        </div>
+        <div id="swing-body" class="text-sm text-ink-dim">—</div>
+      </section>
+
       <!-- Daily retros -->
       <section class="card p-4">
         <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Daily retros (last 14 days)</h3>
@@ -3989,8 +4001,44 @@ for (const id of ["stopstudy-days", "stopstudy-strategy", "stopstudy-direction"]
   document.getElementById(id).addEventListener("change", refreshStopStudy);
 }
 
+async function refreshSwing() {
+  const el = document.getElementById("swing-body"), pills = document.getElementById("swing-pills");
+  try {
+    const r = await fetch("/purgatory/swing");
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const d = await r.json();
+    const money = v => `${v > 0 ? "+" : (v < 0 ? "−" : "")}$${Math.abs(Math.round(v)).toLocaleString()}`;
+    const cls = v => v > 0 ? "val-up" : (v < 0 ? "val-down" : "text-ink-dim");
+    const pct = v => v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
+    pills.innerHTML = `<span class="px-2.5 py-1 rounded-full ${d.enabled ? "v-bullish" : "v-neutral"}">${d.enabled ? "Enabled" : "Not enabled"}</span>
+      <span class="px-2.5 py-1 rounded-full v-neutral">$${Math.round(d.notional_usd).toLocaleString()} / top ${d.top_n}</span>
+      <span class="px-2.5 py-1 rounded-full v-neutral">week ${d.week_key}${d.rebalanced_this_week ? " ✓" : ""}</span>`;
+    const b = d.book || {}, bm = d.benchmarks || {};
+    const held = Object.keys(d.holdings || {});
+    const target = (d.targets && d.targets.ranked_eligible || []).slice(0, d.top_n);
+    const summary = `<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3 text-xs">
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Book</div><div class="text-lg font-semibold mono ${cls(b.return_pct || 0)}">${pct(b.return_pct)}</div><div class="text-[11px] text-ink-faint">${b.weeks_run || 0} weeks · unrealized ${money(b.unrealized_pl || 0)}</div></div>
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Watchlist equal-weight</div><div class="text-lg font-semibold mono ${cls(bm.universe_equal_weight_pct || 0)}">${pct(bm.universe_equal_weight_pct)}</div><div class="text-[11px] text-ink-faint">since ${bm.since || "first rebalance"}</div></div>
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">SPY</div><div class="text-lg font-semibold mono ${cls(bm.spy_pct || 0)}">${pct(bm.spy_pct)}</div><div class="text-[11px] text-ink-faint">same window</div></div>
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Holding</div><div class="text-sm font-semibold mono">${held.length ? held.join(" · ") : "—"}</div><div class="text-[11px] text-ink-faint">target: ${target.length ? target.join(" · ") : "nothing eligible"}</div></div>
+    </div>`;
+    const rows = (d.targets && d.targets.rows) || [];
+    const table = `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead><tr class="text-ink-faint text-left"><th class="pb-2">#</th><th class="pb-2">Ticker</th><th class="pb-2">Regime</th><th class="pb-2 text-right">12-wk</th><th class="pb-2">Eligible</th><th class="pb-2 text-right">Held</th><th class="pb-2 text-right">P&L</th></tr></thead>
+      <tbody>${rows.map(r => { const h = (d.holdings || {})[r.ticker]; const inT = target.includes(r.ticker);
+        return `<tr class="border-t border-line ${inT ? "bg-line/30" : ""}"><td class="py-1 mono">${r.rank || ""}</td><td class="py-1 mono ${inT ? "font-bold text-ink" : ""}">${r.ticker}</td>
+          <td class="py-1"><span class="px-2 py-0.5 rounded-full text-[10px] ${r.regime === "above" ? "v-bullish" : (r.regime === "below" ? "v-bearish" : "v-neutral")}">${r.regime || "n/a"}</span></td>
+          <td class="py-1 mono text-right ${cls(r.mom_12w_pct || 0)}">${r.mom_12w_pct == null ? "—" : pct(r.mom_12w_pct)}</td><td class="py-1">${r.eligible ? "yes" : ""}</td>
+          <td class="py-1 mono text-right">${h ? h.qty : ""}</td><td class="py-1 mono text-right ${h ? cls(h.unrealized_pl || 0) : ""}">${h ? money(h.unrealized_pl || 0) : ""}</td></tr>`; }).join("")}</tbody></table></div>
+      <div class="text-[11px] text-ink-faint mt-2">Weekly data through ${d.targets && d.targets.week_ending || "—"}. Pre-registered read after 13 weeks (SWING_BOOK.md).</div>`;
+    el.innerHTML = summary + table;
+  } catch (e) {
+    el.innerHTML = `<span class="text-ink-faint text-xs">${escapeHTML(e.message)}</span>`;
+  }
+}
+
 async function refreshTrading() {
-  await Promise.all([refreshTradingStatus(), refreshTradingPerf(), refreshTradingPnl(), refreshTradingSummaries(), refreshStopStudy()]);
+  await Promise.all([refreshTradingStatus(), refreshTradingPerf(), refreshTradingPnl(), refreshTradingSummaries(), refreshStopStudy(), refreshSwing()]);
 }
 
 document.getElementById("trading-refresh-btn").addEventListener("click", refreshTrading);

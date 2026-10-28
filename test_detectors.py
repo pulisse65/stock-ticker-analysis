@@ -1038,5 +1038,28 @@ check("close: rejected partial falls back to close-all", _del_calls[1] == {"qty"
 check("close: 404 -> no_position synthetic", r3 == {"status": "no_position"})
 
 
+# ---------------- SWING BOOK (pure pieces) ----------------
+import numpy as np
+_wk_idx = pd.date_range("2024-01-05", periods=120, freq="W-FRI")
+_up = pd.DataFrame({"High": np.linspace(100, 220, 120) * 1.01, "Low": np.linspace(100, 220, 120) * 0.99, "Close": np.linspace(100, 220, 120)}, index=_wk_idx)
+_dn = pd.DataFrame({"High": np.linspace(220, 100, 120) * 1.01, "Low": np.linspace(220, 100, 120) * 0.99, "Close": np.linspace(220, 100, 120)}, index=_wk_idx)
+_fu = main._swing_weekly_features(_up); _fd = main._swing_weekly_features(_dn)
+check("swing features: steady uptrend ends above cloud, chikou up, eligible", bool(_fu.iloc[-1]["above"]) and bool(_fu.iloc[-1]["chikou"]) and bool(_fu.iloc[-1]["eligible"]) and _fu.iloc[-1]["mom"] > 0, str(_fu.iloc[-1].to_dict()))
+check("swing features: steady downtrend is below cloud and not eligible", bool(_fd.iloc[-1]["below"]) and not bool(_fd.iloc[-1]["eligible"]))
+check("swing features: first 77 weeks have no cloud (52-week span shifted 26) and are not eligible", not _fu["eligible"].iloc[:77].any() and _fu["cloud_top"].iloc[:77].isna().all())
+check("swing select: fills top-N best-first from nothing", main._swing_select(["A", "B", "C", "D", "E", "F", "G", "H", "I"], [], 5, 3) == ["A", "B", "C", "D", "E"])
+check("swing select: a holding ranked 7th (inside buffer) is kept, rank 9 is dropped", main._swing_select(["A", "B", "C", "D", "E", "F", "G", "H", "I"], ["G", "I"], 5, 3) == ["G", "A", "B", "C", "D"])
+check("swing select: holdings no longer eligible are dropped", main._swing_select(["A", "B"], ["Z"], 5, 3) == ["A", "B"])
+check("swing select: fewer eligible than N -> smaller book, no padding", main._swing_select(["A"], [], 5, 3) == ["A"])
+check("swing qty: whole shares under the slot", main._swing_qty(2000, 123.45) == 16 and main._swing_qty(2000, 2500) == 0 and main._swing_qty(2000, None) == 0)
+check("swing week key: ISO Monday", main._swing_week_key(_date(2026, 10, 29)) == "2026-10-26" and main._swing_week_key(_date(2026, 10, 26)) == "2026-10-26")
+check("swing: disabled by default, hook inert", main.SWING_ENABLED is False and main._maybe_run_swing_rebalance() is None)
+check("swing: rebalanced_this_week reads the marker row", main._swing_rebalanced_this_week([{"week_key": main._swing_week_key(), "side": "rebalance"}]) is True and main._swing_rebalanced_this_week([{"week_key": "2020-01-06", "side": "rebalance"}]) is False)
+_saved_tok3 = main.EXTERNAL_SIGNAL_TOKEN; main.EXTERNAL_SIGNAL_TOKEN = "t0k"
+resp = client.post("/purgatory/swing/rebalance")
+check("swing rebalance endpoint: 401 without token", resp.status_code == 401)
+main.EXTERNAL_SIGNAL_TOKEN = _saved_tok3
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -356,3 +356,8 @@ puts 10 trades +$268. October paper month −$8,827; all-time −$9,274. Live
 halted at −$184. AAPL call auto-muted again. `TRADING_DIRECTIONS` still
 `call,put`. Sizing fix held: zero entries above $750 since 10/22 (prior
 week max $4,380). RSS 267 MB, scan 6 s.
+
+**Swing book pre-registered 2026-10-27** — see `SWING_BOOK.md` (weekly
+cloud regime + 12-week momentum, top 5 equal weight, paper stock, read after
+13 weeks ≈ 2027-01-25). Backtest basis in
+`analysis/research/ichimoku_bb/swing_momentum.py`.
