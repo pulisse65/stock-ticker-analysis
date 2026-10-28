@@ -890,7 +890,7 @@ main._supabase_client = _saved_sb6
 r = client.get("/healthz?mem=1").json()
 check("healthz mem reports thread count", isinstance(r["mem"].get("threads"), int) and r["mem"]["threads"] >= 1)
 check("quote path cap lowered", main._QUOTE_PATH_CAP == 45)
-check("study cache ttl default 600 and reported", main._STUDY_CACHE_TTL_S == 600 and r["mem"]["study_cache_ttl_s"] == 600)
+check("study cache ttl default 1800 and reported", main._STUDY_CACHE_TTL_S == 1800 and r["mem"]["study_cache_ttl_s"] == 1800)
 
 # ---------------- STOP-STUDY PAIR FILTERS ----------------
 class _StopQ:
@@ -898,28 +898,34 @@ class _StopQ:
     def select(self, *a, **k): return self
     def gte(self, *a, **k): return self
     def eq(self, *a, **k): return self
+    def lt(self, *a, **k): return self
     def order(self, *a, **k): return self
     def range(self, a, b): self.a, self.b = a, b; return self
     def execute(self):
         class R: pass
         r = R(); r.data = self.rows[self.a:(self.b or len(self.rows)) + 1]; return r
+def _reset_study_cache():
+    main._study_rows_cache[True] = {}; main._study_rows_cache[False] = {}
+    main._study_rows_floor[True] = None; main._study_rows_floor[False] = None
 class _StopSB:
     def __init__(self, rows): self.rows = rows
     def table(self, name): return _StopQ(self.rows)
+_ss_seq = [0]
 def _ss_pair(strategy, tkr, direction, bar, fill, xfill, reason):
-    return [dict(id=1, role="entry", strategy=strategy, signal_ticker=tkr, signal_direction=direction, signal_bar_time=bar,
+    _ss_seq[0] += 2
+    return [dict(id=_ss_seq[0] - 1, role="entry", strategy=strategy, signal_ticker=tkr, signal_direction=direction, signal_bar_time=bar,
                  paper=True, qty=1, fill_price=fill, submitted_at=bar,
                  raw={"quote_path": [{"t": bar, "mid": fill}, {"t": bar, "mid": xfill}]}),
-            dict(id=2, role="exit", strategy=strategy, signal_ticker=tkr, signal_direction=direction, signal_bar_time=bar,
+            dict(id=_ss_seq[0], role="exit", strategy=strategy, signal_ticker=tkr, signal_direction=direction, signal_bar_time=bar,
                  paper=True, qty=1, fill_price=xfill, submitted_at=bar, raw={"exit_reason": reason})]
 _ss_rows = (_ss_pair("purgatory", "AAPL", "call", "2026-10-20T14:00:00+00:00", 1.0, 1.5, "hold")
             + _ss_pair("purgatory", "MSTR", "call", "2026-10-20T14:01:00+00:00", 3.0, 2.5, "stop_loss")
             + _ss_pair("vwap_reclaim", "AAPL", "put", "2026-10-20T14:02:00+00:00", 1.0, 0.8, "stop_loss"))
-_saved_sb6 = main._supabase_client; main._supabase_client = _StopSB(_ss_rows)
+_saved_sb6 = main._supabase_client; main._supabase_client = _StopSB(_ss_rows); _reset_study_cache()
 _all = main._stop_study_payload(30, "paper")
-_aapl = main._stop_study_payload(30, "paper", "purgatory", "aapl", "CALL")
-_mstr = main._stop_study_payload(30, "paper", ticker="MSTR")
-_none = main._stop_study_payload(30, "paper", strategy="market_wave")
+_reset_study_cache(); _aapl = main._stop_study_payload(30, "paper", "purgatory", "aapl", "CALL")
+_reset_study_cache(); _mstr = main._stop_study_payload(30, "paper", ticker="MSTR")
+_reset_study_cache(); _none = main._stop_study_payload(30, "paper", strategy="market_wave")
 main._supabase_client = _saved_sb6
 check("stop-study: unfiltered sees all three trades", _all["coverage"]["trades"] == 3 and _all["realized"]["stop"]["n"] == 2, str(_all["coverage"]))
 check("stop-study: strategy+ticker+direction filter is case-insensitive and keeps one trade",
@@ -964,9 +970,9 @@ check("stop detail: finds the lowest mid and flags replay/realized disagreement"
 _dt2 = dict(_dtrow, exit_reason="stop_loss", hold_mid=4.6, actual_pnl=-90.0)
 row2 = main._stop_study_trade_detail(_dt2, 15.0)
 check("stop detail: a real stop that replays as a stop does not disagree", row2["disagree"] is False and row2["replay_pnl"] == -90.0, str(row2))
-_saved_sb7 = main._supabase_client; main._supabase_client = _StopSB(_ss_rows)
+_saved_sb7 = main._supabase_client; main._supabase_client = _StopSB(_ss_rows); _reset_study_cache()
 _d = main._stop_study_payload(30, "paper", detail=True)
-_nd = main._stop_study_payload(30, "paper")
+_reset_study_cache(); _nd = main._stop_study_payload(30, "paper")
 main._supabase_client = _saved_sb7
 check("stop-study detail=1 returns per-trade rows (stopped trades without hold_mid excluded), default omits them", "trades" in _d and len(_d["trades"]) == 1 and "trades" not in _nd, str(list(_d)))
 
@@ -986,7 +992,7 @@ _late_rows = [dict(id=9, role="entry", strategy="purgatory", signal_ticker="MSTR
                    raw={"hold_deadline": "2026-10-13T14:28:00+00:00", "quote_path": _cap_path}),
               dict(id=10, role="exit", strategy="purgatory", signal_ticker="MSTR", signal_direction="call", signal_bar_time="2026-10-13T14:12:00+00:00",
                    paper=True, qty=1, fill_price=4.6, submitted_at="2026-10-13T14:28:30+00:00", raw={"exit_reason": "hold"})]
-_saved_sb8 = main._supabase_client; main._supabase_client = _StopSB(_late_rows)
+_saved_sb8 = main._supabase_client; main._supabase_client = _StopSB(_late_rows); _reset_study_cache()
 _lp = main._stop_study_payload(30, "paper", detail=True)
 main._supabase_client = _saved_sb8
 _r15 = next(r for r in _lp["study"]["rules"] if r["label"] == "15%")
@@ -1059,6 +1065,49 @@ _saved_tok3 = main.EXTERNAL_SIGNAL_TOKEN; main.EXTERNAL_SIGNAL_TOKEN = "t0k"
 resp = client.post("/purgatory/swing/rebalance")
 check("swing rebalance endpoint: 401 without token", resp.status_code == 401)
 main.EXTERNAL_SIGNAL_TOKEN = _saved_tok3
+
+
+# ---------------- STUDY ROW CACHE (egress) ----------------
+class _EgQ:
+    def __init__(self, sb): self.sb, self.f, self.a, self.b = sb, {}, 0, None
+    def select(self, *a, **k): return self
+    def eq(self, k, v): self.f[("eq", k)] = v; return self
+    def gte(self, k, v): self.f["gte"] = v; return self
+    def lt(self, k, v): self.f["lt"] = v; return self
+    def order(self, *a, **k): return self
+    def range(self, a, b): self.a, self.b = a, b; return self
+    def execute(self):
+        self.sb.reads.append(dict(self.f))
+        rows = [r for r in self.sb.rows if r["submitted_at"] >= self.f.get("gte", "") and ("lt" not in self.f or r["submitted_at"] < self.f["lt"])]
+        class R: pass
+        x = R(); x.data = rows[self.a:(self.b if self.b is not None else len(rows)) + 1]; return x
+class _EgSB:
+    def __init__(self, rows): self.rows, self.reads = rows, []
+    def table(self, name): return _EgQ(self)
+_nowu = _dt.now(_tz.utc)
+def _eg_row(i, hours_ago, role="entry"):
+    return dict(id=f"r{i}", role=role, strategy="purgatory", signal_ticker="AAPL", signal_direction="call", signal_bar_time="x", paper=True, qty=1, fill_price=1.0,
+                submitted_at=(_nowu - _td(hours=hours_ago)).isoformat(), raw={"quote_path": [{"t": "a", "mid": 1.0}], "junk": "x" * 100, "exit_reason": "hold"})
+_eg_rows = [_eg_row(1, 150), _eg_row(2, 100), _eg_row(3, 1), _eg_row(4, 0.5, "exit")]
+_saved_sb9, _saved_cache = main._supabase_client, (dict(main._study_rows_cache), dict(main._study_rows_floor))
+main._supabase_client = _EgSB(_eg_rows); main._study_rows_cache[True] = {}; main._study_rows_floor[True] = None
+_since7 = (_nowu - _td(days=7)).isoformat()
+r1 = main._study_rows(_since7, True)
+n_reads_first = len(main._supabase_client.reads)
+r2 = main._study_rows(_since7, True)
+n_reads_second = len(main._supabase_client.reads) - n_reads_first
+check("study cache: first call loads the window (4 rows) via an older read + a recent read", len(r1) == 4 and n_reads_first == 2, f"{len(r1)} rows, {n_reads_first} reads")
+check("study cache: second call only re-reads the recent slice (1 read), same rows", len(r2) == 4 and n_reads_second == 1 and main._supabase_client.reads[-1]["gte"] > _since7, str(main._supabase_client.reads[-1]))
+check("study cache: rows are slimmed to the keys the studies use", "junk" not in r2[0]["raw"] and "quote_path" in r2[0]["raw"])
+_since30 = (_nowu - _td(days=30)).isoformat()
+main._supabase_client.rows.append(_eg_row(0, 24 * 20))
+r3 = main._study_rows(_since30, True)
+check("study cache: a longer window loads only the missing older range", len(r3) == 5 and main._supabase_client.reads[-2].get("lt") == _since7, str(main._supabase_client.reads[-2]))
+main._supabase_client.rows[2]["raw"]["quote_path"].append({"t": "b", "mid": 0.9})
+r4 = main._study_rows(_since7, True)
+check("study cache: a recent row's new sample shows up on the next call", len([x for x in r4 if x["id"] == "r3"][0]["raw"]["quote_path"]) == 2)
+check("study TTL default raised to 1800", main._STUDY_CACHE_TTL_S == 1800)
+main._supabase_client = _saved_sb9; main._study_rows_cache.update(_saved_cache[0]); main._study_rows_floor.update(_saved_cache[1])
 
 
 print(f"\n{passed} passed, {failed} failed")
