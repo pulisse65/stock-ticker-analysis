@@ -9454,27 +9454,69 @@ def _swing_benchmarks(start_date: str | None) -> dict[str, Any]:
             "universe_equal_weight_pct": round(100 * sum(uni_r) / len(uni_r), 2) if uni_r else None}
 
 
+def _swing_reconcile_fills(rows: list[dict], max_lookups: int = 20) -> int:
+    """Fill in fill_price on logged orders from Alpaca's filled_avg_price so
+    the book is valued at what was actually paid, not Friday's close.
+    Bounded per call; rows without an order id or still unfilled are left."""
+    if _supabase_client is None or not _alpaca_enabled():
+        return 0
+    n = 0
+    for r in rows:
+        if n >= max_lookups:
+            break
+        if r.get("fill_price") is not None or not r.get("alpaca_order_id") or r.get("side") not in ("buy", "sell"):
+            continue
+        o = _alpaca_get_order(r["alpaca_order_id"], paper=True) or {}
+        fp = _safe_float(o.get("filled_avg_price"))
+        if fp is None:
+            continue
+        try:
+            _supabase_client.table(_SWING_TABLE).update({"fill_price": fp, "alpaca_status": o.get("status")}).eq("id", r["id"]).execute()
+            r["fill_price"] = fp; r["alpaca_status"] = o.get("status"); n += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("swing fill reconcile failed for %s: %s", r.get("id"), exc)
+    return n
+
+
+def _swing_book_value(rows: list[dict], holding: dict[str, dict], notional: float) -> dict[str, Any]:
+    """Pure. Cash-flow book: notional - buys + sells at FILL prices (rows
+    without a fill price are excluded and counted), plus current market
+    value of holdings."""
+    buys = sells = 0.0; unpriced = 0
+    for r in rows:
+        if r.get("side") not in ("buy", "sell"):
+            continue
+        fp = r.get("fill_price")
+        if fp is None:
+            unpriced += 1; continue
+        amt = (r.get("qty") or 0) * float(fp)
+        if r["side"] == "buy":
+            buys += amt
+        else:
+            sells += amt
+    mv = sum((p.get("market_value") or 0.0) for p in holding.values())
+    upl = sum((p.get("unrealized_pl") or 0.0) for p in holding.values())
+    equity = notional - buys + sells + mv
+    return {"market_value": round(mv, 2), "unrealized_pl": round(upl, 2), "cash": round(notional - buys + sells, 2),
+            "equity_est": round(equity, 2), "return_pct": round(100 * (equity / notional - 1), 2) if notional else None,
+            "unpriced_orders": unpriced}
+
+
 def _swing_status_payload() -> dict[str, Any]:
     tgt = _swing_targets()
     holding = _swing_holdings() if _alpaca_enabled() else {}
     rows = _swing_rows()
+    _swing_reconcile_fills(rows)
     markers = [r for r in rows if r.get("side") == "rebalance"]
     first = min((r.get("ts") or "" for r in markers), default=None)
-    mv = sum((p.get("market_value") or 0.0) for p in holding.values())
-    upl = sum((p.get("unrealized_pl") or 0.0) for p in holding.values())
-    # realized: sells at fill vs cost are not tracked by Alpaca per lot in this view; report cash-flow P&L from the log
-    buys = sum((r.get("qty") or 0) * (r.get("fill_price") or r.get("est_price") or 0) for r in rows if r.get("side") == "buy")
-    sells = sum((r.get("qty") or 0) * (r.get("fill_price") or r.get("est_price") or 0) for r in rows if r.get("side") == "sell")
-    equity_est = SWING_NOTIONAL_USD - buys + sells + mv
+    book = _swing_book_value(rows, holding, SWING_NOTIONAL_USD)
     return {
         "enabled": SWING_ENABLED, "registered_at": _SWING_REGISTERED_AT, "notional_usd": SWING_NOTIONAL_USD,
         "top_n": SWING_TOP_N, "buffer": SWING_BUFFER, "mom_weeks": SWING_MOM_WEEKS,
         "rebalance_after_et": SWING_REBALANCE_AFTER_ET, "week_key": _swing_week_key(),
         "rebalanced_this_week": _swing_rebalanced_this_week(rows),
         "targets": tgt, "holdings": holding,
-        "book": {"market_value": round(mv, 2), "unrealized_pl": round(upl, 2), "equity_est": round(equity_est, 2),
-                 "return_pct": round(100 * (equity_est / SWING_NOTIONAL_USD - 1), 2) if SWING_NOTIONAL_USD else None,
-                 "weeks_run": len(markers), "first_rebalance": first},
+        "book": {**book, "weeks_run": len(markers), "first_rebalance": first},
         "benchmarks": _swing_benchmarks(first[:10] if first else None),
         "log_tail": rows[-30:],
         "ts": _now_iso(),

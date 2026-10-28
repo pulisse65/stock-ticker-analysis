@@ -1110,5 +1110,29 @@ check("study TTL default raised to 1800", main._STUDY_CACHE_TTL_S == 1800)
 main._supabase_client = _saved_sb9; main._study_rows_cache.update(_saved_cache[0]); main._study_rows_floor.update(_saved_cache[1])
 
 
+# ---------------- SWING BOOK VALUE AT FILL PRICES ----------------
+_sw_rows = [{"side": "buy", "qty": 11, "est_price": 175.91, "fill_price": 183.87}, {"side": "buy", "qty": 3, "est_price": 524.51, "fill_price": None},
+            {"side": "rebalance", "qty": 0}, {"side": "sell", "qty": 11, "fill_price": 190.0}]
+_sw_hold = {"MSFT": {"qty": 3, "market_value": 1591.02, "unrealized_pl": -10.62}}
+_bv = main._swing_book_value(_sw_rows, _sw_hold, 10000.0)
+check("swing book: valued at fill prices, unpriced orders excluded and counted",
+      _bv["cash"] == round(10000 - 11 * 183.87 + 11 * 190.0, 2) and _bv["unpriced_orders"] == 1 and _bv["market_value"] == 1591.02 and _bv["equity_est"] == round(10000 - 11 * 183.87 + 11 * 190.0 + 1591.02, 2), str(_bv))
+check("swing book: never uses est_price", "175.91" not in str(_bv) and abs(_bv["return_pct"] - round(100 * (_bv["equity_est"] / 10000 - 1), 2)) < 1e-9)
+_saved_go = main._alpaca_get_order; _upd = []
+class _SwSB:
+    def table(self, n):
+        class Q:
+            def update(self_, d): _upd.append(d); return self_
+            def eq(self_, *a): return self_
+            def execute(self_): return None
+        return Q()
+main._alpaca_get_order = lambda oid, paper=True: {"filled_avg_price": "183.87", "status": "filled"} if oid == "o1" else {"status": "new"}
+_saved_sb10, _saved_alp3 = main._supabase_client, main._alpaca_enabled; main._supabase_client = _SwSB(); main._alpaca_enabled = lambda: True
+_rr = [{"id": "a", "side": "buy", "alpaca_order_id": "o1", "fill_price": None}, {"id": "b", "side": "buy", "alpaca_order_id": "o2", "fill_price": None}, {"id": "c", "side": "rebalance"}]
+_n = main._swing_reconcile_fills(_rr)
+main._supabase_client, main._alpaca_enabled, main._alpaca_get_order = _saved_sb10, _saved_alp3, _saved_go
+check("swing reconcile: filled order gets fill_price written, unfilled left alone, marker skipped", _n == 1 and _rr[0]["fill_price"] == 183.87 and _rr[1]["fill_price"] is None and _upd == [{"fill_price": 183.87, "alpaca_status": "filled"}], f"{_n} {_rr} {_upd}")
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
