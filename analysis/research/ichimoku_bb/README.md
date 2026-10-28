@@ -29,3 +29,41 @@ A 38.6% on 88.
 Verdict: on this watchlist and horizon the combination does not beat
 picking a random bar. Purgatory's honest fixed-15 rate is 42% platform-wide
 and MSTR call 57%. Not added as a detector.
+
+## Swing timeframe (daily / weekly bars), added 2026-10-27
+
+Paul asked whether the cloud works on a weekly cadence. `swing_backtest.py`
+and `swing_periods.py`: yfinance daily bars Oct-2020 → Oct-2026, the 17
+watchlist names plus 20 liquid controls, long only, enter at the next close
+after the signal, exit when price closes back below the cloud (or below the
+base line), max hold 60 days / 26 weeks. No costs. Rules: **A** = the
+article (TK cross + above cloud + lagging span + upper-band break);
+**B** = A without the Bollinger condition; **E** = first close above the
+cloud with the lagging span confirming (plain cloud breakout).
+
+Pooled, median ticker, compounded return of the rule vs buy-and-hold:
+
+| | trades | win | 2022 bear: rule / B&H | 2023–26: rule / B&H | full-period drawdown: rule / B&H |
+|---|---|---|---|---|---|
+| A daily, article | 53 | 32% | | | |
+| B daily | 144 | 40% | −6% / −33% | +29% / +178% | −33% / −60% |
+| B weekly | 36 | 47% | 0% / −29% | +13% / +170% | −32% / −59% |
+| **E weekly** | 96 | 56% | **0% / −29%** | +58% / +170% | **−37% / −59%** |
+| random daily entries, 5–40 day holds | 7,200 | 55% | | | |
+
+Findings. The article's combination (A) is the worst variant on every
+timeframe: 32% wins, below random entry timing. The Bollinger "break above
+the upper band" condition is what hurts, since it buys 2-sigma spikes. The
+plain weekly cloud breakout (E) is a different animal: it was flat through
+all of 2022 while every ticker fell, and it roughly halves the full-period
+drawdown. The price is upside: it captured about a third of buy-and-hold in
+the bull years, and beat buy-and-hold on only 19% of tickers. On MSTR
+specifically, weekly E matched buy-and-hold (+748% vs +737%) with a −34%
+drawdown instead of −86%, which is the honest version of the friend's
+result: any long rule on MSTR made money; the cloud's contribution was
+staying out of 2022.
+
+What this is not: an edge on entry timing. What it might be: a regime
+filter (weekly close above the cloud = allowed to be long) that could gate
+which direction the intraday book trades. Untested; see the proposal in
+the 10/27 notes.

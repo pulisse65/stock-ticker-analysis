@@ -339,3 +339,20 @@ original 10/06 wording (stored 30-min-best label) it would have passed:
 The four 10/23 signals were all stored "win"/"flat" with negative f15. Not
 promotable under the binding rule. Any further test is the reviewer's
 quote-ledger protocol, owner's decision.
+
+**Hold-length study — pre-registered read DONE 2026-10-27.** 377 usable
+paper trades platform-wide (gate 60): 15 min −$4,303 / 141 stops, 20 min
+−$5,479 / 156, 25 min −$4,793 / 171, 30 min −$6,150 / 183, worst −$562 on
+every row. No longer hold clears the rule (every one raises `stopped` and
+loses more). **Decision: keep 15 minutes.** The AAPL-morning leg never
+became readable (1 usable of 7: the sampler's ±5-min match rarely lands for
+those entries). Study stays on as shadow data; no further reads scheduled.
+
+**Week 10/19–10/23 retro (2026-10-27).** Paper −$4,406 on 235 (prior week
+−$4,550 on 248). The two widened strategies were still trading until the
+10/21 revert: vwap_reclaim −$1,397, market_wave −$2,053. Purgatory-only
+since 10/22: 34 trades −$776; calls 24 trades 21% wr 17 stops −$1,044,
+puts 10 trades +$268. October paper month −$8,827; all-time −$9,274. Live
+halted at −$184. AAPL call auto-muted again. `TRADING_DIRECTIONS` still
+`call,put`. Sizing fix held: zero entries above $750 since 10/22 (prior
+week max $4,380). RSS 267 MB, scan 6 s.
