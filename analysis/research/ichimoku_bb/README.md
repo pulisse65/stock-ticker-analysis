@@ -67,3 +67,42 @@ What this is not: an edge on entry timing. What it might be: a regime
 filter (weekly close above the cloud = allowed to be long) that could gate
 which direction the intraday book trades. Untested; see the proposal in
 the 10/27 notes.
+
+## Does the weekly regime predict intraday direction? No. (2026-10-27)
+
+`regime_join.py` tags every honest signal (4,210) and paper fill (1,189)
+with the ticker's weekly-cloud regime as of the prior week's close
+(above / inside / below; no look-ahead) and splits by direction.
+
+| purgatory, fixed-15 endpoint | n | win | net f15 |
+|---|---|---|---|
+| with the regime (above+call, below+put) | 400 | 41.2% | −0.07 |
+| against the regime | 470 | 41.9% | −0.04 |
+
+Paper fills tell the same story once direction is held fixed: purgatory
+calls were positive in both regimes (+$2,761 above, +$1,731 below) and
+puts negative in both (−$4,154, −$2,959). The only cell with a real
+tilt is calls in a *below* regime, 56% on 170 signals (Wilson .48): buying
+dips in downtrending names, which is the opposite of what the cloud is
+supposed to say. Not pre-registering a forward test; the retrospective is
+unambiguous. The join script stays here so it can be rerun on new signals.
+
+## What a month looks like, weekly cloud rule E, long only, no costs
+
+Six years, equal-weight baskets, `monthly_profile.py`:
+
+| | CAGR | positive months | median month | worst month | worst quarter | max drawdown |
+|---|---|---|---|---|---|---|
+| watchlist basket, cloud | 12.9% | 44% | 0.0% | −8.2% | −14.6% | −21.5% |
+| watchlist basket, buy & hold | 32.1% | 62% | +2.4% | −17.1% | −20.2% | −37.2% |
+| QQQ, cloud | 12.8% | 38% | 0.0% | −7.6% | −9.6% | −21.3% |
+| QQQ, buy & hold | 18.5% | 62% | +1.8% | −12.9% | −17.9% | −35.1% |
+| MSTR, cloud | 42.8% | 24% | 0.0% | −24.8% | −28.5% | −34.1% |
+| MSTR, buy & hold | 42.8% | 53% | +2.7% | −48.3% | −56.5% | −86.3% |
+
+The typical month is zero because the rule is out of the market more than
+half the time. It is a drawdown-control overlay for someone who wants to
+hold volatile names without the 2022 experience, not a return generator.
+Last 13 months on the watchlist basket: cloud +15% cumulative vs buy and
+hold +15% — equal, with the cloud catching half the up months and half the
+down months.
