@@ -6886,6 +6886,12 @@ def _run_scan_pass() -> dict[str, Any]:
     # pass is still sampling, so threads never pile up.
     _run_shadow_sampler_async()
 
+    # Weekly swing book (pre-registered 2026-10-27): inert unless SWING_ENABLED.
+    try:
+        _maybe_run_swing_rebalance()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Swing hook failed: %s", exc)
+
     # Re-check the live circuit breaker when order state changed this pass,
     # so a breach alerts within one scan of the closing trade instead of
     # waiting for the next live entry attempt.
@@ -9118,3 +9124,323 @@ def index():
     if not INDEX.exists():
         raise HTTPException(status_code=404, detail="index.html not found")
     return FileResponse(INDEX)
+
+
+# ===================== SWING BOOK (weekly cloud regime + 12-week momentum) =====================
+# Pre-registered 2026-10-27 (SWING_BOOK.md). A paper STOCK book, separate from
+# the intraday options book: once a week, hold the top-N watchlist names that
+# closed the prior week above their weekly Ichimoku cloud (with the lagging
+# span confirming), ranked by 12-week return, equal weight. Benchmarks: the
+# equal-weight watchlist and SPY from the same start. Nothing here touches
+# purgatory_orders or the live account.
+SWING_ENABLED = os.environ.get("SWING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+SWING_NOTIONAL_USD = float(os.environ.get("SWING_NOTIONAL_USD", "10000"))
+SWING_TOP_N = max(1, int(os.environ.get("SWING_TOP_N", "5")))
+SWING_BUFFER = max(0, int(os.environ.get("SWING_BUFFER", "3")))
+SWING_MOM_WEEKS = 12
+SWING_REBALANCE_AFTER_ET = "09:35"
+_SWING_TABLE = "swing_trades"
+_SWING_REGISTERED_AT = "2026-10-27"
+_swing_lock = threading.Lock()
+
+
+def _swing_universe() -> list[str]:
+    raw = os.environ.get("SWING_UNIVERSE", "").strip()
+    if raw:
+        return sorted({x.strip().upper() for x in raw.split(",") if x.strip()})
+    return sorted(_purgatory_watchlist)
+
+
+def _swing_weekly_features(weekly: pd.DataFrame, mom_weeks: int = SWING_MOM_WEEKS) -> pd.DataFrame:
+    """Pure. `weekly` has High/Low/Close indexed by week-ending date. Returns
+    per-week: close, above (close > cloud top), chikou (close > close 26w
+    ago), eligible, mom (close / close mom_weeks ago - 1), cloud_top/bot."""
+    h, l, c = weekly["High"], weekly["Low"], weekly["Close"]
+    tenkan = (h.rolling(9).max() + l.rolling(9).min()) / 2
+    kijun = (h.rolling(26).max() + l.rolling(26).min()) / 2
+    span_a = ((tenkan + kijun) / 2).shift(26)
+    span_b = ((h.rolling(52).max() + l.rolling(52).min()) / 2).shift(26)
+    top = np.maximum(span_a, span_b); bot = np.minimum(span_a, span_b)
+    out = pd.DataFrame({
+        "close": c, "cloud_top": top, "cloud_bot": bot,
+        "above": (c > top), "below": (c < bot), "chikou": (c > c.shift(26)),
+        "mom": c / c.shift(mom_weeks) - 1,
+    })
+    out["eligible"] = out["above"] & out["chikou"] & out["mom"].notna() & top.notna()
+    return out
+
+
+def _swing_select(ranked_eligible: list[str], holding: list[str], top_n: int = SWING_TOP_N,
+                  buffer: int = SWING_BUFFER) -> list[str]:
+    """Pure. `ranked_eligible` is best-first. Current holdings stay while they
+    are still eligible and ranked within top_n + buffer; the rest of the
+    book is filled best-first. Deterministic order: kept names first in
+    rank order, then new names in rank order."""
+    keep = [t for t in ranked_eligible[: top_n + buffer] if t in holding]
+    out = list(keep)
+    for t in ranked_eligible:
+        if len(out) >= top_n:
+            break
+        if t not in out:
+            out.append(t)
+    return out[:top_n]
+
+
+def _swing_qty(slot_usd: float, price: float | None) -> int:
+    if not price or price <= 0 or slot_usd <= 0:
+        return 0
+    return int(slot_usd // price)
+
+
+def _swing_weekly_bars(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    """Daily closes from yfinance (same source as the rest of the dashboard),
+    resampled to weeks ending Friday. Only COMPLETED weeks are kept, so a
+    read on Monday sees last Friday's close and nothing from this week."""
+    if not tickers:
+        return {}
+    raw = yf.download(tickers, period="3y", interval="1d", auto_adjust=True,
+                      progress=False, group_by="ticker", threads=False)
+    out: dict[str, pd.DataFrame] = {}
+    today = pd.Timestamp.now(tz=_ET).normalize().tz_localize(None)
+    last_friday = today - pd.Timedelta(days=(today.weekday() - 4) % 7)
+    for t in tickers:
+        try:
+            d = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
+            d = d.dropna(subset=["Close"])
+        except Exception:  # noqa: BLE001
+            continue
+        if d.empty:
+            continue
+        w = d.resample("W-FRI").agg({"High": "max", "Low": "min", "Close": "last"}).dropna()
+        w = w[w.index <= last_friday]
+        if len(w) >= 80:
+            out[t] = w
+    return out
+
+
+def _swing_targets_payload() -> dict[str, Any]:
+    """Ranked table for the current week + the target book. Cached per ET
+    date (weekly data only changes on Friday close)."""
+    tickers = _swing_universe()
+    bars = _swing_weekly_bars(tickers)
+    rows = []
+    for t in tickers:
+        w = bars.get(t)
+        if w is None:
+            rows.append({"ticker": t, "data": False}); continue
+        f = _swing_weekly_features(w)
+        last = f.iloc[-1]
+        rows.append({
+            "ticker": t, "data": True, "week_ending": f.index[-1].date().isoformat(),
+            "close": round(float(last["close"]), 2),
+            "regime": "above" if bool(last["above"]) else ("below" if bool(last["below"]) else "inside"),
+            "chikou": bool(last["chikou"]), "mom_12w_pct": round(100 * float(last["mom"]), 1) if pd.notna(last["mom"]) else None,
+            "eligible": bool(last["eligible"]),
+        })
+    elig = sorted([r for r in rows if r.get("eligible")], key=lambda r: -(r["mom_12w_pct"] or -1e9))
+    for i, r in enumerate(elig):
+        r["rank"] = i + 1
+    return {"as_of": _now_iso(), "week_ending": max((r.get("week_ending") or "" for r in rows), default=None),
+            "universe": tickers, "rows": sorted(rows, key=lambda r: (r.get("rank") or 999, r["ticker"])),
+            "ranked_eligible": [r["ticker"] for r in elig]}
+
+
+def _swing_targets() -> dict[str, Any]:
+    return _cached_json(("swing", "targets", str(_now_et_date())), _swing_targets_payload, ttl=6 * 3600)
+
+
+def _alpaca_list_positions(paper: bool = True) -> list[dict]:
+    base, headers = _trading_api(paper)
+    try:
+        r = requests.get(f"{base}/v2/positions", headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.json() or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("List positions failed: %s", exc)
+        return []
+
+
+def _swing_holdings() -> dict[str, dict]:
+    """Equity positions on the paper account restricted to the swing
+    universe. The options book lives on the same account but every option
+    symbol is > 6 chars and asset_class 'us_option', so it never matches."""
+    uni = set(_swing_universe())
+    out = {}
+    for p in _alpaca_list_positions(paper=True):
+        if p.get("asset_class", "us_equity") != "us_equity":
+            continue
+        sym = p.get("symbol")
+        if sym in uni:
+            out[sym] = {"qty": int(float(p.get("qty") or 0)), "avg_entry": _safe_float(p.get("avg_entry_price")),
+                        "price": _safe_float(p.get("current_price")), "market_value": _safe_float(p.get("market_value")),
+                        "unrealized_pl": _safe_float(p.get("unrealized_pl"))}
+    return out
+
+
+def _swing_week_key(d=None) -> str:
+    """ISO Monday of the trading week, e.g. '2026-10-27'."""
+    d = d or _now_et_date()
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+def _swing_log(row: dict) -> None:
+    if _supabase_client is None:
+        return
+    try:
+        _supabase_client.table(_SWING_TABLE).insert(row).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("swing_trades insert failed: %s", exc)
+
+
+def _swing_rows(limit: int = 2000) -> list[dict]:
+    if _supabase_client is None:
+        return []
+    try:
+        return _page_all(lambda: (_supabase_client.table(_SWING_TABLE).select("*").order("ts", desc=False)))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("swing_trades read failed: %s", exc)
+        return []
+
+
+def _swing_rebalanced_this_week(rows: list[dict] | None = None) -> bool:
+    wk = _swing_week_key()
+    return any(r.get("week_key") == wk and r.get("side") == "rebalance" for r in (rows if rows is not None else _swing_rows()))
+
+
+def _swing_rebalance(dry_run: bool = True, force: bool = False) -> dict[str, Any]:
+    """Bring the paper stock book to this week's target. Sells first, then
+    buys, market orders, whole shares, one slot = SWING_NOTIONAL_USD / top_n.
+    Logs every order and one 'rebalance' marker row per week."""
+    if not _alpaca_enabled():
+        raise HTTPException(503, "Alpaca keys missing.")
+    with _swing_lock:
+        rows = _swing_rows()
+        if not force and not dry_run and _swing_rebalanced_this_week(rows):
+            return {"skipped": "already rebalanced this week", "week_key": _swing_week_key()}
+        tgt = _swing_targets()
+        holding = _swing_holdings()
+        target = _swing_select(tgt["ranked_eligible"], list(holding), SWING_TOP_N, SWING_BUFFER)
+        slot = SWING_NOTIONAL_USD / SWING_TOP_N
+        price_by = {r["ticker"]: r.get("close") for r in tgt["rows"]}
+        actions = []
+        for sym, pos in holding.items():
+            if sym not in target and pos["qty"] > 0:
+                actions.append({"side": "sell", "symbol": sym, "qty": pos["qty"], "reason": "dropped from target"})
+        for sym in target:
+            if sym in holding and holding[sym]["qty"] > 0:
+                continue
+            q = _swing_qty(slot, price_by.get(sym))
+            if q > 0:
+                actions.append({"side": "buy", "symbol": sym, "qty": q, "reason": "entered target", "est_price": price_by.get(sym)})
+            else:
+                actions.append({"side": "skip", "symbol": sym, "qty": 0, "reason": "slot too small for one share"})
+        placed = []
+        if not dry_run:
+            wk = _swing_week_key(); ts = _now_iso()
+            for a in actions:
+                if a["side"] not in ("buy", "sell"):
+                    continue
+                order = _alpaca_submit_market_order(a["symbol"], a["qty"], a["side"], paper=True)
+                row = {"ts": ts, "week_key": wk, "symbol": a["symbol"], "side": a["side"], "qty": a["qty"],
+                       "est_price": a.get("est_price"), "reason": a["reason"],
+                       "alpaca_order_id": (order or {}).get("id"), "alpaca_status": (order or {}).get("status"),
+                       "raw": {"order": order, "target": target}}
+                _swing_log(row); placed.append({**a, "order_id": (order or {}).get("id"), "status": (order or {}).get("status")})
+            _swing_log({"ts": ts, "week_key": wk, "symbol": "*", "side": "rebalance", "qty": 0, "reason": f"target={','.join(target)}",
+                        "raw": {"target": target, "ranked": tgt["ranked_eligible"], "holding_before": list(holding)}})
+            _WIDGET_CACHE.pop(("swing", "status"), None)
+        return {"dry_run": dry_run, "week_key": _swing_week_key(), "target": target, "holding_before": list(holding),
+                "actions": actions, "placed": placed, "slot_usd": round(slot, 2)}
+
+
+def _maybe_run_swing_rebalance() -> dict | None:
+    """Scan-loop hook: Monday (or the first session of the week) at or after
+    SWING_REBALANCE_AFTER_ET, once per week. Inert unless SWING_ENABLED."""
+    if not SWING_ENABLED or not _alpaca_enabled() or _supabase_client is None:
+        return None
+    now = pd.Timestamp.now(tz=_ET)
+    if now.weekday() > 4 or now.strftime("%H:%M") < SWING_REBALANCE_AFTER_ET:
+        return None
+    try:
+        if _swing_rebalanced_this_week():
+            return None
+        res = _swing_rebalance(dry_run=False)
+        try:
+            _post_slack_text(f"📘 *SWING BOOK* week {res.get('week_key')}: target {', '.join(res.get('target') or []) or '—'}; "
+                             f"{len(res.get('placed') or [])} orders placed.")
+        except Exception:  # noqa: BLE001
+            pass
+        return res
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Swing rebalance failed: %s", exc)
+        return {"error": str(exc)}
+
+
+def _swing_benchmarks(start_date: str | None) -> dict[str, Any]:
+    """Equal-weight universe and SPY, total return since start_date (the
+    first rebalance), from yfinance daily closes."""
+    if not start_date:
+        return {}
+    uni = _swing_universe()
+    try:
+        raw = yf.download(sorted(set(uni + ["SPY"])), start=start_date, interval="1d", auto_adjust=True,
+                          progress=False, group_by="ticker", threads=False)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+    rets = {}
+    for t in set(uni + ["SPY"]):
+        try:
+            c = (raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw)["Close"].dropna()
+            if len(c) >= 2:
+                rets[t] = float(c.iloc[-1] / c.iloc[0] - 1)
+        except Exception:  # noqa: BLE001
+            continue
+    uni_r = [rets[t] for t in uni if t in rets]
+    return {"since": start_date, "spy_pct": round(100 * rets["SPY"], 2) if "SPY" in rets else None,
+            "universe_equal_weight_pct": round(100 * sum(uni_r) / len(uni_r), 2) if uni_r else None}
+
+
+def _swing_status_payload() -> dict[str, Any]:
+    tgt = _swing_targets()
+    holding = _swing_holdings() if _alpaca_enabled() else {}
+    rows = _swing_rows()
+    markers = [r for r in rows if r.get("side") == "rebalance"]
+    first = min((r.get("ts") or "" for r in markers), default=None)
+    mv = sum((p.get("market_value") or 0.0) for p in holding.values())
+    upl = sum((p.get("unrealized_pl") or 0.0) for p in holding.values())
+    # realized: sells at fill vs cost are not tracked by Alpaca per lot in this view; report cash-flow P&L from the log
+    buys = sum((r.get("qty") or 0) * (r.get("fill_price") or r.get("est_price") or 0) for r in rows if r.get("side") == "buy")
+    sells = sum((r.get("qty") or 0) * (r.get("fill_price") or r.get("est_price") or 0) for r in rows if r.get("side") == "sell")
+    equity_est = SWING_NOTIONAL_USD - buys + sells + mv
+    return {
+        "enabled": SWING_ENABLED, "registered_at": _SWING_REGISTERED_AT, "notional_usd": SWING_NOTIONAL_USD,
+        "top_n": SWING_TOP_N, "buffer": SWING_BUFFER, "mom_weeks": SWING_MOM_WEEKS,
+        "rebalance_after_et": SWING_REBALANCE_AFTER_ET, "week_key": _swing_week_key(),
+        "rebalanced_this_week": _swing_rebalanced_this_week(rows),
+        "targets": tgt, "holdings": holding,
+        "book": {"market_value": round(mv, 2), "unrealized_pl": round(upl, 2), "equity_est": round(equity_est, 2),
+                 "return_pct": round(100 * (equity_est / SWING_NOTIONAL_USD - 1), 2) if SWING_NOTIONAL_USD else None,
+                 "weeks_run": len(markers), "first_rebalance": first},
+        "benchmarks": _swing_benchmarks(first[:10] if first else None),
+        "log_tail": rows[-30:],
+        "ts": _now_iso(),
+    }
+
+
+@app.get("/purgatory/swing")
+def purgatory_swing():
+    return _cached_json(("swing", "status"), _swing_status_payload, ttl=300)
+
+
+@app.post("/purgatory/swing/rebalance")
+def purgatory_swing_rebalance(request: Request, dry_run: int = 1, force: int = 0):
+    """Token-gated (X-Signal-Token). dry_run=1 (default) lists the orders the
+    rule would place; dry_run=0 places them on the PAPER account."""
+    if not EXTERNAL_SIGNAL_TOKEN:
+        raise HTTPException(503, "Admin endpoints disabled: set EXTERNAL_SIGNAL_TOKEN.")
+    supplied = request.headers.get("X-Signal-Token", "")
+    if not hmac.compare_digest(supplied, EXTERNAL_SIGNAL_TOKEN):
+        raise HTTPException(401, "Bad or missing X-Signal-Token header.")
+    if not dry_run and _supabase_client is None:
+        raise HTTPException(503, "Requires Supabase (swing_trades table).")
+    return _swing_rebalance(dry_run=bool(dry_run), force=bool(force))
