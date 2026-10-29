@@ -180,19 +180,50 @@
     }
     .btn-ghost:hover { background: var(--bg-hover); color: var(--ink); border-color: var(--line-strong); }
 
-    /* Tabs */
-    .tab-btn {
-      position: relative;
-      color: var(--ink-dim);
-      padding: 0.6rem 1rem;
-      font-weight: 500;
-      transition: color .12s;
-      border-bottom: 2px solid transparent;
+    /* Side navigation (vertical tabs, collapsible). Below 768px it folds
+       into the old horizontal strip above the content. */
+    .side-nav {
+      position: sticky; top: 72px; align-self: flex-start;
+      width: 184px; flex: 0 0 auto;
+      display: flex; flex-direction: column; gap: 2px;
+      max-height: calc(100vh - 88px); overflow-y: auto;
+      transition: width .15s ease;
     }
-    .tab-btn:hover { color: var(--ink); }
-    .tab-btn.active {
-      color: var(--ink);
-      border-bottom-color: var(--brand);
+    .side-nav.collapsed { width: 48px; }
+    .tab-btn {
+      display: flex; align-items: center; gap: .6rem; width: 100%;
+      padding: .5rem .65rem; border-radius: .5rem; text-align: left;
+      color: var(--ink-dim); font-weight: 500; font-size: .9rem;
+      border-left: 3px solid transparent; transition: color .12s, background .12s;
+      white-space: nowrap;
+    }
+    .tab-btn:hover { color: var(--ink); background: var(--bg-hover); }
+    .tab-btn.active { color: var(--ink); background: var(--bg-hover); border-left-color: var(--brand); }
+    .tab-btn svg { width: 16px; height: 16px; flex: 0 0 16px; }
+    .side-nav.collapsed .tab-btn { justify-content: center; padding-left: .4rem; padding-right: .4rem; }
+    .side-nav.collapsed .tab-label { display: none; }
+    .nav-toggle {
+      display: flex; align-items: center; justify-content: center; gap: .5rem;
+      padding: .4rem .65rem; margin-bottom: .35rem; border-radius: .5rem;
+      color: var(--ink-faint); font-size: .72rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    }
+    .nav-toggle:hover { color: var(--ink); background: var(--bg-hover); }
+    .nav-toggle svg { width: 14px; height: 14px; transition: transform .15s; }
+    .side-nav.collapsed .nav-toggle svg { transform: rotate(180deg); }
+    .side-nav.collapsed .nav-toggle .tab-label { display: none; }
+    @media (max-width: 767px) {
+      .side-nav, .side-nav.collapsed {
+        position: static; width: 100%; max-height: none; flex-direction: row; gap: 0;
+        overflow-x: auto; overflow-y: hidden; border-bottom: 1px solid var(--line); margin-bottom: 1rem;
+      }
+      .side-nav .tab-btn, .side-nav.collapsed .tab-btn {
+        width: auto; border-left: 0; border-bottom: 2px solid transparent; border-radius: 0;
+        padding: .55rem .8rem; justify-content: center; background: transparent;
+      }
+      .side-nav .tab-btn.active { border-bottom-color: var(--brand); background: transparent; }
+      .side-nav .tab-btn svg { display: none; }
+      .side-nav.collapsed .tab-label { display: inline; }
+      .nav-toggle { display: none; }
     }
 
     /* Inline help: a small ? glyph or dotted-underlined label carrying data-tip (hover / tap) */
@@ -400,20 +431,6 @@
         <img src="/static/logo.png" alt="Ticker Tracker" class="h-10 w-auto" />
       </a>
 
-      <!-- Alerts first: it's the primary daily-use view. Tab clicks persist
-           to localStorage + URL hash so reloads land where you left off. -->
-      <nav class="flex items-center gap-0 overflow-x-auto no-scrollbar">
-        <button class="tab-btn active" data-tab="alerts">Alerts</button>
-        <button class="tab-btn" data-tab="trading">Trading</button>
-        <button class="tab-btn" data-tab="bullseye">Bullseye</button>
-        <button class="tab-btn" data-tab="analysis">Analysis</button>
-        <button class="tab-btn" data-tab="dashboard">Dashboard</button>
-        <button class="tab-btn" data-tab="watchlist">Quotes</button>
-        <button class="tab-btn" data-tab="sectors">Sectors</button>
-        <button class="tab-btn" data-tab="movers">Movers</button>
-        <button class="tab-btn" data-tab="ai">AI</button>
-      </nav>
-
       <div class="flex items-center gap-3">
         <span id="active-ticker-pill" class="ticker-pill hidden">—</span>
         <button id="help-btn" type="button" class="btn-ghost px-2.5 py-2 flex items-center justify-center" title="How to read this app" aria-label="Help — how to read this app">
@@ -438,7 +455,26 @@
     </div>
   </header>
 
-  <main class="max-w-7xl mx-auto px-4 py-6">
+  <div class="max-w-7xl mx-auto px-4 py-6 md:flex md:gap-6">
+    <!-- Vertical tabs. Alerts first: it's the primary daily-use view. Tab
+         clicks persist to localStorage + URL hash; the collapsed state
+         persists too (ui.navCollapsed). Folds to a horizontal strip < 768px. -->
+    <aside id="side-nav" class="side-nav" aria-label="Sections">
+      <button id="nav-toggle" type="button" class="nav-toggle" title="Collapse navigation" aria-label="Collapse navigation" aria-expanded="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="15 18 9 12 15 6"/></svg><span class="tab-label">Menu</span>
+      </button>
+      <button class="tab-btn active" data-tab="alerts" title="Alerts"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg><span class="tab-label">Alerts</span></button>
+      <button class="tab-btn" data-tab="trading" title="Trading"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg><span class="tab-label">Trading</span></button>
+      <button class="tab-btn" data-tab="bullseye" title="Bullseye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg><span class="tab-label">Bullseye</span></button>
+      <button class="tab-btn" data-tab="analysis" title="Analysis"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg><span class="tab-label">Analysis</span></button>
+      <button class="tab-btn" data-tab="dashboard" title="Dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg><span class="tab-label">Dashboard</span></button>
+      <button class="tab-btn" data-tab="watchlist" title="Quotes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg><span class="tab-label">Quotes</span></button>
+      <button class="tab-btn" data-tab="sectors" title="Sectors"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg><span class="tab-label">Sectors</span></button>
+      <button class="tab-btn" data-tab="movers" title="Movers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg><span class="tab-label">Movers</span></button>
+      <button class="tab-btn" data-tab="ai" title="AI"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 17l.8 2.2L22 20l-2.2.8L19 23l-.8-2.2L16 20l2.2-.8z"/></svg><span class="tab-label">AI</span></button>
+    </aside>
+
+  <main class="flex-1 min-w-0">
     <!-- ============================== ANALYSIS TAB ============================== -->
     <section id="tab-analysis" class="tab-panel space-y-6">
       <!-- Controls -->
@@ -1205,6 +1241,7 @@
       </div>
     </section>
   </main>
+  </div>
 
   <footer class="max-w-7xl mx-auto px-4 mt-12 mb-6 text-xs text-ink-faint text-center">
     Data via Yahoo Finance, Reddit, Google News, and TradingView. Educational use only — not investment advice.
@@ -1359,6 +1396,22 @@ function setTab(name) {
 }
 window.setTab = setTab;
 document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
+{
+  const nav = document.getElementById("side-nav"), toggle = document.getElementById("nav-toggle");
+  const apply = (collapsed) => {
+    nav.classList.toggle("collapsed", collapsed);
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+    toggle.title = toggle.ariaLabel = collapsed ? "Expand navigation" : "Collapse navigation";
+  };
+  let collapsed = false;
+  try { collapsed = localStorage.getItem("ui.navCollapsed") === "1"; } catch {}
+  apply(collapsed);
+  toggle.addEventListener("click", () => {
+    collapsed = !nav.classList.contains("collapsed");
+    apply(collapsed);
+    try { localStorage.setItem("ui.navCollapsed", collapsed ? "1" : "0"); } catch {}
+  });
+}
 window.addEventListener("hashchange", () => {
   const name = location.hash.replace(/^#/, "");
   if (KNOWN_TABS.includes(name)) setTab(name);
