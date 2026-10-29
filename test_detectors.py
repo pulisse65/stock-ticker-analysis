@@ -1134,5 +1134,55 @@ main._supabase_client, main._alpaca_enabled, main._alpaca_get_order = _saved_sb1
 check("swing reconcile: filled order gets fill_price written, unfilled left alone, marker skipped", _n == 1 and _rr[0]["fill_price"] == 183.87 and _rr[1]["fill_price"] is None and _upd == [{"fill_price": 183.87, "alpaca_status": "filled"}], f"{_n} {_rr} {_upd}")
 
 
+# ---------------- SLACK ONCE-GUARDS SURVIVE REDEPLOYS ----------------
+class _StateSB:
+    def __init__(self): self.store = {}
+    def table(self, name):
+        sb = self
+        class Q:
+            def __init__(self_): self_.k = None
+            def select(self_, *a): return self_
+            def eq(self_, k, v): self_.k = v; return self_
+            def limit(self_, n): return self_
+            def execute(self_):
+                class R: pass
+                r = R(); r.data = [{"value": sb.store[self_.k]}] if self_.k in sb.store else []; return r
+            def upsert(self_, row): sb.store[row["key"]] = row["value"]; return self_
+        return Q()
+_saved_sb11, _saved_posts = main._supabase_client, main._post_slack_text
+_posts = []; main._post_slack_text = lambda t: _posts.append(t) or True
+main._supabase_client = _StateSB(); main._app_state_mem.clear(); main._live_halt_slacked = False
+_halt = {"halted": True, "reason": "cumulative live P&L $-184.00 breached", "reset_at": "2026-10-07T02:38:30Z"}
+main._notify_live_halt_once(_halt)
+main._notify_live_halt_once(_halt)
+check("halt alert: posted once while halted", len(_posts) == 1)
+# simulate a redeploy: process memory wiped, table remembers the episode
+main._app_state_mem.clear(); main._live_halt_slacked = False
+main._notify_live_halt_once(_halt)
+check("halt alert: NOT re-posted after a redeploy for the same episode", len(_posts) == 1, str(_posts))
+main._notify_live_halt_once({**_halt, "reset_at": "2026-11-01T00:00:00Z"})
+check("halt alert: a new episode (reset_at changed) posts again", len(_posts) == 2)
+main._notify_live_halt_once({"halted": False})
+check("halt alert: clearing the halt clears the marker", main._state_get("live_halt_notified") is None and main._live_halt_slacked is False)
+# weekly retro guard across a redeploy
+_saved_cw, _saved_pw, _saved_se = main._compute_weekly_retro, main._post_weekly_retro_to_slack, main._slack_enabled
+main._compute_weekly_retro = lambda dates: {"total_signals": 5}; _wposts = []; main._post_weekly_retro_to_slack = lambda w: _wposts.append(w) or True; main._slack_enabled = lambda: True
+main._weekly_retro_posted = None; main._app_state_mem.clear(); main._supabase_client.store.pop("weekly_retro_posted", None)
+r1 = main._run_weekly_retro_if_due(force=True)
+main._weekly_retro_posted = None; main._app_state_mem.clear()   # redeploy
+import pandas as _pd
+_wk_now = _pd.Timestamp.now(tz="America/New_York").strftime("%G-W%V")
+check("weekly retro: forced post records the week marker in app_state", r1 is True and main._supabase_client.store.get("weekly_retro_posted") == _wk_now, str(main._supabase_client.store))
+main._compute_weekly_retro, main._post_weekly_retro_to_slack, main._slack_enabled = _saved_cw, _saved_pw, _saved_se
+# daily retro guard
+_saved_cd = main._compute_daily_retro; _cd_calls = []
+main._compute_daily_retro = lambda d: _cd_calls.append(d) or None
+main._state_set("daily_retro_posted", _pd.Timestamp.now(tz="America/New_York").date().isoformat())
+main._run_daily_retro_if_due()
+check("daily retro: skipped when today's marker is set (no recompute, no post)", _cd_calls == [], str(_cd_calls))
+main._compute_daily_retro = _saved_cd
+main._supabase_client, main._post_slack_text = _saved_sb11, _saved_posts; main._app_state_mem.clear()
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
