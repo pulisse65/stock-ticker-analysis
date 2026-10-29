@@ -4887,19 +4887,65 @@ def _live_halt_status(force: bool = False) -> dict[str, Any]:
     return status
 
 
+# --- Persistent one-shot markers (app_state) ---
+# Slack "once" guards used to be process globals; a redeploy reset them and
+# re-posted the live-halt alert and the retros. Markers now live in the
+# app_state table (supabase_app_state.sql) with an in-memory mirror, so a
+# missing table degrades to the old behaviour instead of failing.
+_APP_STATE_TABLE = "app_state"
+_app_state_mem: dict[str, Any] = {}
+_app_state_lock = threading.Lock()
+
+
+def _state_get(key: str) -> Any:
+    with _app_state_lock:
+        if key in _app_state_mem:
+            return _app_state_mem[key]
+    if _supabase_client is None:
+        return None
+    try:
+        res = _supabase_client.table(_APP_STATE_TABLE).select("value").eq("key", key).limit(1).execute()
+        val = (res.data or [{}])[0].get("value") if res.data else None
+    except Exception as exc:  # noqa: BLE001
+        log.debug("app_state read failed for %s: %s", key, exc)
+        return None
+    with _app_state_lock:
+        _app_state_mem[key] = val
+    return val
+
+
+def _state_set(key: str, value: Any) -> None:
+    with _app_state_lock:
+        _app_state_mem[key] = value
+    if _supabase_client is None:
+        return
+    try:
+        _supabase_client.table(_APP_STATE_TABLE).upsert({"key": key, "value": value, "updated_at": _now_iso()}).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("app_state write failed for %s: %s", key, exc)
+
+
 def _notify_live_halt_once(status: dict[str, Any]) -> None:
-    """One Slack alert per halt episode (re-arms if the breaker clears
-    after a LIVE_HALT_RESET_AT resume)."""
+    """One Slack alert per halt episode. An episode is identified by the
+    breaker's reset_at (a LIVE_HALT_RESET_AT resume starts a new one), so
+    the marker survives redeploys and never re-fires for the same halt."""
     global _live_halt_slacked
-    if status.get("halted") and not _live_halt_slacked:
-        _post_slack_text(
-            f"🛑 *LIVE TRADING HALTED* — {status.get('reason')}. "
-            f"Live entries are suspended (open positions still close normally); "
-            f"paper trading and scoring continue. To resume after review, set "
-            f"LIVE_HALT_RESET_AT to now so only newer trades count.")
-        _live_halt_slacked = True
-    elif not status.get("halted"):
+    if not status.get("halted"):
         _live_halt_slacked = False
+        if _state_get("live_halt_notified") is not None:
+            _state_set("live_halt_notified", None)
+        return
+    episode = str(status.get("reset_at") or "no-reset")
+    if _state_get("live_halt_notified") == episode:
+        _live_halt_slacked = True
+        return
+    _post_slack_text(
+        f"🛑 *LIVE TRADING HALTED* — {status.get('reason')}. "
+        f"Live entries are suspended (open positions still close normally); "
+        f"paper trading and scoring continue. To resume after review, set "
+        f"LIVE_HALT_RESET_AT to now so only newer trades count.")
+    _live_halt_slacked = True
+    _state_set("live_halt_notified", episode)
 
 
 # Filter thresholds (env-overridable so we can tighten/loosen without redeploy)
@@ -8701,11 +8747,15 @@ def _run_daily_retro_if_due(force_date: str | None = None) -> dict[str, Any] | N
     else:
         date_str = force_date
 
+    if not force_date and _state_get("daily_retro_posted") == date_str:
+        return None   # already posted today (marker survives redeploys and a failed summary save)
     summary = _compute_daily_retro(date_str)
     if summary is None:
         return None
 
     slack_ok = _post_daily_retro_to_slack(summary) if summary["total_signals"] > 0 else False
+    if slack_ok:
+        _state_set("daily_retro_posted", date_str)
     _save_daily_summary(summary, slack_ok)
 
     # Phase 2: AI analysis. Only run if Slack post landed (otherwise no point).
@@ -8869,11 +8919,13 @@ def _run_weekly_retro_if_due(force: bool = False) -> bool:
             return False
         if now_et.hour * 60 + now_et.minute < 16 * 60 + 20:
             return False
-        if _weekly_retro_posted == week_key:
+        if _weekly_retro_posted == week_key or _state_get("weekly_retro_posted") == week_key:
+            _weekly_retro_posted = week_key
             return False
     dates = [(now_et - pd.Timedelta(days=i)).strftime("%Y-%m-%d") for i in range(4, -1, -1)]
     w = _compute_weekly_retro(dates)
     _weekly_retro_posted = week_key
+    _state_set("weekly_retro_posted", week_key)
     if not w or not w.get("total_signals"):
         return False
     return _post_weekly_retro_to_slack(w)
