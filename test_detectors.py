@@ -1184,5 +1184,54 @@ main._compute_daily_retro = _saved_cd
 main._supabase_client, main._post_slack_text = _saved_sb11, _saved_posts; main._app_state_mem.clear()
 
 
+# ---------------- SWING BOOK FAILS CLOSED ----------------
+_tg_bad = {"rows": [{"ticker": "A", "data": True}] + [{"ticker": f"T{i}", "data": False} for i in range(9)], "ranked_eligible": []}
+_tg_ok = {"rows": [{"ticker": f"T{i}", "data": True} for i in range(10)], "ranked_eligible": ["T1", "T2"]}
+check("swing data gate: 1/10 tickers with data -> refuse", main._swing_data_ok(_tg_bad)[0] is False)
+check("swing data gate: full data -> ok", main._swing_data_ok(_tg_ok) == (True, "ok"))
+check("swing data gate: empty payload -> refuse", main._swing_data_ok({"rows": []})[0] is False)
+_saved_sr, _saved_st, _saved_sh, _saved_en5, _saved_sub2, _saved_post2 = main._swing_rows, main._swing_targets, main._swing_holdings, main.SWING_ENABLED, main._alpaca_submit_market_order, main._post_slack_text
+_orders2, _slack2 = [], []
+main._alpaca_submit_market_order = lambda *a, **k: _orders2.append(a) or {"id": "x", "status": "accepted"}
+main._post_slack_text = lambda t: _slack2.append(t) or True
+main._swing_week_done_mem = None; main._swing_error_notified_week = None
+_saved_alp4, _saved_sb12 = main._alpaca_enabled, main._supabase_client; main._alpaca_enabled = lambda: True; main._supabase_client = object()
+main._swing_rows = lambda: None            # table unreadable
+main._swing_targets = lambda: _tg_bad
+main._swing_holdings = lambda: {"QCOM": {"qty": 11}}
+try:
+    main._swing_rebalance(dry_run=False); _r = "no error"
+except Exception as e: _r = str(getattr(e, "detail", e))
+check("rebalance: unreadable marker table -> 503, no orders, nothing sold", "fail closed" in _r and _orders2 == [], _r)
+main._swing_rows = lambda: []
+try:
+    main._swing_rebalance(dry_run=False); _r = "no error"
+except Exception as e: _r = str(getattr(e, "detail", e))
+check("rebalance: missing price data -> 503, holdings NOT sold into an empty target", "incomplete" in _r and _orders2 == [], _r)
+main._swing_targets = lambda: _tg_ok; main._swing_holdings = lambda: None
+try:
+    main._swing_rebalance(dry_run=False); _r = "no error"
+except Exception as e: _r = str(getattr(e, "detail", e))
+check("rebalance: positions unreadable -> 503, no orders", "positions" in _r and _orders2 == [], _r)
+main._swing_rows = lambda: None
+check("rebalanced_this_week: unreadable table -> None (unknown), not False", main._swing_rebalanced_this_week(None) is None)
+# hook: enabled + unknown state -> silent skip; enabled + data missing -> one error post per week, no repeat
+main.SWING_ENABLED = True
+main._swing_rows = lambda: None
+import pandas as _pd2
+_is_weekday_hours = _pd2.Timestamp.now(tz="America/New_York").weekday() <= 4 and _pd2.Timestamp.now(tz="America/New_York").strftime("%H:%M") >= "09:35"
+_h1 = main._maybe_run_swing_rebalance()
+main._swing_rows = lambda: []; main._swing_targets = lambda: _tg_bad; main._swing_holdings = lambda: {"QCOM": {"qty": 11}}
+_h2 = main._maybe_run_swing_rebalance(); _h3 = main._maybe_run_swing_rebalance()
+if _is_weekday_hours:
+    check("hook: unknown marker state -> no action, no Slack", _h1 is None and _slack2 == [], str(_slack2))
+    check("hook: data missing -> error returned, ONE Slack warning for the week, no repeat", "error" in (_h2 or {}) and "error" in (_h3 or {}) and len(_slack2) == 1 and "not run" in _slack2[0], str(_slack2))
+else:
+    check("hook: outside the weekday window it is inert (test ran off-hours)", _h1 is None and _h2 is None and _slack2 == [])
+check("hook: still no orders placed by any failure path", _orders2 == [])
+main._swing_rows, main._swing_targets, main._swing_holdings, main.SWING_ENABLED, main._alpaca_submit_market_order, main._post_slack_text = _saved_sr, _saved_st, _saved_sh, _saved_en5, _saved_sub2, _saved_post2
+main._alpaca_enabled, main._supabase_client = _saved_alp4, _saved_sb12; main._swing_week_done_mem = None; main._swing_error_notified_week = None
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

@@ -9352,10 +9352,20 @@ def _swing_targets_payload() -> dict[str, Any]:
 
 
 def _swing_targets() -> dict[str, Any]:
-    return _cached_json(("swing", "targets", str(_now_et_date())), _swing_targets_payload, ttl=6 * 3600)
+    key = ("swing", "targets", str(_now_et_date()))
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    val = _swing_targets_payload()
+    ok, _ = _swing_data_ok(val)
+    if ok:
+        _cache_set(key, val, 6 * 3600)   # a failed/partial fetch is retried next call, never cached
+    return val
 
 
-def _alpaca_list_positions(paper: bool = True) -> list[dict]:
+def _alpaca_list_positions(paper: bool = True) -> list[dict] | None:
+    """None when the request fails (callers must treat that as unknown, not
+    as 'no positions'); [] only when the account really holds nothing."""
     base, headers = _trading_api(paper)
     try:
         r = requests.get(f"{base}/v2/positions", headers=headers, timeout=15)
@@ -9363,16 +9373,20 @@ def _alpaca_list_positions(paper: bool = True) -> list[dict]:
         return r.json() or []
     except Exception as exc:  # noqa: BLE001
         log.warning("List positions failed: %s", exc)
-        return []
+        return None
 
 
-def _swing_holdings() -> dict[str, dict]:
+def _swing_holdings() -> dict[str, dict] | None:
     """Equity positions on the paper account restricted to the swing
-    universe. The options book lives on the same account but every option
-    symbol is > 6 chars and asset_class 'us_option', so it never matches."""
+    universe, or None when Alpaca could not be read. The options book lives
+    on the same account but every option symbol is > 6 chars and
+    asset_class 'us_option', so it never matches."""
     uni = set(_swing_universe())
+    positions = _alpaca_list_positions(paper=True)
+    if positions is None:
+        return None
     out = {}
-    for p in _alpaca_list_positions(paper=True):
+    for p in positions:
         if p.get("asset_class", "us_equity") != "us_equity":
             continue
         sym = p.get("symbol")
@@ -9398,19 +9412,48 @@ def _swing_log(row: dict) -> None:
         log.warning("swing_trades insert failed: %s", exc)
 
 
-def _swing_rows(limit: int = 2000) -> list[dict]:
+def _swing_rows(limit: int = 2000) -> list[dict] | None:
+    """All swing_trades rows, or None when the table could not be read.
+    Callers that place orders must abort on None (fail closed)."""
     if _supabase_client is None:
-        return []
+        return None
     try:
         return _page_all(lambda: (_supabase_client.table(_SWING_TABLE).select("*").order("ts", desc=False)))
     except Exception as exc:  # noqa: BLE001
         log.warning("swing_trades read failed: %s", exc)
-        return []
+        return None
 
 
-def _swing_rebalanced_this_week(rows: list[dict] | None = None) -> bool:
+_swing_week_done_mem: str | None = None   # in-process mirror of the weekly marker
+
+
+def _swing_rebalanced_this_week(rows: list[dict] | None = None) -> bool | None:
+    """True/False from the marker rows; None when the table could not be
+    read (unknown — never treat as 'not yet')."""
     wk = _swing_week_key()
-    return any(r.get("week_key") == wk and r.get("side") == "rebalance" for r in (rows if rows is not None else _swing_rows()))
+    if _swing_week_done_mem == wk:
+        return True
+    if rows is None:
+        rows = _swing_rows()
+    if rows is None:
+        return None
+    return any(r.get("week_key") == wk and r.get("side") == "rebalance" for r in rows)
+
+
+_SWING_MIN_DATA_COVERAGE = 0.8
+
+
+def _swing_data_ok(tgt: dict) -> tuple[bool, str]:
+    """Pure. Refuse to act on a targets payload whose price data is mostly
+    missing: an empty target would sell the whole book."""
+    rows = tgt.get("rows") or []
+    if not rows:
+        return False, "no universe rows"
+    with_data = sum(1 for r in rows if r.get("data"))
+    cov = with_data / len(rows)
+    if cov < _SWING_MIN_DATA_COVERAGE:
+        return False, f"weekly data for only {with_data}/{len(rows)} tickers"
+    return True, "ok"
 
 
 def _swing_rebalance(dry_run: bool = True, force: bool = False) -> dict[str, Any]:
@@ -9419,12 +9462,21 @@ def _swing_rebalance(dry_run: bool = True, force: bool = False) -> dict[str, Any
     Logs every order and one 'rebalance' marker row per week."""
     if not _alpaca_enabled():
         raise HTTPException(503, "Alpaca keys missing.")
+    global _swing_week_done_mem
     with _swing_lock:
         rows = _swing_rows()
-        if not force and not dry_run and _swing_rebalanced_this_week(rows):
+        if rows is None and not dry_run:
+            raise HTTPException(503, "swing_trades could not be read; not rebalancing (fail closed).")
+        done = _swing_rebalanced_this_week(rows)
+        if not force and not dry_run and done:
             return {"skipped": "already rebalanced this week", "week_key": _swing_week_key()}
         tgt = _swing_targets()
+        ok, why = _swing_data_ok(tgt)
+        if not ok:
+            raise HTTPException(503, f"Swing data incomplete ({why}); not rebalancing (fail closed).")
         holding = _swing_holdings()
+        if holding is None:
+            raise HTTPException(503, "Alpaca positions could not be read; not rebalancing (fail closed).")
         target = _swing_select(tgt["ranked_eligible"], list(holding), SWING_TOP_N, SWING_BUFFER)
         slot = SWING_NOTIONAL_USD / SWING_TOP_N
         price_by = {r["ticker"]: r.get("close") for r in tgt["rows"]}
@@ -9454,6 +9506,7 @@ def _swing_rebalance(dry_run: bool = True, force: bool = False) -> dict[str, Any
                 _swing_log(row); placed.append({**a, "order_id": (order or {}).get("id"), "status": (order or {}).get("status")})
             _swing_log({"ts": ts, "week_key": wk, "symbol": "*", "side": "rebalance", "qty": 0, "reason": f"target={','.join(target)}",
                         "raw": {"target": target, "ranked": tgt["ranked_eligible"], "holding_before": list(holding)}})
+            _swing_week_done_mem = wk
             _WIDGET_CACHE.pop(("swing", "status"), None)
         return {"dry_run": dry_run, "week_key": _swing_week_key(), "target": target, "holding_before": list(holding),
                 "actions": actions, "placed": placed, "slot_usd": round(slot, 2)}
@@ -9467,19 +9520,41 @@ def _maybe_run_swing_rebalance() -> dict | None:
     now = pd.Timestamp.now(tz=_ET)
     if now.weekday() > 4 or now.strftime("%H:%M") < SWING_REBALANCE_AFTER_ET:
         return None
+    done = _swing_rebalanced_this_week()
+    if done is None:
+        log.warning("Swing: marker table unreadable this pass; skipping (fail closed).")
+        return None
+    if done:
+        return None
     try:
-        if _swing_rebalanced_this_week():
-            return None
         res = _swing_rebalance(dry_run=False)
-        try:
-            _post_slack_text(f"📘 *SWING BOOK* week {res.get('week_key')}: target {', '.join(res.get('target') or []) or '—'}; "
-                             f"{len(res.get('placed') or [])} orders placed.")
-        except Exception:  # noqa: BLE001
-            pass
-        return res
     except Exception as exc:  # noqa: BLE001
         log.warning("Swing rebalance failed: %s", exc)
+        _swing_notify_error_once(str(getattr(exc, "detail", exc)))
         return {"error": str(exc)}
+    if res.get("placed"):
+        try:
+            _post_slack_text(f"📘 *SWING BOOK* week {res.get('week_key')}: target {', '.join(res.get('target') or [])}; "
+                             f"{len(res['placed'])} orders placed: " + ", ".join(f"{a['side']} {a['qty']} {a['symbol']}" for a in res["placed"]))
+        except Exception:  # noqa: BLE001
+            pass
+    return res
+
+
+_swing_error_notified_week: str | None = None
+
+
+def _swing_notify_error_once(msg: str) -> None:
+    """At most one Slack line per week about a rebalance that could not run."""
+    global _swing_error_notified_week
+    wk = _swing_week_key()
+    if _swing_error_notified_week == wk:
+        return
+    _swing_error_notified_week = wk
+    try:
+        _post_slack_text(f"⚠️ *SWING BOOK* week {wk}: rebalance not run — {msg}. Will retry next scan; this is the only alert this week.")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _swing_benchmarks(start_date: str | None) -> dict[str, Any]:
@@ -9556,8 +9631,8 @@ def _swing_book_value(rows: list[dict], holding: dict[str, dict], notional: floa
 
 def _swing_status_payload() -> dict[str, Any]:
     tgt = _swing_targets()
-    holding = _swing_holdings() if _alpaca_enabled() else {}
-    rows = _swing_rows()
+    holding = (_swing_holdings() if _alpaca_enabled() else {}) or {}
+    rows = _swing_rows() or []
     _swing_reconcile_fills(rows)
     markers = [r for r in rows if r.get("side") == "rebalance"]
     first = min((r.get("ts") or "" for r in markers), default=None)
@@ -9566,7 +9641,8 @@ def _swing_status_payload() -> dict[str, Any]:
         "enabled": SWING_ENABLED, "registered_at": _SWING_REGISTERED_AT, "notional_usd": SWING_NOTIONAL_USD,
         "top_n": SWING_TOP_N, "buffer": SWING_BUFFER, "mom_weeks": SWING_MOM_WEEKS,
         "rebalance_after_et": SWING_REBALANCE_AFTER_ET, "week_key": _swing_week_key(),
-        "rebalanced_this_week": _swing_rebalanced_this_week(rows),
+        "rebalanced_this_week": bool(_swing_rebalanced_this_week(rows)),
+        "data_ok": _swing_data_ok(tgt),
         "targets": tgt, "holdings": holding,
         "book": {**book, "weeks_run": len(markers), "first_rebalance": first},
         "benchmarks": _swing_benchmarks(first[:10] if first else None),
