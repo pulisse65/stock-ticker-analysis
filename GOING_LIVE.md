@@ -126,6 +126,14 @@ entry+30 so the missed trades can be compared with the filled ones.
 Read: `GET /purgatory/entry-study?days=14`; rule in `analysis/README.md`.
 Verify with `/purgatory/status` → `entry_order_type`.
 
+## PEAD book (added 2026-11-08, paper only)
+
+Run `supabase_pead_trades.sql`, then set `PEAD_ENABLED=1` on Render. Rule,
+knobs and the pre-registered read are in `PEAD_BOOK.md`. Universe is the
+S&P 100 minus the swing universe so the two stock books never share a
+symbol on the paper account. Status: `GET /purgatory/pead`; today's rule
+evaluation: `GET /purgatory/pead/candidates`. Never live.
+
 ## Direction switch (added 2026-10-21)
 
 `TRADING_DIRECTIONS` (Render env, default `call,put`) decides which signal

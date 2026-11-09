@@ -1369,5 +1369,51 @@ resp = client.get("/purgatory/status")
 check("status reports entry_order_type + ttl", resp.status_code == 200 and resp.json().get("entry_order_type") == main.ENTRY_ORDER_TYPE and resp.json().get("entry_limit_ttl_s") == main.ENTRY_LIMIT_TTL_S)
 
 
+# ---------------- PEAD BOOK (post-earnings drift, paper stock) ----------------
+check("pead: defaults (off, $10k, $2k slots -> 5 positions, hold 10, z 2.0)", main.PEAD_ENABLED is False and main._pead_max_positions() == 5 and main.PEAD_HOLD_SESSIONS == 10 and main.PEAD_Z_MIN == 2.0)
+_pu = main._pead_universe()
+check("pead universe: S&P 100 minus the swing universe, no overlap", not (set(_pu) & set(main._swing_universe())) and "JPM" in _pu and len(_pu) >= 80, f"{len(_pu)}")
+import datetime as _pdt
+check("pead next session: Fri + 1 -> Mon; Thu 11/5 + 10 weekdays -> Thu 11/19", main._pead_next_session(_pdt.date(2026, 11, 6), 1) == _pdt.date(2026, 11, 9) and main._pead_next_session(_pdt.date(2026, 11, 5), 10) == _pdt.date(2026, 11, 19))
+_sess = [_pdt.date(2026, 11, 2), _pdt.date(2026, 11, 3), _pdt.date(2026, 11, 4), _pdt.date(2026, 11, 5)]
+check("pead reaction: after-close report 11/3 16:05 -> 11/4", main._pead_reaction_session(_pd.Timestamp("2026-11-03 16:05", tz="America/New_York"), _sess) == _pdt.date(2026, 11, 4))
+check("pead reaction: before-open report 11/3 07:00 -> 11/3", main._pead_reaction_session(_pd.Timestamp("2026-11-03 07:00", tz="America/New_York"), _sess) == _pdt.date(2026, 11, 3))
+check("pead reaction: report after the last known session -> None", main._pead_reaction_session(_pd.Timestamp("2026-11-05 16:05", tz="America/New_York"), _sess) is None)
+_dates = [_pdt.date(2026, 1, 1) + _pdt.timedelta(days=i) for i in range(70)]
+_cl = _pd.Series([100.0 * (1.001 ** i) * (1 + 0.01 * ((-1) ** i)) for i in range(69)] + [0.0], index=_dates)
+_cl.iloc[-1] = _cl.iloc[-2] * 1.08       # +8% reaction on a ~2%-sigma series
+_zz = main._pead_z(_cl, _dates[-1])
+check("pead z: +8% reaction on a ~2% sigma series -> z about 4", _zz is not None and 3.0 < _zz["z"] < 5.0 and abs(_zz["r"] - 0.08) < 1e-9, str(_zz))
+check("pead z: too little history -> None", main._pead_z(_cl.iloc[-20:], _dates[-1]) is None)
+_cands = [{"symbol": "A", "z": 2.5, "price": 100}, {"symbol": "B", "z": 3.1, "price": 50}, {"symbol": "C", "z": 1.9, "price": 10}, {"symbol": "D", "z": 2.2, "price": 20}]
+check("pead select: highest z first, below threshold dropped, held skipped, slots capped", [c["symbol"] for c in main._pead_select(_cands, {"B"}, 1)] == ["A"] and [c["symbol"] for c in main._pead_select(_cands, set(), 5)] == ["B", "A", "D"])
+_prow = [{"id": "b1", "side": "buy", "symbol": "X", "qty": 10, "fill_price": 100.0, "session_key": "2026-11-02", "exit_session": "2026-11-16", "z": 2.4, "alpaca_status": "filled"},
+         {"id": "b2", "side": "buy", "symbol": "Y", "qty": 5, "fill_price": 200.0, "session_key": "2026-11-03", "exit_session": "2026-11-17", "z": 2.1, "alpaca_status": "filled"},
+         {"id": "s1", "side": "sell", "symbol": "X", "qty": 10, "fill_price": 103.0, "session_key": "2026-11-16", "parent_id": "b1", "alpaca_status": "filled"},
+         {"id": "m1", "side": "scan", "symbol": "*", "session_key": "2026-11-03"}]
+check("pead open positions: buy without a sell -> open; closed one excluded", [r["id"] for r in main._pead_open_positions(_prow)] == ["b2"])
+_bk = main._pead_book(_prow, [{"symbol": "Y", "current_price": "210"}])
+check("pead book: closed X +3.0% / +$30, open Y unrealized +$50, stats", _bk["closed"][0]["ret_pct"] == 3.0 and _bk["closed"][0]["pnl"] == 30.0 and _bk["open"][0]["unrealized"] == 50.0 and _bk["stats"]["n_closed"] == 1 and _bk["stats"]["hit_rate_pct"] == 100.0, str(_bk["stats"]))
+check("pead entered today: marker row -> True; unreadable ledger -> None", main._pead_entered_today(_prow, "2026-11-03") is True and main._pead_entered_today(_prow, "2026-11-04") is False and main._pead_entered_today(None, "2026-11-04") is None)
+# hook inert when disabled; fail-closed on unreadable ledger
+_svp = (main.PEAD_ENABLED, main._pead_rows, main._alpaca_enabled, main._supabase_client, main._pead_entries_async)
+_pcalls = []
+main.PEAD_ENABLED = False; main._pead_rows = lambda: _pcalls.append("rows") or []
+check("pead hook: disabled -> None, no reads", main._maybe_run_pead() is None and _pcalls == [])
+main.PEAD_ENABLED = True; main._alpaca_enabled = lambda: True; main._supabase_client = object()
+main._pead_rows = lambda: None; main._pead_entries_async = lambda: _pcalls.append("entries") or True
+main._pead_entry_done_mem = None; main._pead_exit_done_mem = main._pead_session_key()
+_r = main._maybe_run_pead()
+check("pead hook: ledger unreadable -> no entries started (fail closed)", "entries" not in _pcalls, str(_pcalls))
+try:
+    main._pead_run_entries(dry_run=False); _raised = None
+except Exception as _e: _raised = _e
+check("pead entries: unreadable ledger raises 503, places nothing", _raised is not None and getattr(_raised, "status_code", None) == 503, str(_raised))
+(main.PEAD_ENABLED, main._pead_rows, main._alpaca_enabled, main._supabase_client, main._pead_entries_async) = _svp
+main._pead_entry_done_mem = None; main._pead_exit_done_mem = None
+resp = client.get("/purgatory/pead")
+check("GET /purgatory/pead responds with the rule parameters", resp.status_code == 200 and resp.json().get("hold_sessions") == 10 and resp.json().get("max_positions") == 5, str(resp.status_code))
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)

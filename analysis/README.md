@@ -415,6 +415,10 @@ positive in 11/11 years, +0.96% ex-TSLA, watchlist +2.45%. PASS 5/5. Edge is
 small and the level is mostly the names' own (survivorship) drift. Task 6 =
 paper book pre-registration, on the owner's go.
 
+**PEAD book pre-registered 2026-11-08** — see `PEAD_BOOK.md` (S&P 100 minus
+the swing universe, z ≥ 2 reaction → buy next open, $2k slots × 5, sell 10th
+close, paper stock; read at 50 closed trades or 2027-05-08).
+
 **Swing book pre-registered 2026-10-27** — see `SWING_BOOK.md` (weekly
 cloud regime + 12-week momentum, top 5 equal weight, paper stock, read after
 13 weeks ≈ 2027-01-25). Backtest basis in

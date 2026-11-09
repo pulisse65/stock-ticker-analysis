@@ -7335,6 +7335,11 @@ def _run_scan_pass() -> dict[str, Any]:
         _maybe_run_swing_rebalance()
     except Exception as exc:  # noqa: BLE001
         log.warning("Swing hook failed: %s", exc)
+    # PEAD book (pre-registered 2026-11-08): inert unless PEAD_ENABLED.
+    try:
+        _maybe_run_pead()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("PEAD hook failed: %s", exc)
 
     # Re-check the live circuit breaker when order state changed this pass,
     # so a breach alerts within one scan of the closing trade instead of
@@ -10055,3 +10060,483 @@ def purgatory_swing_rebalance(request: Request, dry_run: int = 1, force: int = 0
     if not dry_run and _supabase_client is None:
         raise HTTPException(503, "Requires Supabase (swing_trades table).")
     return _swing_rebalance(dry_run=bool(dry_run), force=bool(force))
+
+
+# ---------------------------------------------------------------------------
+# PEAD book — post-earnings drift, paper STOCK, pre-registered 2026-11-08
+# (PEAD_BOOK.md; backtest in analysis/research/earnings/EARNINGS_DRIFT.md).
+#
+# Rule: a universe stock whose earnings-day reaction (close/prior close − 1)
+# is ≥ PEAD_Z_MIN trailing-60-session daily sigmas is bought at the next
+# session's open (first scan ≥ 09:35 ET) with one PEAD_SLOT_USD slot and
+# sold at the close of the PEAD_HOLD_SESSIONS-th session after entry (first
+# scan ≥ 15:50 ET). Universe = S&P 100 minus the swing universe: both books
+# share the paper account and the swing rebalance treats any position in
+# its universe as its own, so the two must never hold the same symbol.
+# Fail closed: unreadable ledger / prices → no orders; Slack only on orders
+# placed plus one warning a day. Never live, never options.
+# ---------------------------------------------------------------------------
+PEAD_ENABLED = os.environ.get("PEAD_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+PEAD_NOTIONAL_USD = float(os.environ.get("PEAD_NOTIONAL_USD", "10000"))
+PEAD_SLOT_USD = float(os.environ.get("PEAD_SLOT_USD", "2000"))
+PEAD_HOLD_SESSIONS = max(1, int(os.environ.get("PEAD_HOLD_SESSIONS", "10")))
+PEAD_Z_MIN = float(os.environ.get("PEAD_Z_MIN", "2.0"))
+PEAD_ENTRY_AFTER_ET = "09:35"
+PEAD_EXIT_AFTER_ET = "15:50"
+_PEAD_TABLE = "pead_trades"
+_PEAD_REGISTERED_AT = "2026-11-08"
+_PEAD_SIGMA_WINDOW = 60
+_PEAD_SIGMA_MIN_OBS = 40
+_PEAD_SP100 = ("AAPL ABBV ABT ACN ADBE AIG AMD AMGN AMT AMZN AVGO AXP BA BAC BK BKNG BLK BMY BRK-B C CAT CHTR CL CMCSA COF "
+               "COP COST CRM CSCO CVS CVX DE DHR DIS DUK EMR FDX GD GE GILD GM GOOG GS HD HON IBM INTC INTU ISRG JNJ JPM KO "
+               "LIN LLY LMT LOW MA MCD MDLZ MDT MET META MMM MO MRK MS MSFT NEE NFLX NKE NOW NVDA ORCL PEP PFE PG PLTR PM "
+               "PYPL QCOM RTX SBUX SCHW SO SPG T TGT TMO TMUS TSLA TXN UBER UNH UNP UPS USB V VZ WFC WMT XOM").split()
+_pead_lock = threading.Lock()
+_pead_thread_lock = threading.Lock()
+_pead_entry_done_mem: str | None = None
+_pead_exit_done_mem: str | None = None
+_pead_error_notified_day: str | None = None
+_pead_candidates_cache: dict[str, Any] = {}
+
+
+def _pead_universe() -> list[str]:
+    """S&P 100 minus whatever the swing book may hold (its universe)."""
+    return sorted(set(_PEAD_SP100) - set(_swing_universe()))
+
+
+def _pead_max_positions() -> int:
+    return max(1, int(PEAD_NOTIONAL_USD // PEAD_SLOT_USD))
+
+
+def _pead_session_key(d=None) -> str:
+    return (d or _now_et_date()).isoformat()
+
+
+def _pead_next_session(d, n: int = 1):
+    """n weekdays after d (holidays ignored: a closed exit day just means
+    the exit fires on the next open session, since exits run on
+    exit_session <= today)."""
+    cur = d
+    for _ in range(n):
+        cur = cur + timedelta(days=1)
+        while cur.weekday() > 4:
+            cur = cur + timedelta(days=1)
+    return cur
+
+
+def _pead_reaction_session(report_ts, sessions: list):
+    """Session whose close carries the reaction: the report date itself when
+    the report lands before 09:30 ET, else the next session in `sessions`
+    (sorted dates). None when the sessions list does not reach it."""
+    try:
+        ts = pd.Timestamp(report_ts)
+        ts = ts.tz_localize(_ET) if ts.tzinfo is None else ts.tz_convert(_ET)
+    except Exception:  # noqa: BLE001
+        return None
+    d = ts.date()
+    before_open = ts.strftime("%H:%M") < "09:30"
+    cands = [x for x in sessions if (x >= d if before_open else x > d)]
+    return cands[0] if cands else None
+
+
+def _pead_z(closes: pd.Series, reaction, window: int = _PEAD_SIGMA_WINDOW,
+            min_obs: int = _PEAD_SIGMA_MIN_OBS) -> dict | None:
+    """Pure. closes indexed by date (sorted). Reaction return vs the prior
+    close, standardized by the std of daily returns over the `window`
+    sessions ending at the prior close. None when history is too short."""
+    idx = list(closes.index)
+    if reaction not in idx:
+        return None
+    i = idx.index(reaction)
+    if i < 2:
+        return None
+    r = float(closes.iloc[i] / closes.iloc[i - 1] - 1.0)
+    hist = closes.iloc[max(0, i - window): i].pct_change().dropna()
+    if len(hist) < min_obs:
+        return None
+    sigma = float(hist.std())
+    if not sigma or sigma <= 0:
+        return None
+    return {"r": r, "sigma": sigma, "z": r / sigma, "price": float(closes.iloc[i])}
+
+
+def _pead_select(cands: list[dict], held: set, slots: int, z_min: float = PEAD_Z_MIN) -> list[dict]:
+    """Pure. Highest z first, never a held symbol, at most `slots`."""
+    ok = [c for c in cands if c.get("z") is not None and c["z"] >= z_min and c["symbol"] not in held]
+    ok.sort(key=lambda c: -c["z"])
+    return ok[:max(0, slots)]
+
+
+def _pead_open_positions(rows: list[dict]) -> list[dict]:
+    """Buy rows without a sell row pointing at them (parent_id)."""
+    closed = {r.get("parent_id") for r in rows if r.get("side") == "sell" and r.get("parent_id")}
+    return [r for r in rows if r.get("side") == "buy" and r.get("id") not in closed
+            and (r.get("alpaca_status") or "").lower() not in _ENTRY_TERMINAL_STATUSES]
+
+
+def _pead_log(row: dict) -> None:
+    if _supabase_client is None:
+        return
+    try:
+        _supabase_client.table(_PEAD_TABLE).insert(row).execute()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pead_trades insert failed: %s", exc)
+
+
+def _pead_rows() -> list[dict] | None:
+    """All pead_trades rows, or None when unreadable (fail closed)."""
+    if _supabase_client is None:
+        return None
+    try:
+        return _page_all(lambda: (_supabase_client.table(_PEAD_TABLE).select("*").order("ts", desc=False)))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("pead_trades read failed: %s", exc)
+        return None
+
+
+def _pead_entered_today(rows: list[dict] | None, key: str | None = None) -> bool | None:
+    key = key or _pead_session_key()
+    if _pead_entry_done_mem == key:
+        return True
+    if rows is None:
+        return None
+    return any(r.get("side") == "scan" and r.get("session_key") == key for r in rows)
+
+
+def _pead_recent_events(session, universe: list[str]) -> tuple[list[dict], str]:
+    """Earnings reports dated within the 4 calendar days before `session`
+    for universe symbols: FMP calendar (one call) else yfinance per symbol.
+    Returns (events [{symbol, report}], source). Raises on total failure."""
+    since = (session - timedelta(days=4)).isoformat()
+    uni = set(universe)
+    try:
+        rows = _fmp_get("/earnings-calendar", {"from": since, "to": session.isoformat()}, timeout=15) or []
+        ev = [{"symbol": r.get("symbol"), "report": r.get("date")} for r in rows
+              if r.get("symbol") in uni and r.get("date")]
+        return ev, "fmp"
+    except FMPError as exc:
+        log.info("PEAD: FMP calendar unavailable (%s); yfinance fallback", exc)
+    ev = []
+    for sym in universe:
+        try:
+            df = yf.Ticker(sym).get_earnings_dates(limit=3)
+        except Exception:  # noqa: BLE001
+            continue
+        if df is None or len(df) == 0:
+            continue
+        for ts in df.index:
+            d = pd.Timestamp(ts).tz_convert(_ET).date() if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts).date()
+            if (session - timedelta(days=4)) <= d <= session:
+                ev.append({"symbol": sym, "report": d.isoformat(), "report_ts": pd.Timestamp(ts).isoformat()})
+    return ev, "yfinance"
+
+
+def _pead_report_timestamp(sym: str, report_date) -> pd.Timestamp | None:
+    """The yfinance earnings timestamp (carries the time of day) within 2
+    days of the calendar's report date."""
+    try:
+        df = yf.Ticker(sym).get_earnings_dates(limit=8)
+    except Exception:  # noqa: BLE001
+        return None
+    if df is None or len(df) == 0:
+        return None
+    best = None
+    for ts in df.index:
+        t = pd.Timestamp(ts)
+        d = t.tz_convert(_ET).date() if t.tzinfo else t.date()
+        if abs((d - report_date).days) <= 2 and (best is None or abs((d - report_date).days) < abs((best.date() - report_date).days)):
+            best = t
+    return best
+
+
+def _pead_candidates(session=None, force: bool = False) -> dict[str, Any]:
+    """Evaluate the rule for `session` (entries placed at that session's
+    open): events in the last 4 days whose reaction session is the most
+    recent completed session and whose z >= PEAD_Z_MIN. Cached per session."""
+    session = session or _now_et_date()
+    key = session.isoformat()
+    if not force and _pead_candidates_cache.get("key") == key:
+        return _pead_candidates_cache["val"]
+    uni = _pead_universe()
+    out: dict[str, Any] = {"session": key, "universe_n": len(uni), "events": [], "candidates": [], "errors": [], "source": None}
+    try:
+        events, src = _pead_recent_events(session, uni)
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append(f"events: {exc}")
+        out["ok"] = False
+        return out
+    out["source"] = src
+    for ev in events:
+        sym = ev["symbol"]
+        try:
+            rdate = pd.Timestamp(ev["report"]).date()
+            ts = pd.Timestamp(ev["report_ts"]) if ev.get("report_ts") else _pead_report_timestamp(sym, rdate)
+            if ts is None:
+                ts = pd.Timestamp(f"{rdate.isoformat()} 16:30", tz=_ET)   # unknown time → assume after close
+                ev["time_assumed"] = True
+            px = yf.download(sym, period="6mo", auto_adjust=True, progress=False, threads=False)
+            if px is None or len(px) == 0:
+                ev["error"] = "no prices"; out["events"].append(ev); continue
+            closes = px["Close"]
+            if isinstance(closes, pd.DataFrame):
+                closes = closes.iloc[:, 0]
+            closes.index = [pd.Timestamp(x).date() for x in closes.index]
+            closes = closes[[d for d in closes.index if d < session]]      # completed sessions only
+            sessions = list(closes.index)
+            reaction = _pead_reaction_session(ts, sessions)
+            ev.update({"report_ts": pd.Timestamp(ts).isoformat(), "reaction": reaction.isoformat() if reaction else None})
+            if reaction is None or not sessions or reaction != sessions[-1]:
+                ev["skip"] = "reaction session is not the last completed session"
+                out["events"].append(ev); continue
+            zz = _pead_z(closes, reaction)
+            if zz is None:
+                ev["skip"] = "insufficient history for sigma"; out["events"].append(ev); continue
+            ev.update({k: round(v, 4) for k, v in zz.items()})
+            out["events"].append(ev)
+            if zz["z"] >= PEAD_Z_MIN:
+                out["candidates"].append({"symbol": sym, "report": ev["report"], "reaction": ev["reaction"],
+                                          "z": round(zz["z"], 2), "r_pct": round(zz["r"] * 100, 2), "price": round(zz["price"], 2)})
+        except Exception as exc:  # noqa: BLE001
+            ev["error"] = str(exc)[:200]; out["events"].append(ev); out["errors"].append(f"{sym}: {exc}")
+    out["ok"] = True
+    _pead_candidates_cache.update({"key": key, "val": out})
+    return out
+
+
+def _pead_run_entries(dry_run: bool = True, force: bool = False) -> dict[str, Any]:
+    """Place today's entries (paper). One pass per session (scan marker)."""
+    if not _alpaca_enabled():
+        raise HTTPException(503, "Alpaca keys missing.")
+    global _pead_entry_done_mem
+    with _pead_lock:
+        today = _now_et_date(); key = _pead_session_key(today)
+        rows = _pead_rows()
+        if rows is None and not dry_run:
+            raise HTTPException(503, "pead_trades could not be read; no entries (fail closed).")
+        done = _pead_entered_today(rows, key)
+        if not force and not dry_run and done:
+            return {"skipped": "entries already evaluated this session", "session": key}
+        cands = _pead_candidates(today, force=force)
+        if not cands.get("ok"):
+            raise HTTPException(503, f"PEAD events unavailable ({'; '.join(cands.get('errors') or [])}); no entries (fail closed).")
+        open_rows = _pead_open_positions(rows or [])
+        held = {r["symbol"] for r in open_rows} | set(_swing_universe())
+        slots = _pead_max_positions() - len(open_rows)
+        chosen = _pead_select(cands["candidates"], held, slots)
+        actions = []
+        for c in chosen:
+            q = int(PEAD_SLOT_USD // c["price"]) if c.get("price") else 0
+            actions.append({"side": "buy" if q > 0 else "skip", "symbol": c["symbol"], "qty": q, "z": c["z"],
+                            "est_price": c["price"], "reaction": c["reaction"], "report": c["report"],
+                            "reason": "z>=%.1f reaction" % PEAD_Z_MIN if q > 0 else "slot too small for one share"})
+        placed = []
+        if not dry_run:
+            ts = _now_iso(); exit_s = _pead_next_session(today, PEAD_HOLD_SESSIONS).isoformat()
+            for a in actions:
+                if a["side"] != "buy":
+                    continue
+                order = _alpaca_submit_market_order(a["symbol"], a["qty"], "buy", paper=True)
+                _pead_log({"ts": ts, "session_key": key, "symbol": a["symbol"], "side": "buy", "qty": a["qty"],
+                           "est_price": a["est_price"], "reason": a["reason"], "z": a["z"],
+                           "event_date": a["report"], "reaction_session": a["reaction"], "exit_session": exit_s,
+                           "alpaca_order_id": (order or {}).get("id"), "alpaca_status": (order or {}).get("status"),
+                           "raw": {"order": order}})
+                placed.append({**a, "exit_session": exit_s, "order_id": (order or {}).get("id"), "status": (order or {}).get("status")})
+            _pead_log({"ts": ts, "session_key": key, "symbol": "*", "side": "scan", "qty": 0,
+                       "reason": f"{len(cands['candidates'])} candidates, {len(placed)} placed, {len(open_rows)} open",
+                       "raw": {"candidates": cands["candidates"], "source": cands.get("source"), "slots": slots}})
+            _pead_entry_done_mem = key
+            _WIDGET_CACHE.pop(("pead", "status"), None)
+        return {"dry_run": dry_run, "session": key, "source": cands.get("source"), "candidates": cands["candidates"],
+                "open_before": sorted(r["symbol"] for r in open_rows), "slots": slots, "actions": actions, "placed": placed}
+
+
+def _pead_run_exits(dry_run: bool = True) -> dict[str, Any]:
+    """Sell every open position whose exit_session <= today (paper)."""
+    if not _alpaca_enabled():
+        raise HTTPException(503, "Alpaca keys missing.")
+    global _pead_exit_done_mem
+    with _pead_lock:
+        today = _now_et_date(); key = _pead_session_key(today)
+        rows = _pead_rows()
+        if rows is None:
+            raise HTTPException(503, "pead_trades could not be read; no exits (fail closed).")
+        due = [r for r in _pead_open_positions(rows) if (r.get("exit_session") or "9999") <= key]
+        placed = []
+        if not dry_run:
+            ts = _now_iso()
+            for r in due:
+                res = _alpaca_close_position(r["symbol"], paper=True, qty=int(r.get("qty") or 0))
+                if not res:
+                    continue       # Alpaca unreachable: leave it open, retry next pass
+                _pead_log({"ts": ts, "session_key": key, "symbol": r["symbol"], "side": "sell", "qty": r.get("qty"),
+                           "parent_id": r["id"], "reason": "hold complete" if res.get("status") != "no_position" else "no position at Alpaca",
+                           "alpaca_order_id": res.get("id"), "alpaca_status": res.get("status"), "raw": {"order": res}})
+                placed.append({"symbol": r["symbol"], "qty": r.get("qty"), "status": res.get("status"), "parent_id": r["id"]})
+            if len(placed) == len(due):
+                _pead_exit_done_mem = key
+            _WIDGET_CACHE.pop(("pead", "status"), None)
+        return {"dry_run": dry_run, "session": key, "due": [{"symbol": r["symbol"], "qty": r.get("qty"), "exit_session": r.get("exit_session")} for r in due], "placed": placed}
+
+
+def _pead_notify_error_once(msg: str) -> None:
+    global _pead_error_notified_day
+    key = _pead_session_key()
+    if _pead_error_notified_day == key:
+        return
+    _pead_error_notified_day = key
+    try:
+        _post_slack_text(f"⚠️ *PEAD BOOK* {key}: not run — {msg}. Only alert today.")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pead_entries_async() -> bool:
+    """Entries need yfinance/FMP calls; run them off the scan thread."""
+    if not _pead_thread_lock.acquire(blocking=False):
+        return False
+
+    def _go():
+        try:
+            res = _pead_run_entries(dry_run=False)
+            if res.get("placed"):
+                _post_slack_text(f"📗 *PEAD BOOK* {res['session']}: " + ", ".join(
+                    f"buy {a['qty']} {a['symbol']} (z {a['z']}, exit {a['exit_session']})" for a in res["placed"]))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("PEAD entries failed: %s", exc)
+            _pead_notify_error_once(str(getattr(exc, "detail", exc)))
+        finally:
+            _pead_thread_lock.release()
+    threading.Thread(target=_go, daemon=True, name="pead-entries").start()
+    return True
+
+
+def _maybe_run_pead() -> dict | None:
+    """Scan-loop hook. Inert unless PEAD_ENABLED. Entries once per session
+    at/after 09:35 ET (background thread); exits at/after 15:50 ET."""
+    if not PEAD_ENABLED or not _alpaca_enabled() or _supabase_client is None:
+        return None
+    now = pd.Timestamp.now(tz=_ET)
+    if now.weekday() > 4:
+        return None
+    hhmm = now.strftime("%H:%M"); key = _pead_session_key()
+    out: dict[str, Any] = {}
+    if hhmm >= PEAD_ENTRY_AFTER_ET and _pead_entry_done_mem != key:
+        done = _pead_entered_today(_pead_rows(), key)
+        if done is None:
+            log.warning("PEAD: ledger unreadable this pass; skipping entries (fail closed).")
+        elif not done:
+            out["entries_started"] = _pead_entries_async()
+    if hhmm >= PEAD_EXIT_AFTER_ET and _pead_exit_done_mem != key:
+        try:
+            res = _pead_run_exits(dry_run=False)
+            out["exits"] = res.get("placed")
+            if res.get("placed"):
+                _post_slack_text(f"📗 *PEAD BOOK* {key}: sold " + ", ".join(f"{a['qty']} {a['symbol']}" for a in res["placed"]))
+            if not res.get("due"):
+                _pead_exit_done_mem = key
+        except Exception as exc:  # noqa: BLE001
+            log.warning("PEAD exits failed: %s", exc)
+            _pead_notify_error_once(str(getattr(exc, "detail", exc)))
+    return out or None
+
+
+def _pead_reconcile_fills(rows: list[dict], max_lookups: int = 20) -> int:
+    if _supabase_client is None or not _alpaca_enabled():
+        return 0
+    n = 0
+    for r in rows:
+        if n >= max_lookups:
+            break
+        if r.get("fill_price") is not None or not r.get("alpaca_order_id") or r.get("side") not in ("buy", "sell"):
+            continue
+        o = _alpaca_get_order(r["alpaca_order_id"], paper=True) or {}
+        fp = _safe_float(o.get("filled_avg_price"))
+        if fp is None:
+            continue
+        try:
+            _supabase_client.table(_PEAD_TABLE).update({"fill_price": fp, "alpaca_status": o.get("status")}).eq("id", r["id"]).execute()
+            r["fill_price"] = fp; r["alpaca_status"] = o.get("status"); n += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("pead fill reconcile failed for %s: %s", r.get("id"), exc)
+    return n
+
+
+def _pead_book(rows: list[dict], positions: list[dict] | None) -> dict[str, Any]:
+    """Pure-ish. Closed trades (buy+sell fills) and open positions marked to
+    Alpaca's current price. Returns per-trade rows and summary stats."""
+    sells = {r.get("parent_id"): r for r in rows if r.get("side") == "sell" and r.get("parent_id")}
+    cur = {p.get("symbol"): _safe_float(p.get("current_price")) for p in (positions or [])}
+    closed, open_ = [], []
+    for b in rows:
+        if b.get("side") != "buy":
+            continue
+        bf = _safe_float(b.get("fill_price")); q = int(b.get("qty") or 0)
+        s = sells.get(b.get("id"))
+        if s is not None:
+            sf = _safe_float(s.get("fill_price"))
+            ret = (sf / bf - 1.0) if (bf and sf) else None
+            closed.append({"symbol": b["symbol"], "qty": q, "entry": bf, "exit": sf, "z": b.get("z"),
+                           "entry_session": b.get("session_key"), "exit_session": s.get("session_key"),
+                           "ret_pct": round(ret * 100, 2) if ret is not None else None,
+                           "pnl": round((sf - bf) * q, 2) if (bf and sf) else None})
+        elif (b.get("alpaca_status") or "").lower() not in _ENTRY_TERMINAL_STATUSES:
+            px = cur.get(b["symbol"])
+            open_.append({"symbol": b["symbol"], "qty": q, "entry": bf, "price": px, "z": b.get("z"),
+                          "entry_session": b.get("session_key"), "exit_session": b.get("exit_session"),
+                          "unrealized": round((px - bf) * q, 2) if (bf and px) else None})
+    rets = [c["ret_pct"] for c in closed if c["ret_pct"] is not None]
+    wins = sum(1 for x in rets if x > 0)
+    return {"closed": closed, "open": open_,
+            "stats": {"n_closed": len(rets), "mean_ret_pct": round(sum(rets) / len(rets), 2) if rets else None,
+                      "hit_rate_pct": round(100 * wins / len(rets), 1) if rets else None,
+                      "pnl_usd": round(sum(c["pnl"] or 0 for c in closed), 2),
+                      "unrealized_usd": round(sum(o["unrealized"] or 0 for o in open_), 2),
+                      "n_open": len(open_)}}
+
+
+def _pead_status_payload() -> dict[str, Any]:
+    rows = _pead_rows() or []
+    _pead_reconcile_fills(rows)
+    positions = _alpaca_list_positions(paper=True) if _alpaca_enabled() else []
+    book = _pead_book(rows, positions)
+    scans = [r for r in rows if r.get("side") == "scan"]
+    return {
+        "enabled": PEAD_ENABLED, "registered_at": _PEAD_REGISTERED_AT,
+        "notional_usd": PEAD_NOTIONAL_USD, "slot_usd": PEAD_SLOT_USD, "max_positions": _pead_max_positions(),
+        "hold_sessions": PEAD_HOLD_SESSIONS, "z_min": PEAD_Z_MIN,
+        "entry_after_et": PEAD_ENTRY_AFTER_ET, "exit_after_et": PEAD_EXIT_AFTER_ET,
+        "universe_n": len(_pead_universe()), "excluded_swing_universe": sorted(_swing_universe()),
+        "fmp_enabled": _fmp_enabled(), "session": _pead_session_key(),
+        "entered_today": bool(_pead_entered_today(rows)), "sessions_run": len(scans),
+        "first_session": min((r.get("session_key") or "" for r in scans), default=None),
+        **book, "log_tail": rows[-30:], "ts": _now_iso(),
+    }
+
+
+@app.get("/purgatory/pead")
+def purgatory_pead():
+    return _cached_json(("pead", "status"), _pead_status_payload, ttl=300)
+
+
+@app.get("/purgatory/pead/candidates")
+def purgatory_pead_candidates(force: int = 0):
+    """Today's rule evaluation (events in the last 4 days, reaction = last
+    completed session, z). Cached per session; ?force=1 recomputes."""
+    return _pead_candidates(force=bool(force))
+
+
+@app.post("/purgatory/pead/run")
+def purgatory_pead_run(request: Request, dry_run: int = 1, what: str = "entries", force: int = 0):
+    """Token-gated (X-Signal-Token). what=entries|exits. dry_run=1 lists the
+    orders the rule would place; dry_run=0 places them on the PAPER account."""
+    if not EXTERNAL_SIGNAL_TOKEN:
+        raise HTTPException(503, "Admin endpoints disabled: set EXTERNAL_SIGNAL_TOKEN.")
+    supplied = request.headers.get("X-Signal-Token", "")
+    if not hmac.compare_digest(supplied, EXTERNAL_SIGNAL_TOKEN):
+        raise HTTPException(401, "Bad or missing X-Signal-Token header.")
+    if not dry_run and _supabase_client is None:
+        raise HTTPException(503, "Requires Supabase (pead_trades table).")
+    if what == "exits":
+        return _pead_run_exits(dry_run=bool(dry_run))
+    return _pead_run_entries(dry_run=bool(dry_run), force=bool(force))
