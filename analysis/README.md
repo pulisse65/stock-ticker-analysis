@@ -393,6 +393,14 @@ becomes the paper default; a separate decision for live. Fail → back to
 market, record why. Not a P&L test: at-mid P&L was still −$1,472 the week
 this was designed, so the A/B can only narrow the loss.
 
+**Stop slippage read 2026-11-08 (Task 3a).** 289 stops 10/05–11/06: realized
++4.2 pts past the 15% line = overshoot at the check +3.1 + half-spread +2.1
+− fill residual 1.0 (paper fills beat the bid; live won't). The 4-min→1-min
+scan change on 10/16 did NOT reduce overshoot (purgatory medians +1.7 → +2.7,
+controlling for premium) — 31% of 1-min-era stops fell >20% inside one scan
+and carry 75% of the overshoot dollars. Faster/native stops: NO-GO. Detail in
+`analysis/research/stops/README.md`.
+
 **Swing book pre-registered 2026-10-27** — see `SWING_BOOK.md` (weekly
 cloud regime + 12-week momentum, top 5 equal weight, paper stock, read after
 13 weeks ≈ 2027-01-25). Backtest basis in

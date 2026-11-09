@@ -1,0 +1,29 @@
+universe,variant,cagr,maxdd,pos_months,worst_month,y2022,turn_per_wk
+watchlist16,buy&hold equal weight,31.6,-36.3,0.62,-17.1,-34.3,
+watchlist16,top3 mom12 cloud=True,33.4,-40.9,0.47,-25.7,8.7,0.39
+watchlist16,top3 mom12 cloud=False,32.2,-43.9,0.54,-27.2,-31.1,0.61
+watchlist16,top3 mom26 cloud=True,24.3,-50.9,0.44,-34.2,8.7,0.25
+watchlist16,top3 mom26 cloud=False,23.2,-52.2,0.51,-34.2,3.5,0.33
+watchlist16,top5 mom12 cloud=True,27.8,-37.3,0.43,-16.7,5.0,0.47
+watchlist16,top5 mom12 cloud=False,24.4,-47.1,0.54,-22.4,-36.2,0.86
+watchlist16,top5 mom26 cloud=True,14.0,-42.6,0.44,-23.8,5.0,0.37
+watchlist16,top5 mom26 cloud=False,12.1,-44.1,0.53,-23.8,-10.0,0.42
+watchlist16,top8 mom12 cloud=True,19.1,-31.0,0.46,-17.2,3.3,0.44
+watchlist16,top8 mom12 cloud=False,23.0,-40.5,0.57,-17.4,-34.7,0.72
+watchlist16,top8 mom26 cloud=True,19.4,-25.8,0.47,-14.0,3.3,0.38
+watchlist16,top8 mom26 cloud=False,23.6,-33.9,0.56,-16.0,-16.8,0.38
+watchlist16,"all above cloud, equal weight",1.8,-3.0,0.44,-1.4,0.3,0.64
+all36,buy&hold equal weight,33.7,-40.3,0.6,-16.4,-33.2,
+all36,top3 mom12 cloud=True,38.8,-36.3,0.46,-24.6,15.6,0.58
+all36,top3 mom12 cloud=False,51.3,-53.4,0.62,-27.9,-31.0,0.84
+all36,top3 mom26 cloud=True,48.1,-40.6,0.46,-28.5,24.6,0.32
+all36,top3 mom26 cloud=False,41.4,-40.6,0.53,-31.7,12.1,0.41
+all36,top5 mom12 cloud=True,33.6,-31.8,0.46,-25.4,8.3,0.86
+all36,top5 mom12 cloud=False,44.5,-50.1,0.58,-26.8,-27.6,1.24
+all36,top5 mom26 cloud=True,33.4,-40.1,0.51,-25.6,12.0,0.57
+all36,top5 mom26 cloud=False,28.1,-38.9,0.56,-25.6,-4.7,0.74
+all36,top8 mom12 cloud=True,29.0,-28.2,0.49,-18.4,2.8,1.24
+all36,top8 mom12 cloud=False,32.6,-46.5,0.56,-23.2,-23.6,1.87
+all36,top8 mom26 cloud=True,29.8,-35.7,0.49,-17.1,2.9,0.9
+all36,top8 mom26 cloud=False,24.9,-37.8,0.53,-22.5,-12.9,1.17
+all36,"all above cloud, equal weight",4.1,-5.4,0.49,-2.1,0.3,1.52
