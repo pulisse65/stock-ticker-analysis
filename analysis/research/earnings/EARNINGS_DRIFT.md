@@ -46,5 +46,53 @@ FAIL on any miss. A PASS leads to a SWING_BOOK-style paper pre-registration
 newly pre-registered variant is proposed. No rule is changed after reading
 the results; variants seen in the secondary tables are not promoted.
 
-## Result
-(filled in after the run — see below)
+## Result (read 2026-11-08, `PEAD_RESULTS.md`, `pead_backtest.py`)
+
+Coverage: yfinance earnings history reaches April 2016 (2016 partial); prices
+for 105/106 tickers (BK none); S&P 100 set 4,154 events, median 42 per
+ticker; watchlist 499 events (SPCX too short for sigma60). 27% of events have
+z ≥ 2 — earnings days are routinely 2 normal-day sigmas, so the primary
+signal means "clearly positive reaction", not "extreme".
+
+Primary cell — S&P 100, z ≥ 2, hold 10 sessions, net of 10 bps:
+
+| | value | bar | |
+|---|---|---|---|
+| n | 1,104 | | |
+| mean net return / trade | +1.03% (median +0.93%) | > 0 | ✓ |
+| random same-ticker baseline | +0.65% → paired t = 2.22 | t ≥ 2.0 | ✓ |
+| SPY same windows | +0.54% → paired t = 3.27 | (reported) | |
+| hit rate | 58.5%, Wilson lower 55.6% | > 50% | ✓ |
+| years positive (n ≥ 10) | 11 of 11 | ≥ 60% | ✓ |
+| excluding best ticker (TSLA) | +0.96%, t vs random 1.89 | > 0 | ✓ |
+| watchlist subset | n 144, +2.45%, t vs random 2.45 | > 0 | ✓ |
+
+Secondary (not judged): hold 5 +0.48% (t 1.91), hold 20 +1.70% (t 1.67) —
+the excess over random is largest at 10. Top-quintile raw reaction: +1.18%,
+t 2.49. Mirror z ≤ −2 long: +0.45% vs random +0.64% (t −1.03) — weak
+negative drift on the downside, i.e. the effect is roughly symmetric and
+not just "stocks go up".
+
+**Verdict on the frozen rule: PASS (5 of 5).**
+
+What the pass does and does not say:
+- The signal-attributable edge is the paired excess over owning the same
+  names at random times: **≈ +0.38% per 10-session trade**, t 2.2, on one
+  pre-registered test. Real but small. The headline +1.03% is mostly the
+  names' own drift (survivorship: current constituents), which the random
+  baseline shares.
+- Scale: ~105 qualifying S&P 100 events a year. At $2,000 per trade and
+  10-session holds that is ≈ $2,100/yr gross on ~$4k average deployed, of
+  which ≈ $800/yr is attributable to the timing signal. It does not
+  transform a $10k book; it is a positive-expectancy process with costs
+  that do not eat it, which the intraday option book has never been.
+- Not modelled: slippage beyond 10 bps (negligible at this size), overlapping
+  positions / capital constraints, taxes, the 2016 partial year.
+- The ticker table is top-heavy in recent momentum names (TSLA, PLTR, INTC,
+  QCOM); the ex-TSLA condition passes but t falls to 1.9.
+
+Next (Task 6, owner's "go"): a SWING_BOOK-style paper book — S&P 100 + the
+watchlist, z ≥ 2 at the reaction close, buy next open, sell at the 10th
+close, equal $ slots with a concurrency cap, pre-registered 13-week read
+against the random-entry baseline computed the same way. Stock only, paper
+only, nothing live.

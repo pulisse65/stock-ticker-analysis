@@ -407,6 +407,14 @@ a report: 65, −$2,002, 20% wins; reaction day 15, −$518. But 48/65 fall in t
 −$13.9 per trade, worse on 8/14 sessions, p≈0.4. Not separable from regime; no
 filter installed; re-run after the Q4 season. `analysis/research/earnings/`.
 
+**Post-earnings drift backtest 2026-11-08 (Task 5, rules frozen before the
+run in `analysis/research/earnings/EARNINGS_DRIFT.md`).** S&P 100, z ≥ 2
+reaction, buy next open, sell 10th close, 10 bps: n 1,104, +1.03%/trade net,
++0.38% over same-ticker random entries (t 2.22), hit 58.5% (Wilson 55.6%),
+positive in 11/11 years, +0.96% ex-TSLA, watchlist +2.45%. PASS 5/5. Edge is
+small and the level is mostly the names' own (survivorship) drift. Task 6 =
+paper book pre-registration, on the owner's go.
+
 **Swing book pre-registered 2026-10-27** — see `SWING_BOOK.md` (weekly
 cloud regime + 12-week momentum, top 5 equal weight, paper stock, read after
 13 weeks ≈ 2027-01-25). Backtest basis in
