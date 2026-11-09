@@ -1233,5 +1233,60 @@ main._swing_rows, main._swing_targets, main._swing_holdings, main.SWING_ENABLED,
 main._alpaca_enabled, main._supabase_client = _saved_alp4, _saved_sb12; main._swing_week_done_mem = None; main._swing_error_notified_week = None
 
 
+# ---- retros: fills first ----
+_FIX = {"total_pnl": -50.0, "total_pnl_at_mid": -20.0, "closed_trades": 4, "wins": 2, "losses": 2,
+        "win_rate_pct": 50.0, "stopped": 2, "avg_pnl": -12.5, "by_account": {"live": {}},
+        "best": {"ticker": "SPY", "pnl": 30.0}, "worst": {"ticker": "QQQ", "pnl": -50.0}, "divergences": [],
+        "trades": [
+            {"pnl": 30.0, "pnl_at_mid": 32.0, "exit_reason": "hold", "account": "live", "ticker": "SPY", "direction": "call"},
+            {"pnl": 10.0, "pnl_at_mid": 12.0, "exit_reason": "hold", "account": "live", "ticker": "SPY", "direction": "call"},
+            {"pnl": -50.0, "pnl_at_mid": -40.0, "exit_reason": "stop_loss", "account": "live", "ticker": "QQQ", "direction": "put"},
+            {"pnl": -40.0, "pnl_at_mid": -24.0, "exit_reason": "stop_loss", "account": "live", "ticker": "QQQ", "direction": "put"},
+        ]}
+_fs = main._fills_summary(_FIX)
+check("fills_summary: holds/stops/wins/drag",
+      _fs["holds"] == 2 and _fs["hold_pnl"] == 40 and _fs["stops"] == 2 and _fs["stop_pnl"] == -90
+      and _fs["fill_wins"] == 2 and _fs["fill_win_rate_pct"] == 50 and _fs["at_mid"] == -20 and _fs["drag"] == -30, str(_fs))
+_sv = (main._slack_enabled, main._compute_daily_realized_pnl, main.requests.post, main._get_disabled_pairs)
+_rp = []
+class _R:
+    status_code = 200
+main._slack_enabled = lambda: True
+main._get_disabled_pairs = lambda: set()
+main.requests.post = lambda url, json=None, timeout=None, **k: _rp.append(json) or _R()
+main._compute_daily_realized_pnl = lambda d, account=None: _FIX
+_dsum = {"date": "2026-11-06", "total_signals": 10, "wins": 6, "losses": 3, "flats": 1, "pending": 0,
+         "win_rate_pct": 66.0, "avg_favorable_15m": 0.1, "sum_favorable_15m": 1.0}
+check("daily retro: posts", main._post_daily_retro_to_slack(_dsum) is True and len(_rp) == 1)
+_bl = _rp[0]["blocks"]
+check("daily retro: fills block first after header", "Fills" in _bl[1]["text"]["text"] and "stops 2" in _bl[1]["text"]["text"], str(_bl[1]))
+check("daily retro: signal fields labelled not fills", "not fills" in str(_bl[2]["fields"]) and "Signal outcomes (label)" in str(_bl[2]["fields"]))
+_rp.clear()
+main._compute_daily_realized_pnl = lambda d, account=None: None
+main._post_daily_retro_to_slack(_dsum)
+check("daily retro: no trades -> one-line context", "Fills: no closed trades" in str(_rp[0]["blocks"][1]), str(_rp[0]["blocks"][1]))
+# weekly compute
+_sv_sb, _sv_pa = main._supabase_client, main._page_all
+main._supabase_client = object(); main._page_all = lambda f: []
+_pm = {"2026-11-02": _FIX, "2026-11-03": {**_FIX, "total_pnl_at_mid": None}}
+main._compute_daily_realized_pnl = lambda d, account=None: _pm.get(d)
+_wk = main._compute_weekly_retro(["2026-11-02", "2026-11-03", "2026-11-04"])
+_wp = _wk["pnl"]
+check("weekly compute: fills fields", _wp["holds"] == 4 and _wp["stops"] == 4 and _wp["hold_pnl"] == 80 and _wp["stop_pnl"] == -180
+      and _wp["at_mid"] == -20 and _wp["fill_win_rate_pct"] == 50 and _wp["stopped"] == 4, str(_wp))
+main._supabase_client, main._page_all = _sv_sb, _sv_pa
+_rp.clear()
+_sv_gm = main._get_muted_strategies; main._get_muted_strategies = lambda: {}
+main._post_weekly_retro_to_slack({**_wk})
+_wtxt = str(_rp[0]["blocks"])
+check("weekly post: fill wr + signal scoreboard", "fill wr" in _wtxt and "Signal scoreboard" in _wtxt and "at mid" in _wtxt, _wtxt[:300])
+_rp.clear()
+main._post_weekly_retro_to_slack({"start": "2026-11-02", "end": "2026-11-06", "total_signals": 0, "per_strategy": {},
+    "purgatory_by_dir": {}, "pnl": {"total": 0.0, "trades": 0, "wins": 0, "stopped": 0, "days": []}})
+check("weekly post: old payload without fills keys doesn't crash", len(_rp) == 1)
+main._get_muted_strategies = _sv_gm
+main._slack_enabled, main._compute_daily_realized_pnl, main.requests.post, main._get_disabled_pairs = _sv
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
