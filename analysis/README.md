@@ -357,6 +357,25 @@ halted at −$184. AAPL call auto-muted again. `TRADING_DIRECTIONS` still
 `call,put`. Sizing fix held: zero entries above $750 since 10/22 (prior
 week max $4,380). RSS 267 MB, scan 6 s.
 
+**Week 11/2–11/6 retro (2026-11-08).** Paper −$2,844 on 98 (prior week
+−$1,049 on 95; purgatory only, both weeks). 40 stops (41%) = −$3,651 at a
+realized −20.8% mean on the 15% rule; 58 hold exits +$807 (50% wr). Realized
+−$2,844 vs −$1,472 at mid → −$1,372 of spread drag (median entry spread 3.5%).
+Calls −$1,971/50 (22% wr), puts −$873/48. Worst days Fri 11/6 −$1,419 (18 of
+25 stopped) and Wed 11/4 −$901 (12 stops). No pair above +$120; AAPL call
+0/4 −$299. Paper month Oct final −$10,347; Nov −$2,844 after 5 sessions;
+all-time −$12,668. Live halted since 10/21 (−$184), no trades. Sizing cap
+held (max debit $760). `TRADING_DIRECTIONS` still `call,put`. RSS 229 MB,
+scan 6.8 s. Daily summary still reports 66% "wins" on the 30-min-best label
+while fills ran 16% — the label gap noted 10/22 remains.
+
+Swing book week 2: equity $8,687 (−13.1%) vs SPY −4.8% and equal-weight
+universe −12.4% since 10/28. 11/2 rebalance sold QCOM @168.20 (−$172) and
+INTC @64.04 (−$663), bought TSLA 5 @409.98 and IWM 7 @281.35. Fail-closed
+hook fired once, Monday, no spurious Slack. Only AAPL and MSFT are eligible
+for 11/9 → the rule sells TSLA/QQQ/IWM and sits ~60% cash. Read stays
+2027-01-25.
+
 **Swing book pre-registered 2026-10-27** — see `SWING_BOOK.md` (weekly
 cloud regime + 12-week momentum, top 5 equal weight, paper stock, read after
 13 weeks ≈ 2027-01-25). Backtest basis in

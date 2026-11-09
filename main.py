@@ -8441,6 +8441,50 @@ def _compute_daily_retro(date_str: str) -> dict[str, Any] | None:
     }
 
 
+def _fills_summary(pnl: dict[str, Any]) -> dict[str, Any]:
+    """Fill-based stats from a _compute_daily_realized_pnl payload."""
+    trades = pnl.get("trades") or []
+    holds = [t for t in trades if "stop" not in str(t.get("exit_reason") or "")]
+    stops = [t for t in trades if "stop" in str(t.get("exit_reason") or "")]
+    fill_wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
+    at_mid = pnl.get("total_pnl_at_mid")
+    total = pnl.get("total_pnl")
+    if total is None:
+        total = sum((t.get("pnl") or 0) for t in trades)
+    return {
+        "holds": len(holds),
+        "hold_pnl": sum((t.get("pnl") or 0) for t in holds),
+        "stops": len(stops),
+        "stop_pnl": sum((t.get("pnl") or 0) for t in stops),
+        "fill_wins": fill_wins,
+        "fill_win_rate_pct": (fill_wins / len(trades) * 100.0) if trades else None,
+        "at_mid": at_mid,
+        "drag": (total - at_mid) if at_mid is not None else None,
+    }
+
+
+def _daily_fills_blocks(pnl: dict[str, Any] | None) -> list[dict]:
+    """Slack blocks headlining what actually traded."""
+    if not pnl or not pnl.get("closed_trades"):
+        return [{"type": "context", "elements": [{"type": "mrkdwn", "text": "Fills: no closed trades"}]}]
+    f = _fills_summary(pnl)
+    by_acct = pnl.get("by_account") or {}
+    both = "live" in by_acct and "paper" in by_acct
+    tag = "Live + Paper" if both else ("LIVE" if "live" in by_acct else "Paper")
+    emoji = "🟢" if pnl["total_pnl"] > 0 else ("🔴" if pnl["total_pnl"] < 0 else "⚪")
+    wr = f"{f['fill_win_rate_pct']:.0f}%" if f["fill_win_rate_pct"] is not None else "—"
+    lines = [f"*Fills (what actually traded)* ({tag})",
+             f"{emoji} *${pnl['total_pnl']:+,.2f}* realized · {pnl['closed_trades']} closed · fill wr {wr}",
+             f"• holds {f['holds']} ${f['hold_pnl']:+,.2f} · stops {f['stops']} ${f['stop_pnl']:+,.2f}"]
+    if f["at_mid"] is not None:
+        lines.append(f"• at mid ${f['at_mid']:+,.2f} · spread drag ${f['drag']:+,.2f}")
+    if both:
+        lv, pp = by_acct["live"], by_acct["paper"]
+        lines.append(f"• 💵 Live: *${lv['total_pnl']:+,.2f}* ({lv['closed_trades']} closed, {lv['wins']}W/{lv['losses']}L)"
+                     f"   📋 Paper: ${pp['total_pnl']:+,.2f} ({pp['closed_trades']} closed, {pp['wins']}W/{pp['losses']}L)")
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}}]
+
+
 def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
     """Format and POST the daily retro to the Slack webhook."""
     if not _slack_enabled():
@@ -8461,12 +8505,19 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
     pnl_str = "—" if sum_fav is None else f"{sum_fav:+.2f}%"
     pnl_emoji = "⚪" if sum_fav is None else ("🟢" if sum_fav > 0 else "🔴")
 
+    try:
+        pnl = _compute_daily_realized_pnl(summary["date"])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Realized P&L computation failed: %s", exc)
+        pnl = None
+
     blocks: list[dict] = [
         {"type": "header", "text": {"type": "plain_text", "text": f"📊 Purgatory Daily Retro — {date_pretty}"}},
+        *_daily_fills_blocks(pnl),
         {"type": "section", "fields": [
             {"type": "mrkdwn", "text": f"*Total signals*\n{summary['total_signals']}"},
-            {"type": "mrkdwn", "text": f"*Outcomes*\n🟢 {summary['wins']} W · 🔴 {summary['losses']} L · ⚫ {summary['flats']} flat" + (f" · ⏳ {summary['pending']}" if summary["pending"] else "")},
-            {"type": "mrkdwn", "text": f"*Win rate (scored)*\n{win_rate}"},
+            {"type": "mrkdwn", "text": f"*Signal outcomes (label)*\n🟢 {summary['wins']} W · 🔴 {summary['losses']} L · ⚫ {summary['flats']} flat" + (f" · ⏳ {summary['pending']}" if summary["pending"] else "")},
+            {"type": "mrkdwn", "text": f"*Signal label wr (30-min best, not fills)*\n{win_rate}"},
             {"type": "mrkdwn", "text": f"*Avg favorable @ +15m*\n{avg_fav}"},
             {"type": "mrkdwn", "text": f"*Expected total move*\n{pnl_emoji} {pnl_str} sum @ +15m"},
         ]},
@@ -8537,43 +8588,8 @@ def _post_daily_retro_to_slack(summary: dict[str, Any]) -> bool:
             blocks.append({"type": "section", "text": {"type": "mrkdwn",
                 "text": "*By direction*\n" + "\n".join(pd_lines)}})
 
-    # Real-money (or paper) P&L — only shown if the auto-trader closed
-    # any trades on this date. Joined by (ticker, direction, bar_time).
-    try:
-        pnl = _compute_daily_realized_pnl(summary["date"])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Realized P&L computation failed: %s", exc)
-        pnl = None
+    # Execution divergences (fills headline moved to the top of the retro).
     if pnl and pnl["closed_trades"] > 0:
-        by_acct = pnl.get("by_account") or {}
-        # With both accounts trading, headline each separately; otherwise
-        # keep the legacy single-line format.
-        if "live" in by_acct and "paper" in by_acct:
-            tag = "Live + Paper"
-        else:
-            tag = "LIVE" if "live" in by_acct else "Paper"
-        pnl_emoji = "🟢" if pnl["total_pnl"] > 0 else ("🔴" if pnl["total_pnl"] < 0 else "⚪")
-        stopped_str = f" · ⛔ {pnl['stopped']} stopped" if pnl.get("stopped") else ""
-        acct_str = ""
-        if "live" in by_acct and "paper" in by_acct:
-            lv, pp = by_acct["live"], by_acct["paper"]
-            acct_str = (f"\n• 💵 Live: *${lv['total_pnl']:+,.2f}* "
-                        f"({lv['closed_trades']} closed, {lv['wins']}W/{lv['losses']}L)"
-                        f"   📋 Paper: ${pp['total_pnl']:+,.2f} "
-                        f"({pp['closed_trades']} closed, {pp['wins']}W/{pp['losses']}L)")
-        mid_str = ""
-        if pnl.get("total_pnl_at_mid") is not None:
-            mid_str = (f"\n• At quote mid: ${pnl['total_pnl_at_mid']:+,.2f} · "
-                       f"execution drag ${pnl['total_execution_drag']:+,.2f} "
-                       f"({pnl['trades_with_quotes']}/{pnl['closed_trades']} trades quoted)")
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text":
-            f"💰 *Real P&L ({tag})*  {pnl_emoji} *${pnl['total_pnl']:+,.2f}* net\n"
-            f"• {pnl['closed_trades']} closed · {pnl['wins']} W / {pnl['losses']} L · "
-            f"{pnl['win_rate_pct']:.0f}% wr · avg ${pnl['avg_pnl']:+,.2f}/trade{stopped_str}{acct_str}{mid_str}\n"
-            f"• 🏆 `{pnl['best']['ticker']}` ${pnl['best']['pnl']:+,.2f}   "
-            f"💀 `{pnl['worst']['ticker']}` ${pnl['worst']['pnl']:+,.2f}"
-        }})
-
         # Execution divergences: signal scored one way, the trade paid the
         # other. Almost always a fill-quality problem — surface it with the
         # quotes so the drag is visible without any forensics.
@@ -8830,6 +8846,9 @@ def _compute_weekly_retro(dates: list[str]) -> dict[str, Any] | None:
 
     day_pnls = []
     total_pnl, total_trades, total_wins, total_stopped = 0.0, 0, 0, 0
+    t_holds, t_hold_pnl, t_stops, t_stop_pnl, t_fill_wins = 0, 0.0, 0, 0.0, 0
+    t_at_mid: float | None = None
+    t_drag: float | None = None
     for d in dates:
         p = _compute_daily_realized_pnl(d)
         if not p:
@@ -8839,6 +8858,13 @@ def _compute_weekly_retro(dates: list[str]) -> dict[str, Any] | None:
         total_trades += p["closed_trades"]
         total_wins += p["wins"]
         total_stopped += p.get("stopped", 0)
+        fs = _fills_summary(p)
+        t_holds += fs["holds"]; t_hold_pnl += fs["hold_pnl"]
+        t_stops += fs["stops"]; t_stop_pnl += fs["stop_pnl"]
+        t_fill_wins += fs["fill_wins"]
+        if fs["at_mid"] is not None:
+            t_at_mid = (t_at_mid or 0.0) + fs["at_mid"]
+            t_drag = (t_drag or 0.0) + (p["total_pnl"] - fs["at_mid"])   # quoted days only
 
     return {
         "start": start, "end": end,
@@ -8846,7 +8872,12 @@ def _compute_weekly_retro(dates: list[str]) -> dict[str, Any] | None:
         "per_strategy": per_strategy,
         "purgatory_by_dir": purgatory_by_dir,
         "pnl": {"total": round(total_pnl, 2), "trades": total_trades,
-                "wins": total_wins, "stopped": total_stopped, "days": day_pnls},
+                "wins": total_wins, "stopped": total_stopped, "days": day_pnls,
+                "holds": t_holds, "hold_pnl": round(t_hold_pnl, 2),
+                "stops": t_stops, "stop_pnl": round(t_stop_pnl, 2),
+                "at_mid": round(t_at_mid, 2) if t_at_mid is not None else None,
+                "drag": round(t_drag, 2) if t_drag is not None else None,
+                "fill_win_rate_pct": (t_fill_wins / total_trades * 100.0) if total_trades else None},
     }
 
 
@@ -8856,6 +8887,16 @@ def _post_weekly_retro_to_slack(w: dict[str, Any]) -> bool:
     pretty = f"{pd.Timestamp(w['start']).strftime('%b %d')} – {pd.Timestamp(w['end']).strftime('%b %d')}"
     p = w["pnl"]
     pnl_emoji = "🟢" if p["total"] > 0 else ("🔴" if p["total"] < 0 else "⚪")
+    fparts = [f"holds {p.get('holds', 0)} ${p.get('hold_pnl', 0):+,.0f}",
+              f"stops {p.get('stops', p.get('stopped', 0))} ${p.get('stop_pnl', 0):+,.0f}"]
+    if p.get("at_mid") is not None:
+        drag = p.get("drag")
+        if drag is None:
+            drag = p["total"] - p["at_mid"]
+        fparts += [f"at mid ${p['at_mid']:+,.0f}", f"drag ${drag:+,.0f}"]
+    fwr = p.get("fill_win_rate_pct")
+    fparts.append(f"fill wr {fwr:.0f}%" if fwr is not None else "fill wr —")
+    fills_line = " · ".join(fparts)
     day_str = " · ".join(f"{d['date'][5:]}: ${d['pnl']:+,.0f}" for d in p["days"]) or "no trades"
 
     strat_lines = []
@@ -8878,9 +8919,9 @@ def _post_weekly_retro_to_slack(w: dict[str, Any]) -> bool:
         {"type": "header", "text": {"type": "plain_text", "text": f"📅 Weekly Retro — {pretty}"}},
         {"type": "section", "text": {"type": "mrkdwn", "text":
             f"💰 *Real P&L*  {pnl_emoji} *${p['total']:+,.2f}* · {p['trades']} trades · "
-            f"{p['wins']} wins · ⛔ {p['stopped']} stopped\n{day_str}"}},
+            f"{p['wins']} wins · ⛔ {p.get('stopped', 0)} stopped\n{fills_line}\n{day_str}"}},
         {"type": "section", "text": {"type": "mrkdwn",
-            "text": "*Strategy scoreboard*\n" + ("\n".join(strat_lines) or "no signals")}},
+            "text": "*Signal scoreboard* (30-min-best label, not fills)\n" + ("\n".join(strat_lines) or "no signals")}},
     ]
     if dir_parts:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn",
