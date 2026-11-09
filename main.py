@@ -3304,6 +3304,298 @@ def _alpaca_get_order(order_id: str, paper: bool = True) -> dict | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Entry execution A/B (pre-registered 2026-11-08, analysis/README.md)
+#
+# Every entry has been a market order crossing a ~3.5% median option spread;
+# that drag was −$1,372 of the week 11/2–6's −$2,844. ENTRY_ORDER_TYPE=limit_mid
+# places the PAPER entry as a limit at the quote mid (rounded down to the
+# option tick) and cancels it on the first scan pass ≥ ENTRY_LIMIT_TTL_S
+# later if still unfilled (the effective TTL is one scan interval, ~1 min).
+# Live entries stay market orders whatever the env says. Cancelled entries
+# are tagged raw.entry_cancelled and the contract is quoted to entry+30 via
+# the hold study, so the trades we MISSED can be compared with the ones we
+# filled (GET /purgatory/entry-study) — a limit that only fills when the
+# contract is falling would look great on drag and lose on selection.
+# ---------------------------------------------------------------------------
+_ENTRY_ORDER_TYPES = ("market", "limit_mid")
+ENTRY_ORDER_TYPE = (os.environ.get("ENTRY_ORDER_TYPE", "market").strip().lower() or "market")
+if ENTRY_ORDER_TYPE not in _ENTRY_ORDER_TYPES:
+    log.warning("ENTRY_ORDER_TYPE=%r not in %s; using market", ENTRY_ORDER_TYPE, _ENTRY_ORDER_TYPES)
+    ENTRY_ORDER_TYPE = "market"
+ENTRY_LIMIT_TTL_S = max(10, int(os.environ.get("ENTRY_LIMIT_TTL_S", "45") or 45))
+_ENTRY_TERMINAL_STATUSES = ("canceled", "cancelled", "expired", "rejected")
+
+
+def _option_tick(price: float) -> float:
+    """Listed option price increment: $0.01 under $3, $0.05 at or above."""
+    return 0.01 if price < 3.0 else 0.05
+
+
+def _limit_price_from_quote(quote: dict | None) -> float | None:
+    """Quote mid rounded DOWN to the option tick (a buy limit below mid only
+    makes the fill less likely, never invalid). None without a usable mid."""
+    mid = _safe_float((quote or {}).get("mid"))
+    if not mid or mid <= 0:
+        return None
+    tick = _option_tick(mid)
+    px = int(mid / tick + 1e-9) * tick
+    px = round(px, 2)
+    return px if px > 0 else None
+
+
+def _alpaca_submit_limit_order(option_symbol: str, qty: int, side: str, limit_price: float,
+                               paper: bool = True) -> dict | None:
+    body = {
+        "symbol":         option_symbol,
+        "qty":            str(qty),
+        "side":           side,
+        "type":           "limit",
+        "limit_price":    f"{limit_price:.2f}",
+        "time_in_force":  "day",
+    }
+    base, headers = _trading_api(paper)
+    try:
+        r = requests.post(f"{base}/v2/orders", headers=headers, json=body, timeout=15)
+        if r.status_code >= 400:
+            log.warning("Limit order rejected (%s, %s) for %s %s x%s @ %.2f: %s",
+                        r.status_code, "paper" if paper else "LIVE",
+                        option_symbol, side, qty, limit_price, r.text[:300])
+            return None
+        return r.json()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Limit order submit failed for %s: %s", option_symbol, exc)
+        return None
+
+
+def _alpaca_cancel_order(order_id: str, paper: bool = True) -> bool:
+    """DELETE the order. 204 = cancel accepted; 422 = already terminal
+    (filled or cancelled meanwhile) — the caller re-reads the order either
+    way, so both count as 'done'."""
+    base, headers = _trading_api(paper)
+    try:
+        r = requests.delete(f"{base}/v2/orders/{order_id}", headers=headers, timeout=10)
+        if r.status_code in (200, 204, 422):
+            return True
+        log.warning("Cancel rejected (%s) for %s: %s", r.status_code, order_id, r.text[:200])
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Cancel failed for %s: %s", order_id, exc)
+        return False
+
+
+def _is_terminal_entry(row: dict) -> bool:
+    """An entry whose order died without a position (cancelled / expired /
+    rejected). Never 'open': the sweeps and the sampler skip it, so a
+    cancelled limit can't become a 404 re-close or a phantom exit row."""
+    return (row.get("alpaca_status") or "").lower() in _ENTRY_TERMINAL_STATUSES
+
+
+def _limit_entry_decision(row: dict, remote: dict | None, now: datetime, ttl_s: int) -> str:
+    """Pure. What to do with an unfilled limit entry this pass:
+    'skip'     not a limit_mid entry, or already filled / terminal on our row
+    'unknown'  Alpaca unreadable — leave it alone, try next pass
+    'filled'   filled on Alpaca — the reconcile pass records it
+    'terminal' cancelled/expired on Alpaca without us — mark it
+    'wait'     younger than the TTL
+    'partial'  past TTL, some contracts filled — cancel the rest, keep those
+    'cancel'   past TTL, nothing filled — cancel"""
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    status = (row.get("alpaca_status") or "").lower()
+    if raw.get("entry_order_type") != "limit_mid" or status == "filled" or _is_terminal_entry(row):
+        return "skip"
+    ts = _parse_signal_ts(row.get("submitted_at"))
+    if ts is None:
+        return "skip"
+    if remote is None:
+        return "unknown"
+    rstatus = (remote.get("status") or "").lower()
+    if rstatus == "filled":
+        return "filled"
+    if rstatus in _ENTRY_TERMINAL_STATUSES:
+        return "terminal"
+    if (now - ts).total_seconds() < ttl_s:
+        return "wait"
+    return "partial" if (_safe_float(remote.get("filled_qty")) or 0) > 0 else "cancel"
+
+
+def _fetch_unfilled_limit_entries(hours_back: int = 2) -> list[dict]:
+    """Slim read of recent entries that are not filled yet (full `raw` is
+    fetched per row only when we act on it)."""
+    if _supabase_client is None:
+        return []
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
+    try:
+        rows = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("id,alpaca_order_id,alpaca_status,qty,paper,option_symbol,submitted_at,"
+                    "entry_order_type:raw->entry_order_type")
+            .eq("role", "entry")
+            .gte("submitted_at", since)
+            .neq("alpaca_status", "filled")
+            .order("submitted_at", desc=False)
+        ))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Unfilled-limit query failed: %s", exc)
+        return []
+    out = []
+    for r in rows:
+        if r.get("entry_order_type") == "limit_mid" and not _is_terminal_entry(r):
+            r["raw"] = {"entry_order_type": "limit_mid"}
+            out.append(r)
+    return out
+
+
+def _sweep_unfilled_limit_entries() -> int:
+    """Cancel limit_mid entries still unfilled past ENTRY_LIMIT_TTL_S; keep
+    partial fills as the position. Returns the number cancelled outright.
+    Inert unless ENTRY_ORDER_TYPE=limit_mid (no query otherwise)."""
+    if ENTRY_ORDER_TYPE != "limit_mid":
+        return 0
+    if not ALPACA_TRADING_ENABLED or not _alpaca_enabled() or _supabase_client is None:
+        return 0
+    now = datetime.now(timezone.utc)
+    n_cancelled = 0
+    for slim in _fetch_unfilled_limit_entries():
+        order_id = slim.get("alpaca_order_id")
+        if not order_id:
+            continue
+        paper = bool(slim.get("paper", True))
+        remote = _alpaca_get_order(order_id, paper=paper)
+        decision = _limit_entry_decision(slim, remote, now, ENTRY_LIMIT_TTL_S)
+        if decision in ("skip", "wait", "unknown", "filled"):
+            continue
+        if decision in ("cancel", "partial"):
+            if not _alpaca_cancel_order(order_id, paper=paper):
+                continue
+            remote = _alpaca_get_order(order_id, paper=paper) or remote
+            if (remote.get("status") or "").lower() == "filled":
+                continue        # filled in the race; reconcile records it
+        # Act on the FULL row so raw annotations are merged, not clobbered.
+        try:
+            full = (_supabase_client.table(_PURGATORY_ORDERS_TABLE)
+                    .select("*").eq("id", slim["id"]).limit(1).execute().data or [None])[0]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Unfilled-limit row read failed for %s: %s", slim.get("id"), exc)
+            continue
+        if not full:
+            continue
+        raw = dict(full.get("raw") or {})
+        filled_qty = int(_safe_float(remote.get("filled_qty")) or 0)
+        quote = _quote_snapshot(full.get("option_symbol")) if full.get("option_symbol") else None
+        raw.update({k: v for k, v in remote.items() if k != "raw"})
+        raw["entry_cancelled"] = {
+            "at": _now_iso(), "decision": decision,
+            "requested_qty": full.get("qty"), "filled_qty": filled_qty,
+            "limit_price": raw.get("limit_price"), "quote_at_cancel": quote,
+        }
+        update: dict[str, Any] = {"raw": raw}
+        if filled_qty > 0:
+            fp = _safe_float(remote.get("filled_avg_price"))
+            update.update({"alpaca_status": "filled", "qty": filled_qty, "fill_price": fp,
+                           "filled_at": remote.get("filled_at"),
+                           "notional": (fp * filled_qty * 100) if fp else None})
+        else:
+            update["alpaca_status"] = "canceled"
+        try:
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE).update(update).eq("id", full["id"]).execute()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Unfilled-limit update failed for %s: %s", full.get("id"), exc)
+            continue
+        if filled_qty > 0:
+            log.info("Paper limit entry partial: %s kept %s of %s", full.get("option_symbol"), filled_qty, full.get("qty"))
+            continue
+        full["raw"] = raw
+        _start_hold_study_tracking(full, _safe_float(raw.get("limit_price")))
+        n_cancelled += 1
+        log.info("Paper limit entry cancelled after TTL: %s %s @ %s (mid now %s)",
+                 full.get("signal_ticker"), full.get("option_symbol"), raw.get("limit_price"),
+                 (quote or {}).get("mid"))
+    return n_cancelled
+
+
+def _entry_study_aggregate(entries: list[dict], trades: list[dict],
+                           hold_minutes: int, tolerance_s: int) -> dict[str, Any]:
+    """Pure. Per (order type, account): entries placed / filled / cancelled /
+    partial, fill rate, and from the matched trades: realized, at-mid, drag,
+    drag per trade. For cancelled entries: hypothetical 15-min P&L had we
+    paid the limit price, from the hold-study path (sample nearest
+    entry+hold within tolerance), to compare with filled entries' at-mid."""
+    key_of = lambda e: (e.get("strategy") or "purgatory", e.get("signal_ticker"),
+                        e.get("signal_direction"), e.get("signal_bar_time"), bool(e.get("paper", True)))
+    type_of = {key_of(e): ((e.get("raw") or {}).get("entry_order_type") if isinstance(e.get("raw"), dict)
+                           else e.get("entry_order_type")) or "market" for e in entries}
+    groups: dict[tuple, dict] = {}
+
+    def g(otype: str, acct: str) -> dict:
+        return groups.setdefault((otype, acct), {
+            "order_type": otype, "account": acct, "entries": 0, "filled": 0, "cancelled": 0, "partial": 0,
+            "trades": 0, "realized": 0.0, "at_mid": 0.0, "quoted_trades": 0,
+            "missed": 0, "missed_with_path": 0, "missed_hypothetical_at_mid": 0.0,
+        })
+
+    for e in entries:
+        otype = type_of[key_of(e)]
+        acct = "paper" if bool(e.get("paper", True)) else "live"
+        row = g(otype, acct)
+        row["entries"] += 1
+        raw = e.get("raw") if isinstance(e.get("raw"), dict) else {}
+        cancelled = raw.get("entry_cancelled") or e.get("entry_cancelled")
+        status = (e.get("alpaca_status") or "").lower()
+        if cancelled and (cancelled.get("filled_qty") or 0) > 0:
+            row["partial"] += 1
+            row["filled"] += 1
+        elif status == "filled" or _safe_float(e.get("fill_price")) is not None:
+            row["filled"] += 1
+        elif status in _ENTRY_TERMINAL_STATUSES:
+            row["cancelled"] += 1
+            row["missed"] += 1
+            hs = raw.get("hold_study") or e.get("hold_study") or {}
+            limit_px = _safe_float((cancelled or {}).get("limit_price")) or _safe_float(raw.get("limit_price")) or _safe_float(e.get("limit_price"))
+            ts = _parse_signal_ts(e.get("submitted_at"))
+            if limit_px and ts is not None and isinstance(hs, dict):
+                target = ts + timedelta(minutes=hold_minutes)
+                best, best_dt = None, None
+                for smp in hs.get("samples") or []:
+                    st = _parse_signal_ts(smp.get("t"))
+                    mid = _safe_float(smp.get("mid"))
+                    if st is None or mid is None:
+                        continue
+                    dt = abs((st - target).total_seconds())
+                    if dt <= tolerance_s and (best_dt is None or dt < best_dt):
+                        best, best_dt = mid, dt
+                if best is not None:
+                    qty = int(e.get("qty") or 1)
+                    row["missed_with_path"] += 1
+                    row["missed_hypothetical_at_mid"] += (best - limit_px) * qty * 100
+
+    for t in trades:
+        k = (t.get("strategy") or "purgatory", t.get("ticker"), t.get("direction"), t.get("bar_time"),
+             t.get("account") != "live")
+        otype = type_of.get(k, "market")
+        row = g(otype, t.get("account") or "paper")
+        row["trades"] += 1
+        row["realized"] += float(t.get("pnl") or 0)
+        if t.get("pnl_at_mid") is not None:
+            row["quoted_trades"] += 1
+            row["at_mid"] += float(t["pnl_at_mid"])
+
+    out = []
+    for row in groups.values():
+        n_e, n_t, n_q, n_m = row["entries"], row["trades"], row["quoted_trades"], row["missed_with_path"]
+        row["fill_rate_pct"] = round(100.0 * row["filled"] / n_e, 1) if n_e else None
+        row["drag"] = round(row["realized"] - row["at_mid"], 2) if n_q else None
+        row["drag_per_trade"] = round((row["realized"] - row["at_mid"]) / n_q, 2) if n_q else None
+        row["at_mid_per_trade"] = round(row["at_mid"] / n_q, 2) if n_q else None
+        row["missed_hypothetical_per_entry"] = round(row["missed_hypothetical_at_mid"] / n_m, 2) if n_m else None
+        row["realized"] = round(row["realized"], 2)
+        row["at_mid"] = round(row["at_mid"], 2)
+        row["missed_hypothetical_at_mid"] = round(row["missed_hypothetical_at_mid"], 2)
+        out.append(row)
+    out.sort(key=lambda r: (r["account"], r["order_type"]))
+    return {"groups": out}
+
+
 def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
     """Enter position(s) for this signal. The primary (paper) account trades
     every STRATEGIES_TRADING signal for data collection; the live account
@@ -3350,9 +3642,21 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
 
     def _enter(paper: bool, notional: float) -> dict | None:
         qty = _size_contracts(premium, notional, PAPER_MAX_TRADE_USD)
-        order = _alpaca_submit_market_order(contract["symbol"], qty, "buy", paper=paper)
+        # Limit-at-mid is a PAPER experiment: live money always crosses the
+        # spread with a market order, whatever ENTRY_ORDER_TYPE says.
+        limit_px = _limit_price_from_quote(quote) if (paper and ENTRY_ORDER_TYPE == "limit_mid") else None
+        if limit_px:
+            order = _alpaca_submit_limit_order(contract["symbol"], qty, "buy", limit_px, paper=paper)
+        else:
+            order = _alpaca_submit_market_order(contract["symbol"], qty, "buy", paper=paper)
         if not order:
             return None
+        raw_extra: dict[str, Any] = {"entry_order_type": "limit_mid" if limit_px else "market"}
+        if limit_px:
+            raw_extra["limit_price"] = limit_px
+            raw_extra["entry_ttl_s"] = ENTRY_LIMIT_TTL_S
+        if quote:
+            raw_extra["quote_at_submit"] = quote
         _persist_order_row({
             "strategy":          strategy,
             "signal_ticker":     ticker,
@@ -3370,10 +3674,11 @@ def _maybe_place_trade_for_signal(signal: dict[str, Any]) -> dict | None:
             "alpaca_status":     order.get("status"),
             "submitted_at":      _now_iso(),
             "paper":             paper,
-            "raw":               {**order, "quote_at_submit": quote} if quote else order,
+            "raw":               {**order, **raw_extra},
         })
-        log.info("%s ENTRY: %s %s %s x%s (order %s)",
-                 "Paper" if paper else "LIVE", ticker, direction,
+        log.info("%s ENTRY (%s%s): %s %s %s x%s (order %s)",
+                 "Paper" if paper else "LIVE", raw_extra["entry_order_type"],
+                 f" @ {limit_px:.2f}" if limit_px else "", ticker, direction,
                  contract["symbol"], qty, order.get("id"))
         return order
 
@@ -3482,8 +3787,9 @@ def _fetch_open_entries_for_sweep(min_age_minutes: int) -> list[dict]:
         }
         return [
             e for e in entries
-            if (e.get("strategy") or "purgatory", e["signal_ticker"], e["signal_direction"],
-                e["signal_bar_time"], bool(e.get("paper", True))) not in closed
+            if not _is_terminal_entry(e)       # cancelled limit entries never held a position
+            and (e.get("strategy") or "purgatory", e["signal_ticker"], e["signal_direction"],
+                 e["signal_bar_time"], bool(e.get("paper", True))) not in closed
         ]
     except Exception as exc:  # noqa: BLE001
         log.warning("Sweep query failed: %s", exc)
@@ -4262,6 +4568,43 @@ def _stop_study_payload(days: int = 30, account: str = "paper", strategy: str | 
     }
 
 
+@app.get("/purgatory/entry-study")
+def purgatory_entry_study(days: int = 14):
+    """Entry execution A/B read (pre-registered 2026-11-08): per order type
+    and account, entries placed / filled / cancelled, fill rate, realized vs
+    at-mid P&L and drag per trade on matched trades, and for cancelled
+    limit entries the hypothetical 15-min P&L at the limit price from the
+    hold-study path. Compare `drag_per_trade` (market vs limit_mid) and
+    `missed_hypothetical_per_entry` vs `at_mid_per_trade` (selection bias)."""
+    if _supabase_client is None:
+        raise HTTPException(503, "Entry study requires Supabase.")
+    days = max(1, min(int(days), 90))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        entries = _page_all(lambda: (
+            _supabase_client.table(_PURGATORY_ORDERS_TABLE)
+            .select("id,strategy,signal_ticker,signal_direction,signal_bar_time,paper,qty,"
+                    "alpaca_status,fill_price,submitted_at,"
+                    "entry_order_type:raw->entry_order_type,limit_price:raw->limit_price,"
+                    "entry_cancelled:raw->entry_cancelled,hold_study:raw->hold_study")
+            .eq("role", "entry")
+            .gte("submitted_at", since)
+            .order("submitted_at", desc=False)
+        ))
+        trades = _match_order_rows(_fetch_all_order_rows(since, None))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"Supabase query failed: {exc}") from exc
+    agg = _entry_study_aggregate(entries, trades, ALPACA_TRADING_HOLD_MINUTES, _HOLD_STUDY_TOLERANCE_S)
+    return {
+        "days": days, "since": since,
+        "entry_order_type": ENTRY_ORDER_TYPE, "entry_limit_ttl_s": ENTRY_LIMIT_TTL_S,
+        "rule": ("Pre-registered 2026-11-08: paper only. Read at ≥150 limit_mid entries or 10 sessions. "
+                 "Pass = limit_mid drag_per_trade ≤ 0.6 × market drag_per_trade (same window), "
+                 "fill_rate ≥ 60%, and missed_hypothetical_per_entry ≤ at_mid_per_trade + $10."),
+        **agg,
+    }
+
+
 @app.get("/purgatory/hold-study")
 def purgatory_hold_study(days: int = 30, account: str = "paper", strategy: str | None = None,
                          ticker: str | None = None, direction: str | None = None,
@@ -4463,7 +4806,7 @@ def _reconcile_open_order_fills(hours_back: int = 6) -> int:
 
     updates = 0
     for row in rows:
-        if (row.get("alpaca_status") or "").lower() == "filled":
+        if (row.get("alpaca_status") or "").lower() == "filled" or _is_terminal_entry(row):
             continue
         order_id = row.get("alpaca_order_id")
         if not order_id:
@@ -6976,6 +7319,7 @@ def _run_scan_pass() -> dict[str, Any]:
     n_closed = 0
     try:
         n_reconciled = _reconcile_open_order_fills()
+        _sweep_unfilled_limit_entries()      # inert unless ENTRY_ORDER_TYPE=limit_mid
         n_closed = _sweep_stop_losses()      # stop-outs first (checks live quote)
         n_closed += _sweep_pending_positions()
     except Exception as exc:  # noqa: BLE001
@@ -8204,6 +8548,8 @@ def purgatory_status():
         "trading_hold_minutes":    ALPACA_TRADING_HOLD_MINUTES,
         "trading_stop_loss_pct":   ALPACA_TRADING_STOP_LOSS_PCT,
         "trading_directions":      sorted(TRADING_DIRECTIONS),
+        "entry_order_type":        ENTRY_ORDER_TYPE,          # paper entries only; live is always market
+        "entry_limit_ttl_s":       ENTRY_LIMIT_TTL_S,
         "hold_study":              {"minutes": HOLD_STUDY_MINUTES, "holds": _HOLD_STUDY_HOLDS},
         "paper_morning_hold": {
             "minutes":   PAPER_MORNING_HOLD_MINUTES,

@@ -113,6 +113,19 @@ up-month):
 
 **Hold-length study (2026-10-13):** after every exit the scanner keeps quoting the contract to entry+30 min; `GET /purgatory/hold-study` replays 15/20/25/30-minute holds on real option quotes. Decision rule and re-read date in `analysis/README.md`. The live hold stays 15 min until that rule is met.
 
+## Entry execution A/B (added 2026-11-08, paper only)
+
+`ENTRY_ORDER_TYPE` (Render env, default `market`). Set `limit_mid` to place
+**paper** entries as a limit at the option quote mid (rounded down to the
+tick); any entry still unfilled on the first scan pass ≥ `ENTRY_LIMIT_TTL_S`
+(default 45 s, so effectively one scan interval) is cancelled, partial fills
+are kept as the position. **Live entries are market orders regardless** —
+the gate is in `_enter()` and tested. Cancelled entries are tagged
+`raw.entry_cancelled`, never treated as open, and the contract is quoted to
+entry+30 so the missed trades can be compared with the filled ones.
+Read: `GET /purgatory/entry-study?days=14`; rule in `analysis/README.md`.
+Verify with `/purgatory/status` → `entry_order_type`.
+
 ## Direction switch (added 2026-10-21)
 
 `TRADING_DIRECTIONS` (Render env, default `call,put`) decides which signal
