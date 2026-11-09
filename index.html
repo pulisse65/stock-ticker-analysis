@@ -1034,6 +1034,18 @@
         <div id="swing-body" class="text-sm text-ink-dim">—</div>
       </section>
 
+      <!-- PEAD book (post-earnings drift, paper stock) -->
+      <section class="card p-4">
+        <div class="flex items-start justify-between gap-3 flex-wrap mb-2">
+          <div>
+            <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim">PEAD book<span class="tip-q" data-tip="Post-earnings drift, pre-registered 2026-11-08 (PEAD_BOOK.md). S&P 100 names (minus the swing universe) whose earnings-day reaction was at least 2 trailing-60-day sigmas are bought at the next open, $2,000 each, up to 5 at once, and sold at the close of the 10th session. Backtest 2016–2026: +1.03%/trade, +0.38% over random same-ticker entries. Read at 50 trades or 2027-05-08.">?</span></h3>
+            <p class="text-[11px] text-ink-faint mt-0.5 max-w-3xl">Earnings reaction ≥ 2σ → buy next open, sell 10th close. Paper stock, never options, never live.</p>
+          </div>
+          <div id="pead-pills" class="flex items-center gap-2 flex-wrap text-xs"></div>
+        </div>
+        <div id="pead-body" class="text-sm text-ink-dim">—</div>
+      </section>
+
       <!-- Daily retros -->
       <section class="card p-4">
         <h3 class="text-xs font-bold uppercase tracking-wider text-ink-dim mb-3">Daily retros (last 14 days)</h3>
@@ -4090,8 +4102,37 @@ async function refreshSwing() {
   }
 }
 
+async function refreshPead() {
+  const el = document.getElementById("pead-body"), pills = document.getElementById("pead-pills");
+  try {
+    const r = await fetch("/purgatory/pead");
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || `HTTP ${r.status}`);
+    const d = await r.json();
+    const money = v => v == null ? "—" : `${v > 0 ? "+" : (v < 0 ? "−" : "")}$${Math.abs(Math.round(v)).toLocaleString()}`;
+    const cls = v => v > 0 ? "val-up" : (v < 0 ? "val-down" : "text-ink-dim");
+    const pct = v => v == null ? "—" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+    const st = d.stats || {};
+    pills.innerHTML = `<span class="px-2.5 py-1 rounded-full ${d.enabled ? "v-bullish" : "v-neutral"}">${d.enabled ? "Enabled" : "Not enabled"}</span>
+      <span class="px-2.5 py-1 rounded-full v-neutral">$${Math.round(d.slot_usd).toLocaleString()} × ${d.max_positions} · hold ${d.hold_sessions}</span>
+      <span class="px-2.5 py-1 rounded-full v-neutral">${d.universe_n} names · ${d.fmp_enabled ? "FMP" : "yfinance"} calendar</span>`;
+    const summary = `<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3 text-xs">
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Closed trades</div><div class="text-lg font-semibold mono">${st.n_closed || 0}</div><div class="text-[11px] text-ink-faint">hit ${st.hit_rate_pct == null ? "—" : st.hit_rate_pct.toFixed(0) + "%"}</div></div>
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Mean / trade</div><div class="text-lg font-semibold mono ${cls(st.mean_ret_pct || 0)}">${pct(st.mean_ret_pct)}</div><div class="text-[11px] text-ink-faint">backtest +1.03%</div></div>
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Realized</div><div class="text-lg font-semibold mono ${cls(st.pnl_usd || 0)}">${money(st.pnl_usd || 0)}</div><div class="text-[11px] text-ink-faint">unrealized ${money(st.unrealized_usd || 0)}</div></div>
+      <div class="border border-line rounded-lg p-3"><div class="text-[10px] font-bold uppercase tracking-wider text-ink-faint">Open</div><div class="text-sm font-semibold mono">${(d.open || []).length ? d.open.map(o => o.symbol).join(" · ") : "—"}</div><div class="text-[11px] text-ink-faint">${d.sessions_run || 0} sessions run${d.entered_today ? " · today ✓" : ""}</div></div>
+    </div>`;
+    const rows = [...(d.open || []).map(o => ({...o, kind: "open"})), ...(d.closed || []).slice(-15).reverse().map(c => ({...c, kind: "closed"}))];
+    const table = rows.length ? `<div class="overflow-x-auto"><table class="w-full text-xs">
+      <thead><tr class="text-ink-faint text-left"><th class="pb-2">Ticker</th><th class="pb-2 text-right">z</th><th class="pb-2">Entry</th><th class="pb-2">Exit</th><th class="pb-2 text-right">Qty</th><th class="pb-2 text-right">In</th><th class="pb-2 text-right">Out / now</th><th class="pb-2 text-right">P&L</th></tr></thead>
+      <tbody>${rows.map(r => `<tr class="border-t border-line"><td class="py-1 mono ${r.kind === "open" ? "font-bold text-ink" : ""}">${r.symbol}</td><td class="py-1 mono text-right">${r.z == null ? "" : Number(r.z).toFixed(1)}</td><td class="py-1 mono">${r.entry_session || ""}</td><td class="py-1 mono">${r.exit_session || ""}${r.kind === "open" ? " (due)" : ""}</td><td class="py-1 mono text-right">${r.qty}</td><td class="py-1 mono text-right">${r.entry == null ? "—" : r.entry.toFixed(2)}</td><td class="py-1 mono text-right">${(r.exit ?? r.price) == null ? "—" : Number(r.exit ?? r.price).toFixed(2)}</td><td class="py-1 mono text-right ${cls((r.pnl ?? r.unrealized) || 0)}">${money(r.pnl ?? r.unrealized)}</td></tr>`).join("")}</tbody></table></div>` : `<div class="text-xs text-ink-faint">No trades yet.</div>`;
+    el.innerHTML = summary + table + `<div class="text-[11px] text-ink-faint mt-2">Swing-universe names excluded (${(d.excluded_swing_universe || []).length}). Pre-registered read at 50 closed trades or 2027-05-08 (PEAD_BOOK.md).</div>`;
+  } catch (e) {
+    el.innerHTML = `<span class="text-ink-faint text-xs">${escapeHTML(e.message)}</span>`;
+  }
+}
+
 async function refreshTrading() {
-  await Promise.all([refreshTradingStatus(), refreshTradingPerf(), refreshTradingPnl(), refreshTradingSummaries(), refreshStopStudy(), refreshSwing()]);
+  await Promise.all([refreshTradingStatus(), refreshTradingPerf(), refreshTradingPnl(), refreshTradingSummaries(), refreshStopStudy(), refreshSwing(), refreshPead()]);
 }
 
 document.getElementById("trading-refresh-btn").addEventListener("click", refreshTrading);
