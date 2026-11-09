@@ -376,6 +376,23 @@ hook fired once, Monday, no spurious Slack. Only AAPL and MSFT are eligible
 for 11/9 → the rule sells TSLA/QQQ/IWM and sits ~60% cash. Read stays
 2027-01-25.
 
+**Entry execution A/B pre-registered 2026-11-08 (Task 2 of plan_2026-11-08).**
+Hypothesis: market entries pay the spread (median 3.5%); a limit at the quote
+mid, cancelled after one scan interval if unfilled, cuts execution drag
+without selecting for falling contracts. Paper only; live stays market.
+Knobs `ENTRY_ORDER_TYPE=limit_mid`, `ENTRY_LIMIT_TTL_S=45`. Baseline = the
+market-order entries in the same `GET /purgatory/entry-study?days=` window
+(leave the window long enough to include the last market-only sessions).
+Read once, at ≥150 limit_mid entries or 10 sessions, whichever first.
+Pass = (a) limit_mid `drag_per_trade` ≤ 0.6 × market `drag_per_trade`,
+(b) `fill_rate_pct` ≥ 60, (c) `missed_hypothetical_per_entry` (what the
+cancelled entries would have returned at the limit price, 15-min mid from
+the hold-study path) ≤ limit_mid `at_mid_per_trade` + $10 — i.e. the
+trades we miss are not systematically the good ones. Pass → `limit_mid`
+becomes the paper default; a separate decision for live. Fail → back to
+market, record why. Not a P&L test: at-mid P&L was still −$1,472 the week
+this was designed, so the A/B can only narrow the loss.
+
 **Swing book pre-registered 2026-10-27** — see `SWING_BOOK.md` (weekly
 cloud regime + 12-week momentum, top 5 equal weight, paper stock, read after
 13 weeks ≈ 2027-01-25). Backtest basis in

@@ -1288,5 +1288,86 @@ main._get_muted_strategies = _sv_gm
 main._slack_enabled, main._compute_daily_realized_pnl, main.requests.post, main._get_disabled_pairs = _sv
 
 
+# ---------------- ENTRY EXECUTION A/B: LIMIT AT MID (paper only) ----------------
+check("limit px: $1.234 mid -> $1.23 (penny tick under $3)", main._limit_price_from_quote({"mid": 1.234}) == 1.23)
+check("limit px: $4.37 mid -> $4.35 (nickel tick at/above $3)", main._limit_price_from_quote({"mid": 4.37}) == 4.35)
+check("limit px: exact tick unchanged", main._limit_price_from_quote({"mid": 2.50}) == 2.50)
+check("limit px: no quote / zero mid -> None", main._limit_price_from_quote(None) is None and main._limit_price_from_quote({"mid": 0}) is None)
+check("ENTRY_ORDER_TYPE defaults to market", main.ENTRY_ORDER_TYPE == "market" and main.ENTRY_LIMIT_TTL_S == 45)
+_now_t = _dt(2026, 11, 9, 14, 40, 0, tzinfo=_tz.utc)
+_lrow = {"alpaca_status": "accepted", "submitted_at": "2026-11-09T14:39:00+00:00", "raw": {"entry_order_type": "limit_mid"}}
+check("limit decision: market entry -> skip", main._limit_entry_decision({**_lrow, "raw": {"entry_order_type": "market"}}, {"status": "new"}, _now_t, 45) == "skip")
+check("limit decision: our row already filled -> skip", main._limit_entry_decision({**_lrow, "alpaca_status": "filled"}, {"status": "filled"}, _now_t, 45) == "skip")
+check("limit decision: Alpaca unreadable -> unknown (leave it)", main._limit_entry_decision(_lrow, None, _now_t, 45) == "unknown")
+check("limit decision: filled remotely -> filled", main._limit_entry_decision(_lrow, {"status": "filled", "filled_qty": "2"}, _now_t, 45) == "filled")
+check("limit decision: 30 s old, TTL 45 -> wait", main._limit_entry_decision(_lrow, {"status": "new", "filled_qty": "0"}, _now_t - _td(seconds=30), 45) == "wait")
+check("limit decision: 60 s old, nothing filled -> cancel", main._limit_entry_decision(_lrow, {"status": "new", "filled_qty": "0"}, _now_t, 45) == "cancel")
+check("limit decision: 60 s old, 1 of 3 filled -> partial", main._limit_entry_decision(_lrow, {"status": "partially_filled", "filled_qty": "1"}, _now_t, 45) == "partial")
+check("limit decision: cancelled on Alpaca without us -> terminal", main._limit_entry_decision(_lrow, {"status": "canceled", "filled_qty": "0"}, _now_t, 45) == "terminal")
+check("terminal entry: canceled/expired/rejected yes, accepted/filled no",
+      all(main._is_terminal_entry({"alpaca_status": x}) for x in ("canceled", "cancelled", "expired", "rejected"))
+      and not any(main._is_terminal_entry({"alpaca_status": x}) for x in ("accepted", "filled", "new", None)))
+# entry path: paper uses limit when enabled, live never does, no quote -> market
+_sv = (main._quote_snapshot, main._alpaca_submit_market_order, main._alpaca_submit_limit_order, main._select_option_contract,
+       main.ALPACA_TRADING_ENABLED, main._alpaca_enabled, main._persist_order_row, main.ENTRY_ORDER_TYPE, main.ALPACA_PAPER)
+_mkt, _lim, _rows = [], [], []
+main.ALPACA_TRADING_ENABLED = True; main._alpaca_enabled = lambda: True
+main._select_option_contract = lambda *a, **k: {"symbol": "AAPL261120C00340000", "strike_price": 340, "expiration_date": "2026-11-20", "close_price": 1.5}
+main._quote_snapshot = lambda sym: {"bid": 1.40, "ask": 1.50, "mid": 1.45, "spread_pct": 6.9}
+main._alpaca_submit_market_order = lambda sym, qty, side, paper=True: _mkt.append((sym, qty, paper)) or {"id": "m1", "status": "accepted"}
+main._alpaca_submit_limit_order = lambda sym, qty, side, px, paper=True: _lim.append((sym, qty, px, paper)) or {"id": "l1", "status": "accepted"}
+main._persist_order_row = lambda row: _rows.append(row)
+_sig = {"strategy": "purgatory", "ticker": "AAPL", "signal": "call", "price": 340.0, "bar_time": "2026-11-09T14:30:00+00:00"}
+main.ENTRY_ORDER_TYPE = "market"; main.ALPACA_PAPER = True
+main._maybe_place_trade_for_signal(_sig)
+check("entry A/B: market mode -> market order, row tagged entry_order_type=market", _lim == [] and len(_mkt) == 1 and _rows[-1]["raw"].get("entry_order_type") == "market", f"{_mkt} {_lim}")
+main.ENTRY_ORDER_TYPE = "limit_mid"
+main._maybe_place_trade_for_signal({**_sig, "bar_time": "2026-11-09T14:31:00+00:00"})
+check("entry A/B: limit_mid on paper -> limit at $1.45 mid, 3 contracts, row carries limit_price + ttl",
+      len(_mkt) == 1 and _lim == [("AAPL261120C00340000", 3, 1.45, True)]
+      and _rows[-1]["raw"].get("entry_order_type") == "limit_mid" and _rows[-1]["raw"].get("limit_price") == 1.45
+      and _rows[-1]["raw"].get("entry_ttl_s") == 45 and _rows[-1]["raw"].get("quote_at_submit", {}).get("mid") == 1.45, f"{_mkt} {_lim} {_rows[-1]['raw']}")
+main.ALPACA_PAPER = False   # primary leg is a live account
+main._maybe_place_trade_for_signal({**_sig, "bar_time": "2026-11-09T14:32:00+00:00"})
+check("entry A/B: live leg ignores limit_mid -> market order", len(_lim) == 1 and _mkt[-1] == ("AAPL261120C00340000", 3, False), f"{_mkt} {_lim}")
+main.ALPACA_PAPER = True
+main._quote_snapshot = lambda sym: None
+main._maybe_place_trade_for_signal({**_sig, "bar_time": "2026-11-09T14:33:00+00:00"})
+check("entry A/B: no quote -> market order (no mid to post a limit at), 1 contract", len(_lim) == 1 and _mkt[-1] == ("AAPL261120C00340000", 1, True), f"{_mkt}")
+(main._quote_snapshot, main._alpaca_submit_market_order, main._alpaca_submit_limit_order, main._select_option_contract,
+ main.ALPACA_TRADING_ENABLED, main._alpaca_enabled, main._persist_order_row, main.ENTRY_ORDER_TYPE, main.ALPACA_PAPER) = _sv
+# sweep inert in market mode (no query at all)
+_sv2 = (main.ENTRY_ORDER_TYPE, main._fetch_unfilled_limit_entries)
+_qcalls2 = []
+main._fetch_unfilled_limit_entries = lambda *a, **k: _qcalls2.append(1) or []
+main.ENTRY_ORDER_TYPE = "market"
+check("limit sweep: inert in market mode (no Supabase read)", main._sweep_unfilled_limit_entries() == 0 and _qcalls2 == [])
+main.ENTRY_ORDER_TYPE, main._fetch_unfilled_limit_entries = _sv2
+# entry-study aggregate
+_E = lambda tkr, bt, otype, status, fill, **kw: {"strategy": "purgatory", "signal_ticker": tkr, "signal_direction": "call", "signal_bar_time": bt,
+                                                "paper": True, "qty": kw.get("qty", 2), "alpaca_status": status, "fill_price": fill,
+                                                "submitted_at": kw.get("sub", bt), "entry_order_type": otype, "limit_price": kw.get("lp"),
+                                                "entry_cancelled": kw.get("ec"), "hold_study": kw.get("hs")}
+_T = lambda tkr, bt, pnl, mid: {"strategy": "purgatory", "ticker": tkr, "direction": "call", "bar_time": bt, "account": "paper", "pnl": pnl, "pnl_at_mid": mid}
+_entries = [
+    _E("A", "2026-11-09T14:30:00+00:00", "market", "filled", 1.50),
+    _E("B", "2026-11-09T14:35:00+00:00", "market", "filled", 2.00),
+    _E("C", "2026-11-09T14:40:00+00:00", "limit_mid", "filled", 1.45, lp=1.45),
+    _E("D", "2026-11-09T14:45:00+00:00", "limit_mid", "canceled", None, lp=1.00,
+       ec={"filled_qty": 0, "limit_price": 1.00},
+       hs={"samples": [{"t": "2026-11-09T14:50:00+00:00", "mid": 1.10}, {"t": "2026-11-09T15:00:30+00:00", "mid": 1.30}, {"t": "2026-11-09T15:10:00+00:00", "mid": 0.90}]}),
+    _E("E", "2026-11-09T14:46:00+00:00", "limit_mid", "canceled", None, lp=1.00, ec={"filled_qty": 0, "limit_price": 1.00}, hs={"samples": []}),
+]
+_trades = [_T("A", "2026-11-09T14:30:00+00:00", -40.0, -10.0), _T("B", "2026-11-09T14:35:00+00:00", 20.0, 50.0), _T("C", "2026-11-09T14:40:00+00:00", 10.0, 12.0)]
+_agg = {(g["order_type"], g["account"]): g for g in main._entry_study_aggregate(_entries, _trades, 15, 300)["groups"]}
+_m, _l = _agg[("market", "paper")], _agg[("limit_mid", "paper")]
+check("entry study: market group 2 entries/2 filled, drag per trade -30", _m["entries"] == 2 and _m["filled"] == 2 and _m["drag_per_trade"] == -30.0 and _m["fill_rate_pct"] == 100.0, str(_m))
+check("entry study: limit group 3 entries, 1 filled, 2 cancelled, fill rate 33.3%, drag -2", _l["entries"] == 3 and _l["filled"] == 1 and _l["cancelled"] == 2 and _l["fill_rate_pct"] == 33.3 and _l["drag_per_trade"] == -2.0, str(_l))
+check("entry study: missed D uses the +15 min sample (1.30 at 15:00:30), hypothetical (1.30-1.00)*2*100 = +60; E has no path",
+      _l["missed"] == 2 and _l["missed_with_path"] == 1 and _l["missed_hypothetical_at_mid"] == 60.0 and _l["missed_hypothetical_per_entry"] == 60.0, str(_l))
+resp = client.get("/purgatory/status")
+check("status reports entry_order_type + ttl", resp.status_code == 200 and resp.json().get("entry_order_type") == main.ENTRY_ORDER_TYPE and resp.json().get("entry_limit_ttl_s") == main.ENTRY_LIMIT_TTL_S)
+
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
