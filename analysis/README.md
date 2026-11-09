@@ -401,6 +401,12 @@ controlling for premium) — 31% of 1-min-era stops fell >20% inside one scan
 and carry 75% of the overshoot dollars. Faster/native stops: NO-GO. Detail in
 `analysis/research/stops/README.md`.
 
+**Earnings join 2026-11-08 (Task 4).** Purgatory fills −5…−1 sessions before
+a report: 65, −$2,002, 20% wins; reaction day 15, −$518. But 48/65 fall in the
+10/22–11/06 selloff; session-matched vs other tickers the same days: −$25.8 vs
+−$13.9 per trade, worse on 8/14 sessions, p≈0.4. Not separable from regime; no
+filter installed; re-run after the Q4 season. `analysis/research/earnings/`.
+
 **Swing book pre-registered 2026-10-27** — see `SWING_BOOK.md` (weekly
 cloud regime + 12-week momentum, top 5 equal weight, paper stock, read after
 13 weeks ≈ 2027-01-25). Backtest basis in
